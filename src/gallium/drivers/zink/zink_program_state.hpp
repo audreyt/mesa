@@ -124,6 +124,7 @@ zink_get_gfx_pipeline(struct zink_context *ctx,
          return state->mesh_pipeline;
    } else {
       if (!state->dirty && !state->modules_changed && idx == state->idx && !ctx->vertex_state_changed &&
+          !ctx->gfx_pipeline_failed &&
           ((DYNAMIC_STATE == ZINK_DYNAMIC_VERTEX_INPUT || DYNAMIC_STATE == ZINK_DYNAMIC_VERTEX_INPUT2)))
          return state->pipeline;
    }
@@ -141,8 +142,8 @@ zink_get_gfx_pipeline(struct zink_context *ctx,
       }
    } else {
       if (state->dirty) {
-         if (state->pipeline) //avoid on first hash
-            state->final_hash ^= state->hash;
+         /* starts at zero, and stays folded in when pipeline creation fails */
+         state->final_hash ^= state->hash;
          state->hash = hash_gfx_pipeline_state<DYNAMIC_STATE>(state, screen);
          state->final_hash ^= state->hash;
          state->dirty = false;
@@ -175,8 +176,7 @@ zink_get_gfx_pipeline(struct zink_context *ctx,
    } else {
       if (DYNAMIC_STATE != ZINK_DYNAMIC_VERTEX_INPUT2 && DYNAMIC_STATE != ZINK_DYNAMIC_VERTEX_INPUT && ctx->vertex_state_changed) {
          /* recalc vertex state if missing optimal extensions */
-         if (state->pipeline)
-            state->final_hash ^= state->vertex_hash;
+         state->final_hash ^= state->vertex_hash;
          /* even if dynamic stride is available, it may not be usable with the current pipeline */
          if (DYNAMIC_STATE != ZINK_NO_DYNAMIC_STATE)
 #if defined(MVK_VERSION)
@@ -290,6 +290,9 @@ zink_get_gfx_pipeline(struct zink_context *ctx,
    }
 
    struct zink_gfx_pipeline_cache_entry *cache_entry = (struct zink_gfx_pipeline_cache_entry *)entry->data;
+   /* a failed creation stays cached; keep tracking the last valid pipeline */
+   if (unlikely(!cache_entry->pipeline))
+      return VK_NULL_HANDLE;
    if (IS_MESH)
       state->mesh_pipeline = cache_entry->pipeline;
    else
