@@ -110,7 +110,12 @@ zink_get_gfx_pipeline(struct zink_context *ctx,
    bool uses_dynamic_stride = state->uses_dynamic_stride;
 
    VkPrimitiveTopology vkmode = IS_MESH ? VK_PRIMITIVE_TOPOLOGY_MAX_ENUM : zink_primitive_topology(mode);
-   const unsigned idx = IS_MESH || screen->info.dynamic_state3_props.dynamicPrimitiveTopologyUnrestricted ?
+   /* Unrestricted dynamic topology can only share one pipeline across
+    * topologies when topology is dynamic; otherwise it is baked into each one.
+    */
+   const unsigned idx = IS_MESH ||
+                        (DYNAMIC_STATE >= ZINK_DYNAMIC_STATE &&
+                         screen->info.dynamic_state3_props.dynamicPrimitiveTopologyUnrestricted) ?
                         0 :
                         get_pipeline_idx<DYNAMIC_STATE >= ZINK_DYNAMIC_STATE>(mode, vkmode);
    assert(idx <= ARRAY_SIZE(prog->pipelines));
