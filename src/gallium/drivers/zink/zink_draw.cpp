@@ -710,7 +710,11 @@ zink_draw(struct pipe_context *pctx,
    if (have_streamout && ctx->dirty_so_targets)
       zink_emit_stream_output_targets(pctx);
 
-   bool pipeline_changed = ctx->gfx_pipeline_failed || ctx->gfx_pipeline_state.dirty || rp_state != ctx->gfx_pipeline_state.rp_state || ctx->gfx_dirty || ctx->dirty_gfx_stages || prim_changed || BATCH_CHANGED ?
+   bool pipeline_changed = ctx->gfx_pipeline_failed || ctx->gfx_pipeline_state.dirty || rp_state != ctx->gfx_pipeline_state.rp_state || ctx->gfx_dirty || ctx->dirty_gfx_stages || prim_changed ||
+                           /* Without dynamic topology it is baked into each pipeline, so a
+                            * topology change alone must select a pipeline again.
+                            */
+                           (DYNAMIC_STATE < ZINK_DYNAMIC_STATE && mode_changed) || BATCH_CHANGED ?
                            update_gfx_pipeline<DYNAMIC_STATE, BATCH_CHANGED>(ctx, bs, mode) :
                            false;
    if (unlikely(ctx->gfx_pipeline_failed)) {
