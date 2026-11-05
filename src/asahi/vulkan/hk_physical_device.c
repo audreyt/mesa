@@ -656,6 +656,16 @@ hk_get_device_features(
    };
 
    if (agx_apple9_compute_enabled(dev)) {
+      /* Native graphics supports vertex/fragment stages, per-pixel shading,
+       * filled polygons and timestamp queries only. */
+      features->geometryShader = false;
+      features->tessellationShader = false;
+      features->shaderTessellationAndGeometryPointSize = false;
+      features->sampleRateShading = false;
+      features->alphaToOne = false;
+      features->fillModeNonSolid = false;
+      features->occlusionQueryPrecise = false;
+      features->pipelineStatisticsQuery = false;
       /* Native vertex fetch is specialized from the pipeline's static layout. */
       features->vertexInputDynamicState = false;
       features->extendedDynamicState = false;
