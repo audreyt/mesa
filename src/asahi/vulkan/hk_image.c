@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_image.h"
+#include "hk_apple9_msaa.h"
 #include "asahi/lib/agx_apple9_compute.h"
 #include "asahi/layout/layout.h"
 #include "drm-uapi/drm_fourcc.h"
@@ -489,6 +490,17 @@ hk_GetPhysicalDeviceImageFormatProperties2(
 
       sampleCounts =
          VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT;
+   }
+
+   if (agx_apple9_compute_enabled(&pdev->dev) &&
+       (features & VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT)) {
+      enum pipe_format format = hk_format_to_pipe_format(pImageFormatInfo->format);
+      struct agx_tilebuffer_layout tib;
+      for (unsigned samples = 2; samples <= 4; samples *= 2) {
+         if ((sampleCounts & samples) &&
+             !hk_apple9_tilebuffer(format, samples, &tib))
+            sampleCounts &= ~samples;
+      }
    }
 
    /* From the Vulkan 1.2.199 spec:
