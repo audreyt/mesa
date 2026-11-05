@@ -272,8 +272,11 @@ util_draw_vbo_without_prim_restart(struct pipe_context *context,
 
    new_info.primitive_restart = false;
    new_info.index_bounds_valid = true;
-   if (direct_draws)
-      context->draw_vbo(context, &new_info, drawid_offset, NULL, direct_draws, num_draws);
+   /* All ranges belong to one logical draw. Submit them separately to keep
+    * its draw ID and let drivers upload each user index range in full.
+    */
+   for (unsigned i = 0; i < num_draws; i++)
+      context->draw_vbo(context, &new_info, drawid_offset, NULL, &direct_draws[i], 1);
    free(direct_draws);
 
    return num_draws > 0 ? PIPE_OK : PIPE_ERROR_OUT_OF_MEMORY;

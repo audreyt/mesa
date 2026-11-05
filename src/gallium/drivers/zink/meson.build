@@ -121,6 +121,21 @@ driver_zink = declare_dependency(
 
 if with_tests
   test(
+    'zink_prim_restart_test',
+    executable(
+      'zink_prim_restart_test',
+      'zink_prim_restart_test.cpp',
+      link_with : libgallium,
+      dependencies : [
+        driver_zink, idep_gtest, idep_nir, idep_mesautil, idep_vulkan_util,
+        idep_ntv, idep_vtn, idep_xmlconfig,
+      ],
+      include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src],
+    ),
+    suite : ['zink'],
+    protocol : 'gtest',
+  )
+  test(
     'zink_format_test',
     executable(
       'zink_format_test',

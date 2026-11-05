@@ -533,7 +533,8 @@ zink_draw(struct pipe_context *pctx,
    if (dinfo->primitive_restart && dinfo->index_size && !dindirect &&
        zink_driverid(screen) == VK_DRIVER_ID_MESA_HONEYKRISP) {
       for (unsigned i = 0; i < num_draws; i++)
-         util_draw_vbo_without_prim_restart(pctx, dinfo, drawid_offset + i,
+         util_draw_vbo_without_prim_restart(pctx, dinfo,
+                                            drawid_offset + (dinfo->increment_draw_id ? i : 0),
                                             NULL, &draws[i]);
       return;
    }
