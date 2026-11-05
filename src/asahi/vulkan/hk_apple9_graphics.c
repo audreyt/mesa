@@ -768,7 +768,8 @@ hk_apple9_reserve_render_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 }
 
 void
-hk_apple9_draw(struct hk_cmd_buffer *cmd, struct agx_draw draw)
+hk_apple9_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id,
+               struct agx_draw draw)
 {
    if (vk_command_buffer_get_record_result(&cmd->vk) != VK_SUCCESS)
       return;
@@ -1039,11 +1040,12 @@ hk_apple9_draw(struct hk_cmd_buffer *cmd, struct agx_draw draw)
    struct agx_depth_bias_packed bias = {0};
    util_dynarray_append(&cs->depth_bias, bias);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   /* Instance-rate fetches and gl_BaseInstance read these sysvals; the
-    * hardware instance ID itself starts at zero.
+   /* Instance-rate fetches, base parameters and draw ID read these sysvals;
+    * the hardware instance ID itself starts at zero.
     */
    gfx->apple9_draw_params[0] = draw.indexed ? draw.index_bias : draw.start;
    gfx->apple9_draw_params[1] = draw.start_instance;
+   gfx->apple9_draw_params[2] = draw_id;
    if (!hk_apple9_graphics_resources(cmd, vs, 0, &record) ||
        !hk_apple9_graphics_resources(cmd, fs, 1, &record)) {
       hk_apple9_graphics_reject(cmd, "draw-resources");

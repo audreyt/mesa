@@ -228,8 +228,9 @@ struct hk_graphics_state {
    uint64_t draw_params;
    uint64_t draw_id_ptr;
 
-   /* Apple9 sysval words 0/1: first vertex (or vertex offset), first instance. */
-   uint32_t apple9_draw_params[2];
+   /* Apple9 sysval words 0/1/2: first vertex (or vertex offset), first instance,
+    * and draw ID. */
+   uint32_t apple9_draw_params[3];
 
    uint32_t shaders_dirty;
    struct hk_api_shader *shaders[MESA_SHADER_MESH + 1];

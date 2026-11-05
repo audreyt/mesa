@@ -201,7 +201,8 @@ bool hk_apple9_blend_state(const struct vk_color_blend_state *cb,
 
 void hk_apple9_begin_rendering(struct hk_cmd_buffer *cmd,
                                const struct VkRenderingInfo *info);
-void hk_apple9_draw(struct hk_cmd_buffer *cmd, struct agx_draw draw);
+void hk_apple9_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id,
+                    struct agx_draw draw);
 void hk_apple9_end_rendering(struct hk_cmd_buffer *cmd);
 VkResult hk_apple9_graphics_reject(struct hk_cmd_buffer *cmd,
                                   const char *reason);

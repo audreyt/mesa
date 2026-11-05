@@ -1513,8 +1513,8 @@ hk_api_shader_destroy(struct vk_device *vk_dev, struct vk_shader *vk_shader,
    vk_shader_free(&dev->vk, pAllocator, &obj->vk);
 }
 
-/* Native Apple9 draws publish first vertex and first instance in sysval
- * words 0 and 1, the same words instance-rate fetches already read.
+/* Native Apple9 draws publish first vertex, first instance and draw ID in
+ * sysval words 0, 1 and 2. Instance-rate fetches also read the base parameters.
  */
 static bool
 hk_apple9_lower_draw_params(nir_builder *b, nir_intrinsic_instr *intr,
@@ -1528,6 +1528,9 @@ hk_apple9_lower_draw_params(nir_builder *b, nir_intrinsic_instr *intr,
       break;
    case nir_intrinsic_load_base_instance:
       offset = 4;
+      break;
+   case nir_intrinsic_load_draw_id:
+      offset = 8;
       break;
    default:
       return false;

@@ -3511,7 +3511,7 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_)
       if (!agx_is_indirect(draw_.b) &&
           (!draw_.b.count[0] || !draw_.b.count[1]))
          return;
-      hk_apple9_draw(cmd, draw_);
+      hk_apple9_draw(cmd, draw_id, draw_);
       return;
    }
    const struct vk_dynamic_graphics_state *dyn =
