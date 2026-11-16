@@ -295,19 +295,126 @@ hk_apple9_attachmentless_samples(struct hk_cmd_buffer *cmd, unsigned samples)
    return true;
 }
 
+static bool
+hk_apple9_setup_zs(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
+                   unsigned width, unsigned height, unsigned samples,
+                   bool partial)
+{
+   struct hk_rendering_state *render = &cmd->state.gfx.render;
+   const VkRenderingAttachmentInfo *depth = info->pDepthAttachment;
+   const VkRenderingAttachmentInfo *stencil = info->pStencilAttachment;
+   if (depth && !depth->imageView)
+      depth = NULL;
+   if (stencil && !stencil->imageView)
+      stencil = NULL;
+   /* ZLS fast clears cover the whole attachment. Partial passes must load. */
+   if (partial &&
+       ((depth && depth->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) ||
+        (stencil && stencil->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR))) {
+      hk_apple9_graphics_reject(cmd, "partial-depth-stencil-clear");
+      return false;
+   }
+   struct ail_layout *zl = NULL, *sl = NULL;
+   if (depth) {
+      VK_FROM_HANDLE(hk_image_view, zv, depth->imageView);
+      struct hk_image *zi = container_of(zv->vk.image, struct hk_image, vk);
+      uint64_t zbase;
+      float clear_depth = depth->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR
+         ? depth->clearValue.depthStencil.depth : 0.0f;
+      zl = &zi->planes[0].layout;
+      if ((zv->vk.format != VK_FORMAT_D32_SFLOAT &&
+           zv->vk.format != VK_FORMAT_D32_SFLOAT_S8_UINT) ||
+          zl->format != PIPE_FORMAT_Z32_FLOAT ||
+          !(clear_depth >= 0.0f && clear_depth <= 1.0f) ||
+          !hk_apple9_zs_attachment(zv, zi, 0, depth, width, height, samples, &zbase)) {
+         hk_apple9_graphics_reject(cmd, "depth-view-layout-or-load-store");
+         return false;
+      }
+      render->depth_att.iview = zv;
+      render->depth_att.vk_format = zv->vk.format;
+      render->depth_att.clear = depth->loadOp != VK_ATTACHMENT_LOAD_OP_LOAD;
+      render->cr.depth.buffer = zbase;
+      render->cr.depth.stride =
+         ((zl->layer_stride_B / AIL_PAGESIZE - 1) << 14) | 1;
+      if (zl->compressed) {
+         render->cr.depth.meta = zbase + zl->metadata_offset_B +
+                                zl->level_offsets_compressed_B[0];
+         render->cr.depth.meta_stride =
+            (zl->compression_layer_stride_B / AIL_CACHELINE - 1) << 14;
+      }
+      render->cr.isp_bgobjdepth = fui(clear_depth);
+      render->depth_att.clear_colour[0] = fui(clear_depth);
+   }
+   if (stencil) {
+      VK_FROM_HANDLE(hk_image_view, sv, stencil->imageView);
+      struct hk_image *si = container_of(sv->vk.image, struct hk_image, vk);
+      unsigned plane = si->plane_count - 1;
+      uint64_t sbase;
+      uint32_t clear_stencil = stencil->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR
+         ? stencil->clearValue.depthStencil.stencil : 0;
+      sl = &si->planes[plane].layout;
+      if ((sv->vk.format != VK_FORMAT_S8_UINT &&
+           sv->vk.format != VK_FORMAT_D32_SFLOAT_S8_UINT) ||
+          sl->format != PIPE_FORMAT_S8_UINT ||
+          !hk_apple9_zs_attachment(sv, si, plane, stencil, width, height, samples, &sbase)) {
+         hk_apple9_graphics_reject(cmd, "stencil-view-layout-or-load-store");
+         return false;
+      }
+      render->stencil_att.iview = sv;
+      render->stencil_att.vk_format = sv->vk.format;
+      render->stencil_att.clear = stencil->loadOp != VK_ATTACHMENT_LOAD_OP_LOAD;
+      render->cr.stencil.buffer = sbase;
+      render->cr.stencil.stride =
+         ((sl->layer_stride_B / AIL_PAGESIZE - 1) << 14) | 1;
+      if (sl->compressed) {
+         render->cr.stencil.meta = sbase + sl->metadata_offset_B +
+                                  sl->level_offsets_compressed_B[0];
+         render->cr.stencil.meta_stride =
+            (sl->compression_layer_stride_B / AIL_CACHELINE - 1) << 14;
+      }
+      render->cr.isp_bgobjvals |= clear_stencil & 0xff;
+      render->stencil_att.clear_colour[1] = clear_stencil;
+   }
+   if (zl || sl) {
+      render->cr.zls_width = width;
+      render->cr.zls_height = height;
+      struct agx_zls zls = {
+         .z_store = zl != NULL,
+         .s_store = sl != NULL,
+         .z_load = zl && (partial || depth->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD),
+         .s_load = sl && (partial || stencil->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD),
+      };
+      agx_pack_zls_control(&render->cr.zls_control, zl, sl, &zls);
+      zls.z_load = zl != NULL;
+      zls.s_load = sl != NULL;
+      agx_pack_zls_control(&render->cr.zls_control_partial, zl, sl, &zls);
+   }
+   return true;
+}
+
 static void
-hk_apple9_begin_attachmentless(struct hk_cmd_buffer *cmd,
-                               const VkRenderingInfo *info)
+hk_apple9_begin_colorless(struct hk_cmd_buffer *cmd,
+                          const VkRenderingInfo *info)
 {
    const VkRect2D *area = &info->renderArea;
-   if ((info->pDepthAttachment && info->pDepthAttachment->imageView) ||
-       (info->pStencilAttachment && info->pStencilAttachment->imageView) ||
-       area->offset.x < 0 || area->offset.y < 0 ||
+   const VkRenderingAttachmentInfo *zs =
+      info->pDepthAttachment && info->pDepthAttachment->imageView
+         ? info->pDepthAttachment : info->pStencilAttachment;
+   VK_FROM_HANDLE(hk_image_view, view, zs ? zs->imageView : VK_NULL_HANDLE);
+   unsigned width = view ? view->vk.image->extent.width
+                         : area->offset.x + area->extent.width;
+   unsigned height = view ? view->vk.image->extent.height
+                          : area->offset.y + area->extent.height;
+   unsigned samples = view ? view->vk.image->samples : 1;
+   if (area->offset.x < 0 || area->offset.y < 0 ||
        !area->extent.width || !area->extent.height ||
-       area->extent.width > 16384 || area->extent.height > 16384 ||
-       (unsigned)area->offset.x > 16384 - area->extent.width ||
-       (unsigned)area->offset.y > 16384 - area->extent.height) {
-      hk_apple9_graphics_reject(cmd, "attachmentless-area-or-depth-stencil");
+       !width || !height || width > 16384 || height > 16384 ||
+       (unsigned)area->offset.x > width ||
+       (unsigned)area->offset.y > height ||
+       area->extent.width > width - area->offset.x ||
+       area->extent.height > height - area->offset.y ||
+       (samples != 1 && samples != 2 && samples != 4)) {
+      hk_apple9_graphics_reject(cmd, "colorless-area-or-samples");
       return;
    }
    hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.post_gfx);
@@ -316,17 +423,22 @@ hk_apple9_begin_attachmentless(struct hk_cmd_buffer *cmd,
    memset(render, 0, sizeof(*render));
    render->area = *area;
    render->layer_count = 1;
-   render->cr.width = area->offset.x + area->extent.width;
-   render->cr.height = area->offset.y + area->extent.height;
+   render->cr.width = width;
+   render->cr.height = height;
    render->cr.layers = 1;
    render->cr.isp_bgobjvals = 0x300;
-   if (!hk_apple9_attachmentless_samples(cmd, 1))
+   render->cr.process_empty_tiles = view != NULL;
+   bool partial = area->offset.x || area->offset.y ||
+                  area->extent.width != width || area->extent.height != height;
+   if (!hk_apple9_setup_zs(cmd, info, width, height, samples, partial) ||
+       !hk_apple9_attachmentless_samples(cmd, samples))
       return;
    struct hk_cs *cs = hk_cmd_buffer_get_cs(cmd, false);
    if (!cs) {
       hk_apple9_graphics_reject(cmd, "render-stream-allocation");
       return;
    }
+   cs->cr.zls_control = render->cr.zls_control;
    const uint32_t stop = 0xc0000000;
    memcpy(cs->current, &stop, sizeof(stop));
    /* Keep a valid empty job too; draws select the actual sample count. */
@@ -372,8 +484,9 @@ hk_apple9_begin_rendering(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info
       hk_apple9_graphics_reject(cmd, "attachment-count-layers-or-depth-stencil");
       return;
    }
-   if (info->colorAttachmentCount == 0) {
-      hk_apple9_begin_attachmentless(cmd, info);
+   if (info->colorAttachmentCount == 0 ||
+       !info->pColorAttachments[0].imageView) {
+      hk_apple9_begin_colorless(cmd, info);
       return;
    }
    const VkRenderingAttachmentInfo *att = info->pColorAttachments;
@@ -481,18 +594,6 @@ hk_apple9_begin_rendering(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info
    const VkAttachmentLoadOp color_load =
       partial && att->loadOp == VK_ATTACHMENT_LOAD_OP_DONT_CARE
          ? VK_ATTACHMENT_LOAD_OP_LOAD : att->loadOp;
-   /* ZLS fast clears cover the whole attachment. Until rectangular Z/S
-    * clears are available, only reload Z/S for a partial color render.
-    * Loading DONT_CARE contents is legal and preserves pixels outside it.
-    */
-   if (partial &&
-       ((info->pDepthAttachment && info->pDepthAttachment->imageView &&
-         info->pDepthAttachment->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) ||
-        (info->pStencilAttachment && info->pStencilAttachment->imageView &&
-         info->pStencilAttachment->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR))) {
-      hk_apple9_graphics_reject(cmd, "partial-depth-stencil-clear");
-      return;
-   }
    uint64_t base = hk_image_base_address(image, 0) + layout->level_offsets_B[level];
    if (!base || (base & 15) ||
        (layout->tiling != AIL_TILING_GPU &&
@@ -529,88 +630,8 @@ hk_apple9_begin_rendering(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info
    render->cr.isp_bgobjvals = 0x300;
    render->cr.process_empty_tiles = true;
 
-   const VkRenderingAttachmentInfo *depth = info->pDepthAttachment;
-   const VkRenderingAttachmentInfo *stencil = info->pStencilAttachment;
-   if (depth && !depth->imageView)
-      depth = NULL;
-   if (stencil && !stencil->imageView)
-      stencil = NULL;
-   struct ail_layout *zl = NULL, *sl = NULL;
-   if (depth) {
-      VK_FROM_HANDLE(hk_image_view, zv, depth->imageView);
-      struct hk_image *zi = container_of(zv->vk.image, struct hk_image, vk);
-      uint64_t zbase;
-      zl = &zi->planes[0].layout;
-      if ((zv->vk.format != VK_FORMAT_D32_SFLOAT &&
-           zv->vk.format != VK_FORMAT_D32_SFLOAT_S8_UINT) ||
-          zl->format != PIPE_FORMAT_Z32_FLOAT ||
-          !(depth->clearValue.depthStencil.depth >= 0.0f &&
-            depth->clearValue.depthStencil.depth <= 1.0f) ||
-          !hk_apple9_zs_attachment(zv, zi, 0, depth, width, height, samples, &zbase)) {
-         hk_apple9_graphics_reject(cmd, "depth-view-layout-or-load-store");
-         return;
-      }
-      render->depth_att.iview = zv;
-      render->depth_att.vk_format = zv->vk.format;
-      render->depth_att.clear = depth->loadOp != VK_ATTACHMENT_LOAD_OP_LOAD;
-      render->cr.depth.buffer = zbase;
-      render->cr.depth.stride =
-         ((zl->layer_stride_B / AIL_PAGESIZE - 1) << 14) | 1;
-      if (zl->compressed) {
-         render->cr.depth.meta = zbase + zl->metadata_offset_B +
-                                zl->level_offsets_compressed_B[0];
-         render->cr.depth.meta_stride =
-            (zl->compression_layer_stride_B / AIL_CACHELINE - 1) << 14;
-      }
-      render->cr.isp_bgobjdepth = fui(depth->clearValue.depthStencil.depth);
-      render->depth_att.clear_colour[0] = fui(depth->clearValue.depthStencil.depth);
-   }
-   if (stencil) {
-      VK_FROM_HANDLE(hk_image_view, sv, stencil->imageView);
-      struct hk_image *si = container_of(sv->vk.image, struct hk_image, vk);
-      /* Stencil is always the last plane, possibly the only one. */
-      unsigned plane = si->plane_count - 1;
-      uint64_t sbase;
-      sl = &si->planes[plane].layout;
-      if ((sv->vk.format != VK_FORMAT_S8_UINT &&
-           sv->vk.format != VK_FORMAT_D32_SFLOAT_S8_UINT) ||
-          sl->format != PIPE_FORMAT_S8_UINT ||
-          !hk_apple9_zs_attachment(sv, si, plane, stencil, width, height, samples, &sbase)) {
-         hk_apple9_graphics_reject(cmd, "stencil-view-layout-or-load-store");
-         return;
-      }
-      render->stencil_att.iview = sv;
-      render->stencil_att.vk_format = sv->vk.format;
-      render->stencil_att.clear = stencil->loadOp != VK_ATTACHMENT_LOAD_OP_LOAD;
-      render->cr.stencil.buffer = sbase;
-      render->cr.stencil.stride =
-         ((sl->layer_stride_B / AIL_PAGESIZE - 1) << 14) | 1;
-      if (sl->compressed) {
-         render->cr.stencil.meta = sbase + sl->metadata_offset_B +
-                                  sl->level_offsets_compressed_B[0];
-         render->cr.stencil.meta_stride =
-            (sl->compression_layer_stride_B / AIL_CACHELINE - 1) << 14;
-      }
-      render->cr.isp_bgobjvals |= stencil->clearValue.depthStencil.stencil & 0xff;
-      render->stencil_att.clear_colour[1] = stencil->clearValue.depthStencil.stencil;
-   }
-   if (zl || sl) {
-      /* Like the Apple8 path, always store Z/S: a pass may be split into
-       * several control streams, and every later stream reloads both.
-       */
-      render->cr.zls_width = width;
-      render->cr.zls_height = height;
-      struct agx_zls zls = {
-         .z_store = zl != NULL,
-         .s_store = sl != NULL,
-         .z_load = zl && (partial || depth->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD),
-         .s_load = sl && (partial || stencil->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD),
-      };
-      agx_pack_zls_control(&render->cr.zls_control, zl, sl, &zls);
-      zls.z_load = zl != NULL;
-      zls.s_load = sl != NULL;
-      agx_pack_zls_control(&render->cr.zls_control_partial, zl, sl, &zls);
-   }
+   if (!hk_apple9_setup_zs(cmd, info, width, height, samples, partial))
+      return;
 
    /* First 64 bits stay Apple8-compatible, but the address moves from bit 66
     * to bit 64. Reload raw encoded bytes: fragment blending performs any
@@ -803,7 +824,9 @@ hk_apple9_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id,
    /* variableMultisampleRate is false: all draws in this attachmentless
     * rendering instance use the first draw's rasterizationSamples.
     */
-   if (!gfx->render.color_att_count && !cs->stats.calls &&
+   if (!gfx->render.color_att_count &&
+       !gfx->render.depth_att.iview && !gfx->render.stencil_att.iview &&
+       !cs->stats.calls &&
        dyn->ms.rasterization_samples != gfx->render.tilebuffer.nr_samples) {
       unsigned samples = dyn->ms.rasterization_samples;
       if ((samples != 1 && samples != 2 && samples != 4) ||
