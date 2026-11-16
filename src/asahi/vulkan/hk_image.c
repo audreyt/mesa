@@ -53,6 +53,11 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
    if (p_format == PIPE_FORMAT_NONE)
       return 0;
 
+   /* Native transfers reject block-compressed images in either direction. */
+   if (agx_apple9_compute_enabled(&pdev->dev) &&
+       vk_format_is_compressed(vk_format))
+      return 0;
+
    /* NPOT formats only supported for texel buffers */
    if (!util_is_power_of_two_nonzero(util_format_get_blocksize(p_format)))
       return 0;

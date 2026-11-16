@@ -666,6 +666,10 @@ hk_get_device_features(
       features->fillModeNonSolid = false;
       features->occlusionQueryPrecise = false;
       features->pipelineStatisticsQuery = false;
+      /* Native buffer/image transfers do not support block-compressed data. */
+      features->textureCompressionBC = false;
+      features->textureCompressionETC2 = false;
+      features->textureCompressionASTC_LDR = false;
       /* Native vertex fetch is specialized from the pipeline's static layout. */
       features->vertexInputDynamicState = false;
       features->extendedDynamicState = false;
