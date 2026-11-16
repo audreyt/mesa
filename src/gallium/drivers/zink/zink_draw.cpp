@@ -663,8 +663,10 @@ zink_draw(struct pipe_context *pctx,
       drawid_broken = (drawid_offset != 0 ||
                       (!HAS_MULTIDRAW && num_draws > 1) ||
                       (HAS_MULTIDRAW && num_draws > 1 && !dinfo->increment_draw_id));
-   if (drawid_broken != zink_get_last_vertex_key(ctx)->push_drawid)
+   if (drawid_broken != zink_get_last_vertex_key(ctx)->push_drawid) {
       zink_set_last_vertex_key(ctx)->push_drawid = drawid_broken;
+      ctx->dirty_gfx_stages |= BITFIELD_BIT(ctx->last_vertex_stage->info.stage);
+   }
 
    bool rast_prim_changed = false;
    bool prim_changed = false;
