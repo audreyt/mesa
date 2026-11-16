@@ -109,7 +109,7 @@ hk_apple9_test_blend_state(const struct vk_color_blend_state *cb,
    };
    struct vk_multisample_state ms = {
       .rasterization_samples = samples,
-      .sample_mask = ~0u,
+      .sample_mask = UINT16_MAX,
    };
    struct vk_rasterization_state rs = {0};
    struct vk_graphics_pipeline_state state = {
