@@ -239,6 +239,12 @@ vk_meta_clear_attachments(struct vk_command_buffer *cmd,
       }
    }
 
+   /* The shader has no output for color attachments that are not cleared. */
+   for (uint32_t a = 0; a < key.render.color_attachment_count; a++) {
+      if (!(key.color_attachments_cleared & BITFIELD_BIT(a)))
+         key.render.color_attachment_write_masks[a] = 0;
+   }
+
    VkPipelineLayout layout;
    result = get_clear_pipeline_layout(device, meta, &layout);
    if (unlikely(result != VK_SUCCESS)) {
