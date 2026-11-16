@@ -121,6 +121,7 @@ zink_debug_options[] = {
    { "rploads", ZINK_DEBUG_RPLOADS, "Zap renderpass loads for DONT_CARE" },
    { "nogeneral", ZINK_DEBUG_NOGENERAL, "Disable GENERAL layout usage for supported hardware" },
    { "rpstores", ZINK_DEBUG_RPSTORES, "Zap renderpass stores for DONT_CARE" },
+   { "nod24", ZINK_DEBUG_NOD24, "Treat D24 depth formats as unsupported (use the D32_SFLOAT fallback)" },
    DEBUG_NAMED_VALUE_END
 };
 
@@ -921,9 +922,17 @@ zink_init_screen_caps(struct zink_screen *screen)
       PIPE_VERTEX_INPUT_ALIGNMENT_NONE : PIPE_VERTEX_INPUT_ALIGNMENT_ELEMENT;
 
    caps->gl_clamp = false;
+   /* unorm D24 falls back to D32_SFLOAT */
+   caps->depth_unorm_emulated = !screen->have_X8_D24_UNORM_PACK32 ||
+                                !screen->have_D24_UNORM_S8_UINT;
 
-   /* Assume that the vk driver is capable of moving imm arrays to some sort of constant storage on its own. */
-   caps->prefer_imm_arrays_as_constbuf = false;
+   /* Most Vulkan compilers move immutable local arrays to shader constant
+    * data. Honeykrisp does not implement that path yet, so large lookup
+    * tables otherwise become per-invocation scratch stores. Let mesa/st
+    * place them in the default uniform buffer, as native Asahi GL does.
+    */
+   caps->prefer_imm_arrays_as_constbuf =
+      zink_driverid(screen) == VK_DRIVER_ID_MESA_HONEYKRISP;
    {
       enum pipe_quirk_texture_border_color_swizzle quirk =
          PIPE_QUIRK_TEXTURE_BORDER_COLOR_SWIZZLE_ALPHA_NOT_W;
@@ -1098,8 +1107,10 @@ zink_init_screen_caps(struct zink_screen *screen)
       screen->info.feats.features.sparseResidencyBuffer ? ZINK_SPARSE_BUFFER_PAGE_SIZE : 0;
 
    /* Sparse texture */
+   /* ARB_sparse_texture requires both 2D and 3D sparse textures. */
    caps->max_sparse_texture_size =
-      screen->info.feats.features.sparseResidencyImage2D ?
+      screen->info.feats.features.sparseResidencyImage2D &&
+      screen->info.feats.features.sparseResidencyImage3D ?
       caps->max_texture_2d_size : 0;
    caps->max_sparse_3d_texture_size =
       screen->info.feats.features.sparseResidencyImage3D ?
@@ -1109,10 +1120,13 @@ zink_init_screen_caps(struct zink_screen *screen)
       caps->max_texture_array_layers : 0;
    caps->sparse_texture_full_array_cube_mipmaps =
       screen->info.feats.features.sparseResidencyImage2D;
+   /* ARB_sparse_texture2 and ARB_sparse_texture_clamp require the base extension. */
    caps->query_sparse_texture_residency =
+      caps->max_sparse_texture_size &&
       screen->info.feats.features.sparseResidency2Samples &&
       screen->info.feats.features.shaderResourceResidency;
    caps->clamp_sparse_texture_lod =
+      caps->max_sparse_texture_size &&
       screen->info.feats.features.shaderResourceMinLod &&
       screen->info.feats.features.sparseResidency2Samples &&
       screen->info.feats.features.shaderResourceResidency;
@@ -1168,6 +1182,17 @@ zink_init_screen_caps(struct zink_screen *screen)
       assert(screen->info.feats.features.tessellationShader == VK_FALSE);
       caps->max_varyings = 16;
    }
+
+   /* Honeykrisp on G16 reports 122 output components: its varying bank also
+    * holds position, point size and the clip/cull distances. Halving gives 60
+    * components, below the GL 3.0 minimum of 64. Streamout scalarizes outputs
+    * in place rather than duplicating them, and the varyings Zink injects
+    * (internal GS PrimitiveID, emulated line varyings at the top of the range)
+    * still fit beside 16 vec4 of user varyings.
+    */
+   if (zink_driverid(screen) == VK_DRIVER_ID_MESA_HONEYKRISP &&
+       screen->info.props.limits.maxVertexOutputComponents >= 80)
+      caps->max_varyings = 16;
 
    caps->dmabuf =
 #if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD)
@@ -2964,6 +2989,7 @@ init_driver_workarounds(struct zink_screen *screen)
    case VK_DRIVER_ID_MESA_V3DV:
    case VK_DRIVER_ID_MESA_PANVK:
    case VK_DRIVER_ID_MESA_NVK:
+   case VK_DRIVER_ID_MESA_HONEYKRISP:
    case VK_DRIVER_ID_QUALCOMM_PROPRIETARY:
       screen->driver_workarounds.implicit_sync = false;
       break;
@@ -3157,6 +3183,7 @@ init_driver_workarounds(struct zink_screen *screen)
    case VK_DRIVER_ID_MESA_NVK:
    case VK_DRIVER_ID_MESA_LLVMPIPE:
    case VK_DRIVER_ID_MESA_PANVK:
+   case VK_DRIVER_ID_MESA_HONEYKRISP:
    case VK_DRIVER_ID_ARM_PROPRIETARY:
    case VK_DRIVER_ID_QUALCOMM_PROPRIETARY:
       screen->driver_workarounds.can_do_invalid_linear_modifier = true;
@@ -3228,6 +3255,13 @@ init_driver_workarounds(struct zink_screen *screen)
       screen->driver_workarounds.general_layout = screen->info.have_KHR_unified_image_layouts;
       break;
    }
+
+   /* Honeykrisp can keep compatible passes in one tile render. Explicit
+    * layouts preserve read-only depth information and image-specific barriers
+    * needed to order texture reads without ending that render.
+    */
+   if (zink_driverid(screen) == VK_DRIVER_ID_MESA_HONEYKRISP)
+      screen->driver_workarounds.general_layout = false;
 
    if (zink_debug & ZINK_DEBUG_NOGENERAL)
       screen->driver_workarounds.general_layout = false;
@@ -3541,9 +3575,11 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
 
    update_queue_props(screen);
 
-   screen->have_X8_D24_UNORM_PACK32 = zink_is_depth_format_supported(screen,
+   screen->have_X8_D24_UNORM_PACK32 = !(zink_debug & ZINK_DEBUG_NOD24) &&
+                                      zink_is_depth_format_supported(screen,
                                               VK_FORMAT_X8_D24_UNORM_PACK32);
-   screen->have_D24_UNORM_S8_UINT = zink_is_depth_format_supported(screen,
+   screen->have_D24_UNORM_S8_UINT = !(zink_debug & ZINK_DEBUG_NOD24) &&
+                                    zink_is_depth_format_supported(screen,
                                               VK_FORMAT_D24_UNORM_S8_UINT);
    screen->have_D32_SFLOAT_S8_UINT = zink_is_depth_format_supported(screen,
                                               VK_FORMAT_D32_SFLOAT_S8_UINT);
@@ -3731,6 +3767,16 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
 
    screen->total_video_mem = get_video_mem(screen);
    screen->clamp_video_mem = screen->total_video_mem * 0.8;
+   /* A batch keeps every resource it references alive, including deleted
+    * ones, until it completes. With unified memory the heap is system memory
+    * shared with everything else, so bound the memory kept alive only by
+    * batches (zombie_bytes) long before the heap is nearly full.
+    */
+   if (screen->info.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ||
+       screen->info.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU)
+      screen->zombie_bytes_limit = screen->total_video_mem / 4;
+   else
+      screen->zombie_bytes_limit = screen->clamp_video_mem;
    if (!os_get_total_physical_memory(&screen->total_mem)) {
       if (!screen->driver_name_is_inferred)
          mesa_loge("ZINK: failed to get total physical memory");
@@ -3877,6 +3923,12 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    }
 
    simple_mtx_init(&screen->copy_context_lock, mtx_plain);
+
+   /* polygon stipple is emulated in the fragment shader with the pattern
+    * appended to the gfx push constants
+    */
+   screen->have_poly_stipple_emulation =
+      screen->info.props.limits.maxPushConstantsSize >= sizeof(struct zink_gfx_push_constant);
 
    init_optimal_keys(screen);
 

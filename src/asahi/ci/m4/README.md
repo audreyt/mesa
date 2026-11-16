@@ -16,18 +16,18 @@ The persistent target has the launcher installed as `g16-mesa-ci`:
 
 ```sh
 # Complete GL 3.3 / GLES 3.0 / EGL CI profile.
-ssh root@192.168.50.2 g16-mesa-ci gl
+ssh root@m4-target g16-mesa-ci gl
 
 # Focused CTS run, retaining the same profile and upstream exclusions.
-ssh root@192.168.50.2 \
+ssh root@m4-target \
   "g16-mesa-ci gl --include-tests '^KHR-GL33[.]nearest_edge[.]'"
 
 # Run against a particular installed candidate without changing the desktop.
-ssh root@192.168.50.2 \
+ssh root@m4-target \
   g16-mesa-ci gl --driver /path/to/candidate-prefix
 
 # Supplemental Piglit GPU profile, also through Mesa's runner.
-ssh root@192.168.50.2 \
+ssh root@m4-target \
   "g16-mesa-ci piglit --include-tests '^spec@!opengl 1[.]1@draw-pixels$'"
 ```
 
@@ -46,11 +46,38 @@ a run. Mesa's runner can return success when a failure is expected or flaky.
 This CI profile is distinct from a full Khronos certification configuration
 matrix; use the official conformance procedure when that is explicitly needed.
 
+## Focused dual-source regression
+
+`dual-source.c` checks explicit GLSL output indices, indexed output bindings,
+and the `dual_color_blend_by_location` workaround. It reads all pixels of a
+floating-point target and checks RGBA `(0.16, 0.27, 0.38, 0.49)`. The same
+by-location program also checks disabled blending and ordinary MRT output
+routing, to catch a remap applied outside dual-source blending.
+
+```sh
+cc dual-source.c -o dual-source -lEGL -lGL -lm
+ASAHI_MESA_DEBUG=nocompress dual_color_blend_by_location=true ./dual-source
+```
+
+Select a candidate prefix using `LD_LIBRARY_PATH` and `LIBGL_DRIVERS_PATH` as
+usual. This standalone own-source reproducer complements the routine CTS
+blend profile; it does not replace the suite runner.
+
+## Vertex-stage store ordering regression
+
+`vertex-store-order.c` checks that a vertex shader store waits for an earlier
+render's fragment reads when a `FRAGMENT_SHADER -> VERTEX_SHADER` barrier
+orders them (write-after-read across renders). Each of the 20 rounds uses a
+fresh device. It needs `vertexPipelineStoresAndAtomics`; the build commands are
+in the file header. Exit status 0 is a pass, 1 a failure, 77 unsupported.
+
 ## Upstream expectations and Piglit
 
-The launcher supplies the existing `all`, `asahi`, and `asahi-agx2` skip, flake,
-single-thread, and expected-failure files, as applicable. It does not create
-new expected failures from local test results. The global skip list includes
+The launcher supplies the existing `all`, `asahi`, and `asahi-agx2` skip, flake
+and single-thread files, as applicable. Expected failures come from `all`,
+`asahi` and `asahi-m4-fails.txt`; upstream's `asahi-agx2-fails.txt` describes
+M1-class hardware and is not used. It does not create new expected failures
+from local test results. The global skip list includes
 `streaming-texture-leak`, so routine runs exclude that workload. Direct test
 executables remain useful for intentional, focused debugging.
 
@@ -106,3 +133,53 @@ configuration and provenance together, then repeat a filtered native smoke run.
 
 Native evidence: `/g16/results/mesa-ci/setup-smoke2/` and
 `/g16/results/mesa-ci/setup-piglit-smoke/`.
+
+## Experimental Apple9 Vulkan
+
+`run.py vk` uses `deqp-asahi-m4-vk.toml` with the same upstream expectations and
+result recording. It requires a `/deqp-vk` runtime mapping, the flattened Vulkan
+mustpass list at `mustpass/vk-main.txt`, and a separate candidate prefix containing
+`lib/libvulkan_asahi.so` and `share/vulkan/icd.d/*asahi*.json`. The manifest must
+name the candidate library by absolute path. Inherited Vulkan and Mesa
+selection variables are cleared before the configured `environment` is applied. Apple9 compression is enabled by default
+in both drivers. Leave `ASAHI_MESA_DEBUG` unset for normal regression tests;
+use `nocompress` only for an explicit uncompressed comparison.
+
+The September 27 native development deployment uses
+`/root/honeykrisp-apple9/ci/config.json` on the Fedora target. Earlier `/g16`
+examples describe the older desktop image. Run the new deployment explicitly:
+
+```sh
+ssh root@m4-target 'python3 /root/honeykrisp-apple9/ci/m4/run.py vk \
+  --config /root/honeykrisp-apple9/ci/config.json \
+  --include-tests "^dEQP-VK[.]compute[.]pipeline[.]basic[.]" --jobs 1'
+```
+
+This profile is development coverage, not a certification configuration. See
+[`README.apple9.md`](../../vulkan/README.apple9.md) for current capabilities and
+known failures. Preserve the raw failures rather than turning them into local
+expected failures.
+
+For desktop clear coverage, retain the existing
+`^dEQP-GLES3[.]functional[.]color_clear[.]` group in focused runs (19 cases).
+On October 3 these passed with compression enabled, including with KWin itself
+using the candidate. Check the compositor's loaded libraries: a file capability
+on `kwin_wayland` makes the loader ignore `LD_LIBRARY_PATH`, so setting that
+variable alone does not select the candidate. The installed system driver is
+available to the prefix-based runner through `/opt/mesa-apple9-system`, whose
+`lib` and `share` directories link to `/usr/lib64` and `/usr/share`.
+
+## Apple9 D32S8 compression regression
+
+`apple9-d32s8-regressions.txt` retains the 18 render-pass cases that exposed
+interleaved meta-copy views of Honeykrisp's split depth/stencil planes. Run these
+with compression enabled (leave `ASAHI_MESA_DEBUG` unset) against a candidate:
+
+```sh
+filter=$(python3 -c 'import pathlib,re; cases=pathlib.Path("src/asahi/ci/m4/apple9-d32s8-regressions.txt").read_text().splitlines(); print("^(?:"+"|".join(map(re.escape,cases))+")$")')
+python3 src/asahi/ci/m4/run.py vk --config /path/to/native-config.json \
+  --driver /path/to/candidate --include-tests "$filter" --jobs 1
+```
+
+The native config must also omit `ASAHI_MESA_DEBUG=nocompress`: the launcher
+sets its recorded environment from that config, not from the invoking shell.

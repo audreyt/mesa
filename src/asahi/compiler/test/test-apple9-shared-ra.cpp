@@ -8,6 +8,118 @@
 #include <gtest/gtest.h>
 #include "agx_test.h"
 
+static void
+test_shared_loop_initializers(bool computed, bool live_source = false)
+{
+   for (uint32_t initial : {0u, 7u, 0x3f800000u, 0xfeedfaceu}) {
+      void *memctx = ralloc_context(nullptr);
+      auto ctx = rzalloc(memctx, agx_context);
+      list_inithead(&ctx->blocks);
+      nir_builder nir = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "shared_constant_phis");
+      agx_shader_key key = {};
+      key.has_scratch = true;
+      ctx->nir = nir.shader;
+      ctx->stage = MESA_SHADER_COMPUTE;
+      ctx->key = &key;
+      ctx->ra_target.max_registers = 32;
+      ctx->ra_target.cost_register_constraints = true;
+      ctx->ra_target.disable_occupancy_rematerialization = true;
+      auto entry = agx_test_block(ctx);
+      auto header = agx_test_block(ctx);
+      auto body = agx_test_block(ctx);
+      auto exit = agx_test_block(ctx);
+      header->loop_header = true;
+      agx_block_add_successor(entry, header);
+      agx_block_add_successor(header, body);
+      agx_block_add_successor(header, exit);
+      agx_block_add_successor(body, header);
+
+      auto b = agx_init_builder(ctx, agx_after_block(entry));
+      auto constant = agx_mov_imm(&b, 32, initial);
+      if (computed)
+         constant = agx_iadd(&b, constant, agx_immediate(0), 0);
+      constexpr unsigned count = 8;
+      agx_instr *phis[count];
+      b.cursor = agx_after_block(header);
+      for (unsigned i = 0; i < count; ++i) {
+         phis[i] = agx_phi_to(&b, agx_temp(ctx, AGX_SIZE_32), 2);
+         phis[i]->src[0] = constant;
+      }
+      b.cursor = agx_after_block(body);
+      for (unsigned i = 0; i < count; ++i)
+         phis[i]->src[1] = agx_iadd(&b, phis[i]->dest[0],
+                                    agx_immediate(i + 1), 0);
+      b.cursor = agx_after_block(exit);
+      agx_index results[count];
+      for (unsigned i = 0; i < count; ++i)
+         results[i] = live_source
+            ? agx_iadd(&b, phis[i]->dest[0], constant, 0)
+            : phis[i]->dest[0];
+      for (unsigned i = 0; i < count; ++i)
+         agx_export(&b, results[i], 2 * i);
+
+      ASSERT_TRUE(agx_ra(ctx));
+      ASSERT_EQ(ctx->scratch_size_B, 0u);
+      ASSERT_LT(ctx->max_reg, 32u);
+      uint32_t regs[32] = {};
+      auto execute = [&](agx_block *block) {
+         agx_foreach_instr_in_block(block, I) {
+            auto read = [&](agx_index x) {
+               return x.type == AGX_INDEX_IMMEDIATE ? x.value : regs[x.value];
+            };
+            switch (I->op) {
+            case AGX_OPCODE_MOV_IMM:
+               regs[I->dest[0].value] = I->imm;
+               break;
+            case AGX_OPCODE_MOV:
+               regs[I->dest[0].value] = read(I->src[0]);
+               break;
+            case AGX_OPCODE_IADD:
+               regs[I->dest[0].value] = read(I->src[0]) + read(I->src[1]);
+               break;
+            case AGX_OPCODE_SWAP:
+               std::swap(regs[I->src[0].value], regs[I->src[1].value]);
+               break;
+            case AGX_OPCODE_EXPORT:
+               regs[I->imm] = read(I->src[0]);
+               break;
+            default:
+               FAIL() << "unexpected opcode " << I->op;
+            }
+         }
+      };
+      execute(entry);
+      for (unsigned iteration = 0; iteration < 5; ++iteration) {
+         execute(header);
+         execute(body);
+      }
+      execute(header);
+      execute(exit);
+      for (unsigned i = 0; i < count; ++i)
+         EXPECT_EQ(regs[2 * i], initial + 5 * (i + 1) +
+                   (live_source ? initial : 0));
+      ralloc_free(nir.shader);
+      ralloc_free(memctx);
+   }
+}
+
+TEST(Apple9SharedRa, SharedConstantInitializersKeepIndependentLoopValues)
+{
+   test_shared_loop_initializers(false);
+}
+
+TEST(Apple9SharedRa, SharedComputedInitializersKeepIndependentLoopValues)
+{
+   test_shared_loop_initializers(true);
+}
+
+TEST(Apple9SharedRa, PhiFanoutKeepsStillLiveSourcesSeparate)
+{
+   test_shared_loop_initializers(false, true);
+   test_shared_loop_initializers(true, true);
+}
+
 TEST(Apple9SharedRa, PlacementCostsLeaveSpaceForRestrictedDefinitions)
 {
    unsigned moves[2] = {};
@@ -64,6 +176,82 @@ TEST(Apple9SharedRa, PlacementCostsLeaveSpaceForRestrictedDefinitions)
       ralloc_free(nir.shader); ralloc_free(memctx);
    }
    EXPECT_LT(moves[1], moves[0]);
+}
+
+TEST(Apple9SharedRa, ConstantMaterializationRespectsOperandPreferences)
+{
+   for (bool high_use : {false, true}) {
+      void *memctx = ralloc_context(nullptr);
+      auto ctx = rzalloc(memctx, agx_context);
+      list_inithead(&ctx->blocks);
+      nir_builder nir = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "constant_bank_cost");
+      agx_shader_key key = {};
+      key.has_scratch = true;
+      ctx->nir = nir.shader; ctx->stage = MESA_SHADER_COMPUTE; ctx->key = &key;
+      ctx->ra_target.max_registers = 192;
+      ctx->ra_target.cost_register_constraints = true;
+      ctx->ra_target.disable_occupancy_rematerialization = true;
+      ctx->ra_target.mov_imm_registers = 128;
+      auto block = agx_test_block(ctx);
+      auto b = agx_init_builder(ctx, agx_after_block(block));
+      auto constant = agx_mov_imm_to(&b, agx_temp(ctx, AGX_SIZE_32), 0xfeedface);
+      auto use = agx_iadd_to(&b, agx_temp(ctx, AGX_SIZE_32),
+                              constant->dest[0], agx_immediate(1), 0);
+      use->reg_constraints = rzalloc_array(ctx, agx_reg_constraint, 3);
+      /* A later restricted destination makes the low bank scarce. The high
+       * export keeps both banks within the already-required footprint. */
+      use->reg_constraints[0] = {0, 126, 2};
+      use->reg_constraints[1] = {uint16_t(high_use ? 128 : 0), 190, 2};
+      use->reg_constraints[2] = {0, 190, 2};
+      agx_export(&b, use->dest[0], 170);
+      ASSERT_TRUE(agx_ra(ctx));
+      EXPECT_EQ(ctx->scratch_size_B, 0u);
+      EXPECT_EQ(constant->dest[0].value >= 128, high_use);
+      EXPECT_EQ(use->src[0].value, constant->dest[0].value);
+      ralloc_free(nir.shader); ralloc_free(memctx);
+   }
+}
+
+TEST(Apple9SharedRa, ConstantMaterializationKeepsPhiEdgePreference)
+{
+   void *memctx = ralloc_context(nullptr);
+   auto ctx = rzalloc(memctx, agx_context);
+   list_inithead(&ctx->blocks);
+   nir_builder nir = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "constant_phi_bank");
+   agx_shader_key key = {};
+   key.has_scratch = true;
+   ctx->nir = nir.shader; ctx->stage = MESA_SHADER_COMPUTE; ctx->key = &key;
+   ctx->ra_target.max_registers = 192;
+   ctx->ra_target.cost_register_constraints = true;
+   ctx->ra_target.disable_occupancy_rematerialization = true;
+   ctx->ra_target.mov_imm_registers = 128;
+   auto entry = agx_test_block(ctx), header = agx_test_block(ctx);
+   auto body = agx_test_block(ctx), exit = agx_test_block(ctx);
+   header->loop_header = true;
+   agx_block_add_successor(entry, header);
+   agx_block_add_successor(header, body);
+   agx_block_add_successor(header, exit);
+   agx_block_add_successor(body, header);
+   auto b = agx_init_builder(ctx, agx_after_block(entry));
+   auto initial = agx_preload(&b, agx_register(160, AGX_SIZE_32));
+   b.cursor = agx_after_block(header);
+   auto phi = agx_phi_to(&b, agx_temp(ctx, AGX_SIZE_32), 2);
+   phi->src[0] = initial;
+   b.cursor = agx_after_block(body);
+   auto constant = agx_mov_imm_to(&b, agx_temp(ctx, AGX_SIZE_32), 7);
+   phi->src[1] = constant->dest[0];
+   b.cursor = agx_after_block(exit);
+   agx_export(&b, phi->dest[0], 160);
+   ASSERT_TRUE(agx_ra(ctx));
+   EXPECT_EQ(ctx->scratch_size_B, 0u);
+   EXPECT_EQ(constant->dest[0].value, 160u);
+   agx_foreach_instr_in_block(body, I) {
+      EXPECT_NE(I->op, AGX_OPCODE_MOV);
+      EXPECT_NE(I->op, AGX_OPCODE_SWAP);
+   }
+   ralloc_free(nir.shader); ralloc_free(memctx);
 }
 
 TEST(Apple9SharedRa, InstructionConstraintsRelocateLiveValuesOutOfFullBanks)
@@ -309,8 +497,9 @@ TEST(Apple9SharedRa, ShiftRetainsLiveInputWithoutCopies)
       const char *reason = nullptr;
       ASSERT_TRUE(agx_apple9_allocate_shared(&p, nir.shader, &reason)) << reason;
       EXPECT_EQ(p.scratch_size, 0u);
-      EXPECT_TRUE(p.reserved_gprs[1]);
-      EXPECT_FALSE(p.reserved_gprs[2]);
+      /* Without spills no register is reserved. */
+      for (unsigned r = 0; r < 5; ++r)
+         EXPECT_FALSE(p.reserved_gprs[r]);
       uint32_t regs[96] = {}, output = 0;
       unsigned copies = 0;
       for (unsigned i = 0; i < p.instruction_count; ++i) {
@@ -363,7 +552,7 @@ TEST(Apple9SharedRa, LoadWaitFoldsIntoConsumerAfterIndependentArithmetic)
    auto index = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
       AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0);
    const agx_apple9_device_load_contract contract = {
-      .index_kind = AGX_APPLE9_DEVICE_LOAD_INDEX_DIRECT_GPR,
+      .index_kind = AGX_APPLE9_DEVICE_LOAD_INDEX_RETAINED_GPR,
       .flags = 0,
       .raw_token = AGX_APPLE9_DEVICE_LOAD_TOKEN_5101,
    };
@@ -470,6 +659,7 @@ check_loop_register_pressure()
    struct pending_write {
       bool memory;
       unsigned index, value, slot;
+      unsigned source;
    };
    std::vector<pending_write> pending;
    unsigned saves = 0, fills = 0;
@@ -480,7 +670,13 @@ check_loop_register_pressure()
          auto I = p.instructions[i];
          ASSERT_EQ(agx_apple9_instr_block(I), block);
          for (auto it = pending.begin(); it != pending.end();) {
-            if (it->slot == I->scoreboard_slot) {
+            if (it->slot == I->scoreboard_slot ||
+                (I->op == AGX_APPLE9_VIR_WAIT &&
+                 (I->immediate & BITFIELD_BIT(it->slot - 1)))) {
+               if (it->memory) {
+                  EXPECT_EQ(regs[it->source], it->value);
+                  regs[it->source] = 0xdeadbeef;
+               }
                (it->memory ? memory : regs)[it->index] = it->value;
                it = pending.erase(it);
             } else
@@ -489,6 +685,15 @@ check_loop_register_pressure()
          if (I->producer_scoreboard_slot) {
             for (const auto &write : pending)
                ASSERT_NE(write.slot, I->producer_scoreboard_slot);
+         }
+         for (const auto &write : pending) {
+            if (!write.memory)
+               continue;
+            for (unsigned c = 0; c < I->dest_components; ++c)
+               EXPECT_NE(I->dest + c, write.source);
+            if (I->op == AGX_APPLE9_VIR_SPILL_STORE) {
+               EXPECT_NE(I->src[0], write.source);
+            }
          }
          uint32_t a = I->nr_srcs ? regs[I->src[0]] : 0;
          uint32_t b = I->nr_srcs > 1 ? regs[I->src[1]] : 0;
@@ -505,21 +710,25 @@ check_loop_register_pressure()
          case AGX_APPLE9_VIR_IOR:
             regs[I->dest] = a | b;
             break;
+         case AGX_APPLE9_VIR_IXOR:
+            regs[I->dest] = a ^ b;
+            break;
          case AGX_APPLE9_VIR_SPILL_LOAD:
             ASSERT_LT(I->immediate, 1024u);
             pending.push_back({false, I->dest, memory[I->immediate],
-                               I->producer_scoreboard_slot});
+                               I->producer_scoreboard_slot, 0});
             ++fills;
             break;
          case AGX_APPLE9_VIR_SPILL_STORE:
             ASSERT_LT(I->immediate, 1024u);
             pending.push_back(
-               {true, I->immediate, a, I->producer_scoreboard_slot});
-            regs[I->src[0]] = 0xdeadbeef;
+               {true, I->immediate, a, I->producer_scoreboard_slot, I->src[0]});
             ++saves;
             break;
          case AGX_APPLE9_VIR_DEVICE_STORE:
             result = a;
+            break;
+         case AGX_APPLE9_VIR_WAIT:
             break;
          default:
             FAIL() << "Unexpected physical opcode " << I->op;
@@ -597,6 +806,53 @@ TEST(Apple9SharedRa, TexturePublicationPressurePreservesEarlyHandoffs)
       EXPECT_EQ(retained, handoffs);
       agx_apple9_vir_finish(&p);
       ralloc_free(nir.shader);
+   }
+}
+
+TEST(Apple9SharedRa, GradientPublicationFitsItsWholeEncodingWindow)
+{
+   for (unsigned dimension : {0u, 2u, 3u}) {
+      for (unsigned pending : {0u, 4u, 6u, 7u}) {
+         SCOPED_TRACE(dimension);
+         SCOPED_TRACE(pending);
+         nir_builder nir = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &agx_nir_options, "gradient_publication_window");
+         nir_block logical = {};
+         agx_apple9_vir_program p;
+         agx_apple9_vir_init(&p);
+         auto block = agx_apple9_block_create(&p);
+         block->nir = &logical;
+         agx_apple9_block_begin(&p, block);
+         auto zero = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+            AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0);
+         uint32_t coords[] = {zero, zero};
+         std::vector<uint32_t> samples;
+         for (unsigned i = 0; i < pending; ++i)
+            samples.push_back(agx_apple9_vir_emit_texture_lod(
+               &p, coords, zero, i, 0, false));
+         uint32_t parameters[9];
+         for (auto &value : parameters) value = zero;
+         samples.push_back(agx_apple9_vir_emit_texture_grad(
+            &p, parameters, pending, 0, dimension, false, false));
+         for (auto sample : samples) {
+            uint32_t rgba[] = {sample, sample + 1, sample + 2, sample + 3};
+            ASSERT_TRUE(agx_apple9_vir_emit_device_store(&p, 0, zero, rgba, 4, 32));
+         }
+         const char *reason = nullptr;
+         ASSERT_TRUE(agx_apple9_allocate_publications(&p, &reason)) << reason;
+         EXPECT_LE(p.publication_count, 32u);
+         ASSERT_TRUE(agx_apple9_allocate_shared(&p, nir.shader, &reason)) << reason;
+         for (unsigned i = 0; i < p.instruction_count; ++i) {
+            auto I = p.instructions[i];
+            if (I->op != AGX_APPLE9_VIR_PUBLICATION_TUPLE) continue;
+            EXPECT_LE(p.phys[I->dest] + I->dest_components, 32u);
+            agx_apple9_packed_instruction packed;
+            EXPECT_TRUE(agx_apple9_pack_vir_instruction(I, p.phys, &packed, &reason))
+               << (reason ?: "");
+         }
+         agx_apple9_vir_finish(&p);
+         ralloc_free(nir.shader);
+      }
    }
 }
 
@@ -702,4 +958,84 @@ TEST(Apple9SharedRa, RematerializationPreservesHighOperandConstraints)
    EXPECT_EQ(regs[8], expected);
    ralloc_free(nir.shader);
    ralloc_free(memctx);
+}
+
+TEST(Apple9SharedRa, RejectsImpossibleConstraintWindows)
+{
+   /* Includes the spill-prefix conflict formerly encountered in CS2, empty
+    * aligned windows, inverted bounds, bad alignment and simultaneous pins. */
+   const agx_reg_constraint cases[] = {
+      {0, 6, 2}, {11, 11, 2}, {20, 18, 2}, {10, 30, 3}, {32, 40, 2}, {10, 10, 2},
+   };
+   for (const auto &constraint : cases) {
+      void *memctx = ralloc_context(nullptr);
+      auto ctx = rzalloc(memctx, agx_context);
+      list_inithead(&ctx->blocks);
+      nir_builder nir = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "invalid_constraint");
+      agx_shader_key key = {};
+      key.has_scratch = true;
+      ctx->nir = nir.shader; ctx->stage = MESA_SHADER_COMPUTE; ctx->key = &key;
+      ctx->ra_target.max_registers = 32;
+      ctx->ra_target.reserved_registers = 10;
+      ctx->ra_target.disable_occupancy_rematerialization = true;
+      auto block = agx_test_block(ctx);
+      auto b = agx_init_builder(ctx, agx_after_block(block));
+      auto a = agx_mov_imm(&b, 32, 1);
+      auto c = agx_mov_imm(&b, 32, 2);
+      auto I = agx_iadd_to(&b, agx_temp(ctx, AGX_SIZE_32), a, c, 0);
+      I->reg_constraints = rzalloc_array(ctx, agx_reg_constraint, 3);
+      I->reg_constraints[0] = {10, 30, 2};
+      I->reg_constraints[1] = I->reg_constraints[2] = constraint;
+      agx_export(&b, I->dest[0], 0);
+      EXPECT_FALSE(agx_ra(ctx));
+      EXPECT_NE(ctx->ra_error, nullptr);
+      ralloc_free(nir.shader); ralloc_free(memctx);
+   }
+}
+
+TEST(Apple9SharedRa, SubgroupMaxWaitsForInputAndPreservesSource)
+{
+   nir_builder nir = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "subgroup_max_load");
+   nir_block logical = {};
+   agx_apple9_vir_program p;
+   agx_apple9_vir_init(&p);
+   auto block = agx_apple9_block_create(&p);
+   block->nir = &logical;
+   agx_apple9_block_begin(&p, block);
+   auto index = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+      AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0);
+   const agx_apple9_device_load_contract contract = {
+      .index_kind = AGX_APPLE9_DEVICE_LOAD_INDEX_RETAINED_GPR,
+      .flags = 0,
+      .raw_token = AGX_APPLE9_DEVICE_LOAD_TOKEN_5101,
+   };
+   auto loaded = agx_apple9_vir_emit_device_load(&p, 1, index, &contract);
+   auto maximum = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_SUBGROUP_REDUCE_UMAX,
+      AGX_APPLE9_ENC_SUBGROUP_REDUCE_UMAX, &loaded, 1, 0);
+   EXPECT_FALSE(agx_apple9_instr_is_pure_alu(p.instructions[p.instruction_count - 1]));
+   uint32_t src[] = {maximum, loaded};
+   auto result = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IXOR,
+      AGX_APPLE9_ENC_LOGIC_EXTENDED, src, 2, 0);
+   ASSERT_TRUE(agx_apple9_vir_emit_device_store(&p, 0, index, &result, 1, 32));
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_apple9_allocate_shared(&p, nir.shader, &reason)) << reason;
+   unsigned load_at = ~0u, wait_at = ~0u, max_at = ~0u;
+   for (unsigned i = 0; i < p.instruction_count; ++i) {
+      auto I = p.instructions[i];
+      if (I->op == AGX_APPLE9_VIR_DEVICE_LOAD) load_at = i;
+      if (I->op == AGX_APPLE9_VIR_WAIT) wait_at = i;
+      if (I->op == AGX_APPLE9_VIR_SUBGROUP_REDUCE_UMAX) {
+         max_at = i;
+         EXPECT_NE(p.phys[I->dest], p.phys[I->src[0]]);
+         EXPECT_EQ(I->scoreboard_slot, 0u);
+      }
+      agx_apple9_packed_instruction packed;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(I, p.phys, &packed, &reason)) << reason;
+   }
+   EXPECT_LT(load_at, wait_at);
+   EXPECT_LT(wait_at, max_at);
+   agx_apple9_vir_finish(&p);
+   ralloc_free(nir.shader);
 }

@@ -9,6 +9,7 @@
 #include "poly/geometry.h"
 #include "poly/prim.h"
 #include "poly/tessellator.h"
+#include "tessellator_fold.h"
 #include "util/macros.h"
 #include "util/u_math.h"
 
@@ -101,6 +102,24 @@ libagx_unroll_restart(global struct poly_heap *heap, uint64_t index_buffer,
                        flatshade_first, mode, scratch);
 }
 
+/* Unroll a draw into a 32-bit index list for its decomposed primitive type,
+ * ordered for the given provoking vertex. Non-indexed draws (index size zero)
+ * read vertex IDs; the draw's first vertex becomes the index bias. */
+KERNEL(1024)
+libagx_unroll_geometry(global struct poly_heap *heap, uint64_t index_buffer,
+                       constant uint *in_draw, global uint32_t *out_draw,
+                       uint32_t restart_index, uint32_t index_buffer_size_el,
+                       uint32_t in_index_size_B, uint32_t flatshade_first,
+                       uint mode__11)
+{
+   enum mesa_prim mode = poly_uncompact_prim(mode__11);
+
+   POLY_DECL_UNROLL_RESTART_SCRATCH(scratch, 1024);
+   poly_unroll_geometry(out_draw, heap, in_draw, index_buffer,
+                        index_buffer_size_el, in_index_size_B, 4,
+                        restart_index, flatshade_first, false, mode, scratch);
+}
+
 KERNEL(1)
 libagx_gs_setup_indirect(
    uint64_t index_buffer, constant uint *draw,
@@ -126,29 +145,35 @@ libagx_prefix_sum_geom(constant struct poly_geometry_params *p)
                    p->count_buffer_stride / 4, cl_group_id.x, 1024);
 }
 
-KERNEL(1024)
-libagx_prefix_sum_tess(global struct poly_tess_params *p, global uint *c_prims,
-                       global uint *c_invs, uint increment_stats__2)
+/* Free the geometry heap before its next user, keeping in high_water what
+ * earlier users needed, see hk_heap.
+ */
+KERNEL(1)
+libagx_heap_reset(global struct poly_heap *heap)
 {
-   local uint scratch[32];
-   poly_prefix_sum(scratch, p->counts, p->nr_patches, 1 /* words */,
-                   0 /* word */, 1024);
+   poly_heap_reset(heap);
+}
 
-   /* After prefix summing, we know the total # of indices, so allocate the
-    * index buffer now. Elect a thread for the allocation.
+/* Allocate the index buffer for the prefix-summed patch counts, write the
+ * indexed draw and, if requested, the clipper statistics.
+ */
+static void
+libagx_tess_alloc_draw(global struct poly_tess_params *p, uint total,
+                       global uint *c_prims, global uint *c_invs,
+                       uint increment_stats)
+{
+   /* Allocate 4-byte indices. An exhausted heap draws nothing, and the emit
+    * pass skips the draw's patches, see poly_tess_patch_dropped.
     */
-   barrier(CLK_LOCAL_MEM_FENCE);
-   if (cl_local_id.x != 0)
-      return;
-
-   /* The last element of an inclusive prefix sum is the total sum */
-   uint total = p->nr_patches > 0 ? p->counts[p->nr_patches - 1] : 0;
-
-   /* Allocate 4-byte indices */
    uint32_t elsize_B = sizeof(uint32_t);
-   uint32_t size_B = total * elsize_B;
-   uint alloc_B = poly_heap_alloc_offs(p->heap, size_B);
-   p->index_buffer = (global uint32_t *)(((uintptr_t)p->heap->base) + alloc_B);
+   uint alloc_B = 0;
+   if (poly_heap_try_alloc_offs(p->heap, total * elsize_B, &alloc_B)) {
+      p->index_buffer =
+         (global uint32_t *)(((uintptr_t)p->heap->base) + alloc_B);
+   } else {
+      p->index_buffer = 0;
+      total = 0;
+   }
 
    /* ...and now we can generate the API indexed draw */
    global uint32_t *desc = p->out_draws;
@@ -164,11 +189,112 @@ libagx_prefix_sum_tess(global struct poly_tess_params *p, global uint *c_prims,
     * info on the emulation. We just need to calculate the # of primitives
     * tessellated.
     */
-   if (increment_stats__2) {
+   if (increment_stats) {
       uint prims = p->points_mode ? total
                    : p->isolines  ? (total / 2)
                                   : (total / 3);
 
       poly_increment_counters(c_prims, c_invs, NULL, prims);
    }
+}
+
+/* Prefix sum one draw's patch counts in a 1024-thread workgroup, then
+ * allocate its index buffer and write its draw.
+ */
+static void
+libagx_prefix_sum_tess_draw(local uint *scratch,
+                            global struct poly_tess_params *p,
+                            global uint *c_prims, global uint *c_invs,
+                            uint increment_stats)
+{
+   poly_prefix_sum(scratch, p->counts, p->nr_patches, 1 /* words */,
+                   0 /* word */, 1024);
+
+   /* After prefix summing, we know the total # of indices, so allocate the
+    * index buffer now. Elect a thread for the allocation.
+    */
+   barrier(CLK_LOCAL_MEM_FENCE);
+   if (cl_local_id.x != 0)
+      return;
+
+   /* The last element of an inclusive prefix sum is the total sum */
+   uint total = p->nr_patches > 0 ? p->counts[p->nr_patches - 1] : 0;
+   libagx_tess_alloc_draw(p, total, c_prims, c_invs, increment_stats);
+}
+
+KERNEL(1024)
+libagx_prefix_sum_tess(global struct poly_tess_params *p, global uint *c_prims,
+                       global uint *c_invs, uint increment_stats__2)
+{
+   local uint scratch[32];
+   libagx_prefix_sum_tess_draw(scratch, p, c_prims, c_invs,
+                               increment_stats__2);
+}
+
+/* libagx_prefix_sum_tess of each draw of a folded dispatch, one workgroup
+ * per draw. Folded draws have no statistics.
+ */
+KERNEL(1024)
+libagx_prefix_sum_tess_fold(constant struct libagx_tess_fold_draw *draws)
+{
+   local uint scratch[32];
+   global struct poly_tess_params *p =
+      (global struct poly_tess_params *)draws[cl_group_id.x].p;
+   libagx_prefix_sum_tess_draw(scratch, p, NULL, NULL, 0);
+}
+
+/*
+ * Prefix sum of many patch counts in three passes, so that the work spreads
+ * over the GPU instead of one workgroup walking every patch:
+ *
+ *  1. libagx_prefix_sum_tess_blocks: workgroup i scans block i in place and
+ *     records the block's total.
+ *  2. libagx_prefix_sum_tess_offsets: one workgroup scans the block totals,
+ *     then allocates the index buffer and writes the draw.
+ *  3. libagx_prefix_sum_tess_add: every block after the first adds the
+ *     inclusive total of the blocks before it.
+ */
+KERNEL(1024)
+libagx_prefix_sum_tess_blocks(global uint *counts, global uint *block_sums,
+                              uint nr_patches, uint block_size)
+{
+   local uint scratch[32];
+   uint start = cl_group_id.x * block_size;
+   uint len = min(block_size, nr_patches - start);
+   poly_prefix_sum(scratch, counts + start, len, 1 /* words */, 0 /* word */,
+                   1024);
+
+   /* Each thread reads back only what it wrote, except for the total, which
+    * the thread that wrote the last element publishes.
+    */
+   uint last = len - 1;
+   if (cl_local_id.x == last % 1024)
+      block_sums[cl_group_id.x] = counts[start + last];
+}
+
+KERNEL(1024)
+libagx_prefix_sum_tess_offsets(global struct poly_tess_params *p,
+                               global uint *block_sums, uint nr_blocks,
+                               global uint *c_prims, global uint *c_invs,
+                               uint increment_stats__2)
+{
+   local uint scratch[32];
+   poly_prefix_sum(scratch, block_sums, nr_blocks, 1 /* words */, 0 /* word */,
+                   1024);
+
+   barrier(CLK_LOCAL_MEM_FENCE);
+   if (cl_local_id.x != (nr_blocks - 1) % 1024)
+      return;
+
+   libagx_tess_alloc_draw(p, block_sums[nr_blocks - 1], c_prims, c_invs,
+                          increment_stats__2);
+}
+
+KERNEL(1024)
+libagx_prefix_sum_tess_add(global uint *counts, constant uint *block_sums,
+                           uint nr_patches, uint block_size)
+{
+   uint i = cl_global_id.x + block_size;
+   if (i < nr_patches)
+      counts[i] += block_sums[(i / block_size) - 1];
 }

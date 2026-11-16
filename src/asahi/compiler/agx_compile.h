@@ -80,11 +80,17 @@ struct agx_rodata {
    uint16_t size_16;
 };
 
-/* The current export publication bank retains position plus user scalars
- * through completion. This is a validated compiler capacity, not an API or
- * hardware varying limit. Semantic locations are compacted independently of
- * declaration order and never encoded directly as hardware slot numbers. */
-#define AGX_APPLE9_MAX_VARYING_COMPONENTS 96
+/* Produced user scalars: position occupies four of the 128 publication
+ * entries. Other system outputs share the remaining bank. This is not a
+ * limit on declared fragment inputs: semantic locations are compacted
+ * independently of declaration order and never encoded directly as
+ * hardware slot numbers. */
+#define AGX_APPLE9_MAX_VARYING_COMPONENTS 124
+/* UVS slots: position, user scalars, point size, the layer/viewport word and
+ * eight clip distances. */
+#define AGX_APPLE9_MAX_UVS_SLOTS (4 + AGX_APPLE9_MAX_VARYING_COMPONENTS + 10)
+/* Varying scalars a fragment shader may read per vertex. */
+#define AGX_APPLE9_MAX_PER_VERTEX 32
 /* Interpolation modes are indexed by compacted scalar, independent of API
  * locations. Two words cover the complete publication-addressing namespace. */
 struct agx_apple9_interp_mask {
@@ -123,8 +129,11 @@ agx_apple9_varying_supported(unsigned location)
    return (location >= VARYING_SLOT_COL0 && location <= VARYING_SLOT_TEX7) ||
           location == VARYING_SLOT_BFC0 || location == VARYING_SLOT_BFC1 ||
           location == VARYING_SLOT_PRIMITIVE_ID ||
+          location == VARYING_SLOT_VIEWPORT ||
           location == VARYING_SLOT_CLIP_VERTEX ||
           location == VARYING_SLOT_CLIP_DIST0 || location == VARYING_SLOT_CLIP_DIST1 ||
+          location == VARYING_SLOT_CULL_PRIMITIVE ||
+          location == VARYING_SLOT_CULL_PRIMITIVE + 1 ||
           (location >= VARYING_SLOT_VAR0 && location <= VARYING_SLOT_VAR31);
 }
 
@@ -134,8 +143,35 @@ struct agx_apple9_varying_layout {
     * clipper's varying counts. Values within each group use semantic order. */
    uint8_t group[64];
    uint8_t count;
-   uint8_t reserved[3];
+   bool cull_distance_mask; /* Flat, primitive-wide negative-plane bits. */
+   uint8_t reserved[2];
 };
+
+static inline unsigned
+agx_apple9_varying_group(uint64_t flat, uint64_t linear, unsigned location)
+{
+   return (flat & BITFIELD64_BIT(location)) ? 1 :
+          (linear & BITFIELD64_BIT(location)) ? 2 : 0;
+}
+
+/* Returns the packed user scalar index, excluding the four position words. */
+static inline int
+agx_apple9_varying_index(const struct agx_apple9_varying_layout *layout,
+                     unsigned location, unsigned component)
+{
+   if (!layout || !agx_apple9_varying_supported(location) || component >= 4)
+      return -1;
+   unsigned semantic = location;
+   if (!(layout->mask[semantic] & BITFIELD_BIT(component)))
+      return -1;
+   unsigned index = util_bitcount(layout->mask[semantic] & BITFIELD_MASK(component));
+   for (unsigned i = 0; i < ARRAY_SIZE(layout->mask); ++i) {
+      if (layout->group[i] < layout->group[semantic] ||
+          (layout->group[i] == layout->group[semantic] && i < semantic))
+         index += util_bitcount(layout->mask[i]);
+   }
+   return index;
+}
 
 /* Software capacity of the graphics address table, separate from launcher
  * slots. */
@@ -150,15 +186,27 @@ struct agx_shader_info {
    struct agx_apple9_varying_layout apple9_varyings;
    struct agx_apple9_interp_mask apple9_linear_mask, apple9_flat_mask;
    uint16_t apple9_publication_count;
+   /* Per-thread frame bytes for Apple9 atomics that return a value. */
+   uint8_t apple9_atomic_frame_size;
    /* Apple9 setup code is entered by the launcher, independently of USC
     * preshader configuration used by earlier generations. */
    uint32_t apple9_preamble_offset, apple9_preamble_size;
+   /* Native task/mesh code requiring a native entry/launch contract.
+    * Completion may already be lowered. Generic upload must reject it. */
+   bool apple9_body_only;
    bool apple9_reads_z;
    bool apple9_reads_primitive_id;
    bool apple9_reads_tile;
    bool apple9_writes_point_size;
    uint8_t apple9_clip_distance_count;
    bool apple9_reads_point_coord;
+   /* Barycentric weights (bit 0 perspective, bit 1 linear) and the varying
+    * scalars read per vertex, in the order of their coefficients. Both follow
+    * the point coordinates.
+    */
+   uint8_t apple9_barycentric_mask;
+   uint8_t apple9_per_vertex_count;
+   uint8_t apple9_per_vertex[AGX_APPLE9_MAX_PER_VERTEX];
    /* Ordered graphics table entries: API UBOs 0..31, vertex bindings 32..63. */
    uint32_t apple9_resource_ssbo_mask, apple9_resource_write_mask;
    uint8_t apple9_resource_count;
@@ -167,6 +215,8 @@ struct agx_shader_info {
    uint32_t apple9_texture_mask, apple9_sampler_mask, apple9_image_mask;
    bool apple9_uses_texel_fetch;
    bool apple9_uses_discard;
+   /* Fragment shader with pixel_interlock_{ordered,unordered}. */
+   bool apple9_pixel_interlock;
 
    union agx_varyings varyings;
 
@@ -500,6 +550,8 @@ static const nir_shader_compiler_options agx_nir_options = {
    .lower_hadd = true,
    .has_amul = true,
    .has_isub = true,
+   .txl_lod_from_zero_gradients_is_neg_inf = true,
+   .ssbo_readonly_as_constant_offset = true,
    .has_load_global_bounded = true,
    .support_16bit_alu = true,
    .max_unroll_iterations = 32,

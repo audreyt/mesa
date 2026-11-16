@@ -78,8 +78,9 @@ lower_tex_crawl(nir_builder *b, nir_instr *instr, UNUSED void *data)
    nir_tex_instr *tex = nir_instr_as_tex(instr);
    b->cursor = nir_before_instr(instr);
 
-   if (tex->op != nir_texop_txs && tex->op != nir_texop_texture_samples &&
-       tex->op != nir_texop_query_levels)
+   if ((tex->op != nir_texop_txs && tex->op != nir_texop_texture_samples &&
+        tex->op != nir_texop_query_levels) ||
+       (tex->backend_flags & AGX_TEXTURE_FLAG_METADATA_QUERY))
       return false;
 
    nir_def *ptr = texture_descriptor_ptr(b, tex);
@@ -615,7 +616,7 @@ lower_images(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
  * cheap robustness2.
  */
 static bool
-lower_robustness(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
+lower_robustness(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
    b->cursor = nir_before_instr(&intr->instr);
 
@@ -663,9 +664,16 @@ lower_robustness(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
     * This ensures the resulting hardware coordinate is definitely
     * out-of-bounds, giving hardware-level robustness2 behaviour.
     */
+   /* A buffer coordinate indexes elements, and a view can have more than
+    * 0xFFF0 of them. Where buffer images are bounds-checked in software
+    * against the element count, as on Apple9, use the largest index instead.
+    */
+   const bool *software_buffer_bounds = data;
    unsigned c = size_components - 1;
+   unsigned oob_coord =
+      dim == GLSL_SAMPLER_DIM_BUF && *software_buffer_bounds ? 0xFFFFFFFF : 0xFFF0;
    nir_def *r =
-      nir_bcsel(b, oob, nir_imm_int(b, 0xFFF0), nir_channel(b, coord, c));
+      nir_bcsel(b, oob, nir_imm_int(b, oob_coord), nir_channel(b, coord, c));
 
    nir_src_rewrite(&intr->src[1], nir_vector_insert_imm(b, coord, r, c));
    return true;
@@ -679,12 +687,13 @@ lower_robustness(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
  * the full agx_nir_lower_texture.
  */
 bool
-agx_nir_lower_texture_early(nir_shader *s, bool support_lod_bias)
+agx_nir_lower_texture_early(nir_shader *s, bool support_lod_bias,
+                            bool software_buffer_bounds)
 {
    bool progress = false;
 
    NIR_PASS(progress, s, nir_shader_intrinsics_pass, lower_robustness,
-            nir_metadata_control_flow, NULL);
+            nir_metadata_control_flow, &software_buffer_bounds);
 
    nir_lower_tex_options lower_tex_options = {
       .lower_txp = ~0,
@@ -707,18 +716,16 @@ agx_nir_lower_texture_early(nir_shader *s, bool support_lod_bias)
 }
 
 bool
-agx_nir_lower_texture(nir_shader *s)
+agx_nir_lower_texture_queries(nir_shader *s)
+{
+   return nir_shader_instructions_pass(s, lower_tex_crawl,
+                                       nir_metadata_control_flow, NULL);
+}
+
+bool
+agx_nir_lower_images(nir_shader *s)
 {
    bool progress = false;
-
-   nir_tex_src_type_constraints tex_constraints = {
-      [nir_tex_src_lod] = {true, 16},
-      [nir_tex_src_bias] = {true, 16},
-      [nir_tex_src_ms_index] = {true, 16},
-      [nir_tex_src_min_lod] = {true, 16},
-      [nir_tex_src_texture_offset] = {true, 16},
-      [nir_tex_src_sampler_offset] = {true, 16},
-   };
 
    /* Insert fences before lowering image atomics, since image atomics need
     * different fencing than other image operations.
@@ -732,6 +739,24 @@ agx_nir_lower_texture(nir_shader *s)
             nir_metadata_control_flow, NULL);
    NIR_PASS(progress, s, nir_shader_intrinsics_pass, lower_images,
             nir_metadata_control_flow, NULL);
+   return progress;
+}
+
+bool
+agx_nir_lower_texture(nir_shader *s)
+{
+   bool progress = false;
+
+   nir_tex_src_type_constraints tex_constraints = {
+      [nir_tex_src_lod] = {true, 16},
+      [nir_tex_src_bias] = {true, 16},
+      [nir_tex_src_ms_index] = {true, 16},
+      [nir_tex_src_min_lod] = {true, 16},
+      [nir_tex_src_texture_offset] = {true, 16},
+      [nir_tex_src_sampler_offset] = {true, 16},
+   };
+
+   NIR_PASS(progress, s, agx_nir_lower_images);
    NIR_PASS(progress, s, nir_legalize_16bit_sampler_srcs, tex_constraints);
 
    /* Fold constants after nir_legalize_16bit_sampler_srcs so we can detect 0 in
@@ -745,8 +770,7 @@ agx_nir_lower_texture(nir_shader *s)
     */
    NIR_PASS(progress, s, nir_shader_instructions_pass, lower_regular_texture,
             nir_metadata_none, NULL);
-   NIR_PASS(progress, s, nir_shader_instructions_pass, lower_tex_crawl,
-            nir_metadata_control_flow, NULL);
+   NIR_PASS(progress, s, agx_nir_lower_texture_queries);
 
    return progress;
 }

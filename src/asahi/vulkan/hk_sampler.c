@@ -15,6 +15,7 @@
 #include "vk_sampler.h"
 
 #include "asahi/genxml/agx_pack.h"
+#include "asahi/lib/agx_helpers.h"
 
 static inline uint32_t
 translate_address_mode(VkSamplerAddressMode addr_mode)
@@ -136,12 +137,17 @@ translate_border_color(VkBorderColor color, bool custom_to_1,
 static void
 pack_sampler(const struct hk_physical_device *pdev,
              const struct VkSamplerCreateInfo *info, bool custom_to_1,
-             bool workaround_rgba4, struct agx_sampler_packed *out)
+             bool workaround_rgba4, bool native_custom,
+             struct agx_sampler_packed *out)
 {
    agx_pack(out, SAMPLER, cfg) {
       cfg.minimum_lod = info->minLod;
       cfg.maximum_lod = info->maxLod;
-      cfg.magnify = translate_filter(info->magFilter);
+      /* A positive minimum LOD always minifies, but the 4.6 fixed-point
+       * field truncates small minimums to zero, where the hardware would
+       * magnify. Selecting the minification filter keeps the API result. */
+      cfg.magnify = translate_filter(info->minLod > 0.0f ? info->minFilter
+                                                         : info->magFilter);
       cfg.minify = translate_filter(info->minFilter);
       cfg.mip_filter = translate_mipfilter(info->mipmapMode);
       cfg.wrap_s = translate_address_mode(info->addressModeU);
@@ -165,8 +171,10 @@ pack_sampler(const struct hk_physical_device *pdev,
       }
 
       if (uses_border(info)) {
-         cfg.border_colour = translate_border_color(
-            info->borderColor, custom_to_1, workaround_rgba4);
+         cfg.border_colour =
+            native_custom ? AGX_BORDER_COLOUR_CUSTOM
+                          : translate_border_color(info->borderColor,
+                                                   custom_to_1, workaround_rgba4);
       }
    }
 }
@@ -185,16 +193,38 @@ hk_CreateSampler(VkDevice device,
    if (!sampler)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   bool workaround_rgba4 = dev->vk.enabled_features.customBorderColors;
+   /* Descriptors carry the sampler heap index of each plane. A replayed
+    * sampler takes the indices it was captured with.
+    */
+   struct hk_sampler_capture_data replay = {
+      .index = {HK_DESCRIPTOR_TABLE_ANY_INDEX, HK_DESCRIPTOR_TABLE_ANY_INDEX},
+   };
+   if (info->flags & VK_SAMPLER_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT) {
+      const VkOpaqueCaptureDescriptorDataCreateInfoEXT *cap_info =
+         vk_find_struct_const(info->pNext,
+                              OPAQUE_CAPTURE_DESCRIPTOR_DATA_CREATE_INFO_EXT);
+      if (cap_info && cap_info->opaqueCaptureDescriptorData)
+         memcpy(&replay, cap_info->opaqueCaptureDescriptorData, sizeof(replay));
+   }
+
+   /* G16 samples custom border colours natively, with the border format the
+    * application provides (customBorderColorWithoutFormat is not exposed).
+    * Its opaque black needs no RGBA4 workaround through that path. */
+   const bool g16 = agx_is_apple9(&pdev->dev);
+   bool workaround_rgba4 = !g16 && dev->vk.enabled_features.customBorderColors;
    bool custom_border =
       uses_border(info) &&
       is_border_color_custom(info->borderColor, workaround_rgba4);
+   bool native_custom =
+      g16 && custom_border && sampler->vk.format != VK_FORMAT_UNDEFINED;
 
    /* Sanity check the noborder setting. There's no way to recover from it being
     * wrong but at least we can make noise to lint for errors in the driconf.
+    * A border the hardware applies natively needs no emulation.
     */
    static bool warned_custom_border = false;
-   if (HK_PERF(dev, NOBORDER) && custom_border && !warned_custom_border) {
+   if (HK_PERF(dev, NOBORDER) && custom_border && !native_custom &&
+       !warned_custom_border) {
       fprintf(stderr, "custom border colour used, but emulation is disabled\n");
       fprintf(stderr, "border %u\n", info->borderColor);
       fprintf(stderr, "unnorm %X\n", info->unnormalizedCoordinates);
@@ -209,14 +239,37 @@ hk_CreateSampler(VkDevice device,
       warned_custom_border = true;
    }
 
+   if (native_custom) {
+      /* The hardware applies the image view's swizzle to the native border
+       * colour itself, so the border colour component mapping hint must not
+       * be applied again here (it is for the emulated path below). */
+      VkClearColorValue bc = sampler->vk.border_color_value;
+      static_assert(sizeof(sampler->apple9_border) ==
+                       sizeof(struct agx_border_packed),
+                    "G13 border layout");
+      agx_pack_border((struct agx_border_packed *)sampler->apple9_border,
+                      bc.uint32, vk_format_to_pipe_format(sampler->vk.format));
+   }
+
    struct agx_sampler_packed samp;
-   pack_sampler(pdev, info, true, workaround_rgba4, &samp);
+   pack_sampler(pdev, info, true, workaround_rgba4, native_custom, &samp);
 
    /* LOD bias passed in the descriptor set */
    sampler->lod_bias_fp16 = _mesa_float_to_half(info->mipLodBias);
 
+   /* Vulkan rounds a NEAREST mip selection exactly halfway between levels
+    * down, D3D up. The sampler resolves the LOD in 1/64 steps, so one step
+    * added to explicit LODs rounds exact halves up, see
+    * hk_lower_d3d_txl_rounding. Computed LODs are left alone: the hardware's
+    * estimate is not exact to a step, and a step there moves real results.
+    */
+   if (pdev->apple9_d3d_mip_rounding &&
+       info->mipmapMode == VK_SAMPLER_MIPMAP_MODE_NEAREST)
+      sampler->txl_nudge_fp16 = _mesa_float_to_half(1.0f / 64.0f);
+
    result =
-      hk_sampler_heap_add(dev, samp, &sampler->planes[sampler->plane_count].hw);
+      hk_sampler_heap_add(dev, samp, replay.index[sampler->plane_count],
+                          &sampler->planes[sampler->plane_count].hw);
    if (result != VK_SUCCESS) {
       hk_DestroySampler(device, hk_sampler_to_handle(sampler), pAllocator);
       return result;
@@ -245,9 +298,10 @@ hk_CreateSampler(VkDevice device,
          plane2_info.magFilter = chroma_filter;
          plane2_info.minFilter = chroma_filter;
 
-         pack_sampler(pdev, &plane2_info, false, workaround_rgba4, &samp);
+         pack_sampler(pdev, &plane2_info, false, workaround_rgba4, false, &samp);
          result = hk_sampler_heap_add(
-            dev, samp, &sampler->planes[sampler->plane_count].hw);
+            dev, samp, replay.index[sampler->plane_count],
+            &sampler->planes[sampler->plane_count].hw);
 
          if (result != VK_SUCCESS) {
             hk_DestroySampler(device, hk_sampler_to_handle(sampler),
@@ -257,12 +311,13 @@ hk_CreateSampler(VkDevice device,
 
          sampler->plane_count++;
       }
-   } else if (custom_border) {
+   } else if (custom_border && !g16) {
       /* If the sampler uses custom border colours, we need both clamp-to-1
        * and clamp-to-0 variants. We treat these as planes.
        */
-      pack_sampler(pdev, info, false, workaround_rgba4, &samp);
+      pack_sampler(pdev, info, false, workaround_rgba4, false, &samp);
       result = hk_sampler_heap_add(dev, samp,
+                                   replay.index[sampler->plane_count],
                                    &sampler->planes[sampler->plane_count].hw);
 
       if (result != VK_SUCCESS) {
@@ -293,6 +348,18 @@ hk_CreateSampler(VkDevice device,
       sampler->has_border = true;
    }
 
+   if (g16) {
+      for (unsigned p = 0; p < sampler->plane_count; ++p) {
+         struct hk_apple9_sampler_part *part = &sampler->planes[p].apple9;
+         hk_apple9_native_sampler(part->sampler, &sampler->planes[p].hw->key,
+                                  false, sampler->apple9_border);
+         hk_apple9_runtime_sampler(part->runtime_sampler,
+                                   &sampler->planes[p].hw->key, false);
+         part->lod_bias_fp16 = sampler->lod_bias_fp16;
+         part->txl_nudge_fp16 = sampler->txl_nudge_fp16;
+      }
+   }
+
    *pSampler = hk_sampler_to_handle(sampler);
 
    return VK_SUCCESS;
@@ -313,4 +380,21 @@ hk_DestroySampler(VkDevice device, VkSampler _sampler,
    }
 
    vk_sampler_destroy(&dev->vk, pAllocator, &sampler->vk);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_GetSamplerOpaqueCaptureDescriptorDataEXT(
+   UNUSED VkDevice device, const VkSamplerCaptureDescriptorDataInfoEXT *pInfo,
+   void *pData)
+{
+   VK_FROM_HANDLE(hk_sampler, sampler, pInfo->sampler);
+
+   struct hk_sampler_capture_data data = {
+      .index = {HK_DESCRIPTOR_TABLE_ANY_INDEX, HK_DESCRIPTOR_TABLE_ANY_INDEX},
+   };
+   for (unsigned i = 0; i < sampler->plane_count; i++)
+      data.index[i] = sampler->planes[i].hw->index;
+
+   memcpy(pData, &data, sizeof(data));
+   return VK_SUCCESS;
 }

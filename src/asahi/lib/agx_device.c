@@ -1,3 +1,5 @@
+#include <sys/ioctl.h>
+#include <linux/sync_file.h>
 /*
  * Copyright 2021 Alyssa Rosenzweig
  * Copyright 2019 Collabora, Ltd.
@@ -5,7 +7,9 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "util/u_wait_watchdog.h"
 #include "agx_device.h"
+#include "agx_native_mesh.h"
 #include "agx_apple9_layout.h"
 #include <inttypes.h>
 #include "clc/asahi_clc.h"
@@ -43,13 +47,16 @@
 #include "nir_serialize.h"
 #include "vdrm.h"
 
+static void agx_finish_device(struct agx_device *dev);
+
 static inline int
 asahi_simple_ioctl(struct agx_device *dev, unsigned cmd, void *req)
 {
    if (dev->is_virtio) {
       return agx_virtio_simple_ioctl(dev, cmd, req);
    } else {
-      return drmIoctl(dev->fd, cmd, req);
+      return U_WATCHDOG_IOCTL("asahi_simple_ioctl", dev->fd,
+                              drmIoctl(dev->fd, cmd, req));
    }
 }
 
@@ -83,37 +90,6 @@ static const struct debug_named_value agx_debug_options[] = {
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */
-
-void
-agx_bo_free(struct agx_device *dev, struct agx_bo *bo)
-{
-   const uint64_t handle = bo->handle;
-   struct agx_va *va = bo->va;
-
-   if (bo->_map)
-      munmap(bo->_map, bo->size);
-
-   if (bo->prime_fd != -1)
-      close(bo->prime_fd);
-
-   /* Reset the handle. This has to happen before the GEM close to avoid a race.
-    */
-   memset(bo, 0, sizeof(*bo));
-   __sync_synchronize();
-
-   struct drm_gem_close args = {.handle = handle};
-   if (drmIoctl(dev->fd, DRM_IOCTL_GEM_CLOSE, &args)) {
-      fprintf(stderr, "DRM_IOCTL_GEM_CLOSE failed: %m\n");
-      /* Keep the address reserved if the old mapping may still exist. */
-      free(va);
-      return;
-   }
-
-   /* GEM_CLOSE removes the kernel mappings. Only then allow another thread
-    * to reuse the address: BO allocation does not hold bo_map_lock while
-    * allocating and binding its VA. */
-   agx_va_free(dev, va, false);
-}
 
 static int
 agx_drm_bo_bind(struct agx_device *dev, struct drm_asahi_gem_bind_op *ops,
@@ -173,7 +149,8 @@ agx_bind_timestamps(struct agx_device *dev, struct agx_bo *bo, uint32_t *handle)
 
 static struct agx_bo *
 agx_bo_alloc(struct agx_device *dev, size_t size, size_t align,
-             enum agx_bo_flags flags)
+             enum agx_bo_flags flags,
+             enum agx_va_flags extra_va_flags, uint64_t fixed_va)
 {
    struct agx_bo *bo;
    unsigned handle = 0;
@@ -221,7 +198,8 @@ agx_bo_alloc(struct agx_device *dev, size_t size, size_t align,
    enum agx_va_flags va_flags = flags & AGX_BO_CONTEXT  ? AGX_VA_CONTEXT
                                 : flags & AGX_BO_LOW_VA ? AGX_VA_USC
                                                         : 0;
-   bo->va = agx_va_alloc(dev, size, bo->align, va_flags, 0);
+   bo->va = agx_va_alloc(dev, size, bo->align, va_flags | extra_va_flags,
+                         fixed_va);
    if (!bo->va) {
       fprintf(stderr, "Failed to allocate BO VMA\n");
       agx_bo_free(dev, bo);
@@ -242,10 +220,29 @@ agx_bo_alloc(struct agx_device *dev, size_t size, size_t align,
    return bo;
 }
 
-static void
-agx_bo_mmap(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr)
+/* BO mappings are MAP_SHARED views of GPU memory. A forked child inherits
+ * them at the same addresses but none of the driver state that owns them,
+ * and the parent may later reuse those addresses for other BOs: any write
+ * the child makes there, through its copy of the parent's heap pointers or
+ * an allocator reusing the range, lands in live GPU memory such as shader
+ * code. A GPU mapping is never valid to use in a child, so leave them out
+ * of fork(). A failure only loses this protection.
+ */
+void
+agx_bo_mapping_dontfork(void *map, size_t size)
 {
-   assert(bo->_map == NULL && "not double mapped");
+#ifdef MADV_DONTFORK
+   if (madvise(map, size, MADV_DONTFORK))
+      mesa_logw_once("madvise(MADV_DONTFORK) on a BO mapping failed: %s",
+                     strerror(errno));
+#endif
+}
+
+static void *
+agx_bo_mmap(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr,
+            size_t size)
+{
+   assert(size <= bo->size);
 
    struct drm_asahi_gem_mmap_offset gem_mmap_offset = {.handle =
                                                           bo->uapi_handle};
@@ -258,15 +255,16 @@ agx_bo_mmap(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr)
    }
 
    flags = MAP_SHARED | (fixed_addr ? MAP_FIXED : 0);
-   bo->_map = os_mmap(fixed_addr, bo->size, PROT_READ | PROT_WRITE, flags,
-                      dev->fd, gem_mmap_offset.offset);
-   if (bo->_map == MAP_FAILED) {
-      bo->_map = NULL;
-      fprintf(stderr,
-              "mmap failed: result=%p size=0x%llx fd=%i offset=0x%llx %m\n",
-              bo->_map, (long long)bo->size, dev->fd,
-              (long long)gem_mmap_offset.offset);
+   void *map = os_mmap(fixed_addr, size, PROT_READ | PROT_WRITE, flags,
+                       dev->fd, gem_mmap_offset.offset);
+   if (map == MAP_FAILED) {
+      fprintf(stderr, "mmap failed: size=0x%llx fd=%i offset=0x%llx %m\n",
+              (long long)size, dev->fd, (long long)gem_mmap_offset.offset);
+      return NULL;
    }
+
+   agx_bo_mapping_dontfork(map, size);
+   return map;
 }
 
 struct agx_bo *
@@ -276,8 +274,18 @@ agx_bo_import(struct agx_device *dev, int fd)
    ASSERTED int ret;
    unsigned gem_handle;
 
+   /* Validate before importing a handle, so invalid sizes cannot leak a GEM
+    * reference (or leave a half-initialized entry for the reaper/importer). */
+   off_t size = lseek(fd, 0, SEEK_END);
+   if (size <= 0 || (size & (AIL_PAGESIZE - 1))) {
+      fprintf(stderr, "import failed: invalid BO size 0x%llx\n",
+              (long long)size);
+      return NULL;
+   }
+
    pthread_mutex_lock(&dev->bo_map_lock);
 
+retry:
    ret = drmPrimeFDToHandle(dev->fd, fd, &gem_handle);
    if (ret) {
       fprintf(stderr, "import failed: Could not map fd %d to handle\n", fd);
@@ -288,25 +296,20 @@ agx_bo_import(struct agx_device *dev, int fd)
    bo = agx_lookup_bo(dev, gem_handle);
    dev->max_handle = MAX2(dev->max_handle, gem_handle);
 
+   if (!bo->size && dev->bo_closing_handle == gem_handle) {
+      /* The kernel may still return the old handle before the reaper's
+       * close removes it. Wait without blocking allocation or other imports,
+       * then import again. If allocation has already reused the handle, its
+       * nonempty slot describes the new object and needs no such wait.
+       */
+      pthread_cond_wait(&dev->bo_map_cond, &dev->bo_map_lock);
+      goto retry;
+   }
+
    if (!bo->size) {
       bo->dev = dev;
-      bo->size = lseek(fd, 0, SEEK_END);
+      bo->size = size;
       bo->align = AIL_PAGESIZE;
-
-      /* Sometimes this can fail and return -1. size of -1 is not
-       * a nice thing for mmap to try mmap. Be more robust also
-       * for zero sized maps and fail nicely too
-       */
-      if ((bo->size == 0) || (bo->size == (size_t)-1)) {
-         goto error;
-      }
-      if (bo->size & (AIL_PAGESIZE - 1)) {
-         fprintf(
-            stderr,
-            "import failed: BO is not a multiple of the page size (0x%llx bytes)\n",
-            (long long)bo->size);
-         goto error;
-      }
 
       bo->flags = AGX_BO_SHARED | AGX_BO_SHAREABLE;
       bo->handle = gem_handle;
@@ -339,18 +342,10 @@ agx_bo_import(struct agx_device *dev, int fd)
          abort();
       }
    } else {
-      /* bo->refcnt == 0 can happen if the BO
-       * was being released but agx_bo_import() acquired the
-       * lock before agx_bo_unreference(). In that case, refcnt
-       * is 0 and we can't use agx_bo_reference() directly, we
-       * have to re-initialize the refcnt().
-       * Note that agx_bo_unreference() checks
-       * refcnt value just after acquiring the lock to
-       * make sure the object is not freed if agx_bo_import()
-       * acquired it in the meantime.
-       */
+      /* Final unreference, resurrection and reaper removal all serialize
+       * on bo_map_lock. A queued shared BO still owns its handle and VA. */
       if (p_atomic_read(&bo->refcnt) == 0)
-         p_atomic_set(&bo->refcnt, 1);
+         agx_bo_reclaim(dev, bo);
       else
          agx_bo_reference(bo);
 
@@ -358,8 +353,8 @@ agx_bo_import(struct agx_device *dev, int fd)
        * been marked shared to begin with.
        */
       if (bo->shim_cpu_epoch)
-      *bo->shim_cpu_epoch = 0;
-   assert(bo->flags & AGX_BO_SHAREABLE);
+         *bo->shim_cpu_epoch = 0;
+      assert(bo->flags & AGX_BO_SHAREABLE);
       assert(bo->flags & AGX_BO_SHARED);
       assert(bo->prime_fd != -1);
    }
@@ -373,11 +368,6 @@ agx_bo_import(struct agx_device *dev, int fd)
    }
 
    return bo;
-
-error:
-   memset(bo, 0, sizeof(*bo));
-   pthread_mutex_unlock(&dev->bo_map_lock);
-   return NULL;
 }
 
 void
@@ -479,7 +469,8 @@ static int
 agx_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
            struct agx_submit_virt *virt)
 {
-   return drmIoctl(dev->fd, DRM_IOCTL_ASAHI_SUBMIT, submit);
+   return U_WATCHDOG_IOCTL("DRM_IOCTL_ASAHI_SUBMIT", dev->fd,
+                           drmIoctl(dev->fd, DRM_IOCTL_ASAHI_SUBMIT, submit));
 }
 
 const agx_device_ops_t agx_device_drm_ops = {
@@ -559,6 +550,34 @@ agx_open_device(void *memctx, struct agx_device *dev)
    assert(params_size >= sizeof(dev->params));
 
    assert(dev->params.gpu_generation >= 13);
+
+   /* Identify the chip before any helpers consume device state. */
+   switch (dev->params.gpu_generation) {
+   case 13:
+      dev->chip = dev->params.num_clusters_total > 1 ? AGX_CHIP_G13X
+                                                     : AGX_CHIP_G13G;
+      break;
+   case 14:
+   case 15:
+      dev->chip = dev->params.num_clusters_total > 1 ? AGX_CHIP_G14X
+                                                     : AGX_CHIP_G14G;
+      break;
+   case 16:
+      assert(dev->params.gpu_variant == 'G' ||
+             dev->params.gpu_variant == 'S' ||
+             dev->params.gpu_variant == 'C');
+      /* Pro shares the multi-cluster Max graphics path and ISA. */
+      dev->chip = dev->params.gpu_variant != 'G' ? AGX_CHIP_G16C
+                                               : AGX_CHIP_G16G;
+      break;
+   case 17:
+      assert(dev->params.gpu_variant == 'P');
+      dev->chip = AGX_CHIP_G17P;
+      break;
+   default:
+      UNREACHABLE("Unsupported AGX generation");
+   }
+
    const char *variant = " Unknown";
    switch (dev->params.gpu_variant) {
    case 'G':
@@ -648,11 +667,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
    util_sparse_array_init(&dev->bo_map, sizeof(struct agx_bo), 512);
    pthread_mutex_init(&dev->bo_map_lock, NULL);
 
-   simple_mtx_init(&dev->bo_cache.lock, mtx_plain);
-   list_inithead(&dev->bo_cache.lru);
-
-   for (unsigned i = 0; i < ARRAY_SIZE(dev->bo_cache.buckets); ++i)
-      list_inithead(&dev->bo_cache.buckets[i]);
+   agx_bo_cache_init(dev);
 
    /* The generic ABI puts a generous kernel-private heap at the top of the
     * VM.  G16 render Work instead addresses that backend-owned state relative
@@ -662,17 +677,21 @@ agx_open_device(void *memctx, struct agx_device *dev)
    uint64_t kernel_size = MAX2(dev->params.vm_kernel_min_size, 32ull << 30);
    struct drm_asahi_vm_create vm_create = {0};
    if (dev->params.gpu_generation == 16 &&
-       dev->params.gpu_variant == 'G') {
+       (dev->params.gpu_variant == 'G' || dev->params.gpu_variant == 'S' ||
+        dev->params.gpu_variant == 'C')) {
       kernel_size = dev->params.vm_kernel_min_size;
       vm_create.kernel_end =
          AGX_APPLE9_RENDER_CONTEXT_BASE + (1ull << 32);
       vm_create.kernel_start = vm_create.kernel_end - kernel_size;
+      /* PPP and VDM records share the same 4-GiB aperture, between the low
+       * 64 MiB of fixed aliases and the kernel heap. Keep at least 1 GiB for
+       * them rather than wrapping or starving that heap. */
       if (kernel_size < 0x4000000ull ||
-          vm_create.kernel_end >
-             AGX_APPLE9_RENDER_CONTEXT_BASE + (1ull << 32)) {
+          kernel_size > (1ull << 32) - 0x4000000ull - (1ull << 30)) {
          fprintf(stderr,
-                 "G16 kernel-private heap does not fit its compact render "
-                 "context\n");
+                 "G16 kernel-private heap (%" PRIu64 " MiB) does not fit its "
+                 "compact render context with 1 GiB for render records\n",
+                 kernel_size >> 20);
          return false;
       }
    } else {
@@ -690,12 +709,40 @@ agx_open_device(void *memctx, struct agx_device *dev)
    assert(user_start < user_end);
    uint64_t user_size = user_end - user_start;
 
+   /* Only native G16G VMs can qualify for the current mesh profile. */
+   const char *classes = dev->params.gpu_generation == 16 &&
+                         dev->params.gpu_variant == 'G' && !dev->is_virtio
+                            ? dev->native_mesh_classes : NULL;
+   struct agx_native_mesh_support before =
+      agx_native_mesh_probe(dev->fd, classes);
+   struct agx_native_blocks_support blocks_before =
+      classes ? agx_native_blocks_probe(dev->fd)
+              : (struct agx_native_blocks_support){0};
+   dev->native_mesh_qualified = false;
+   dev->native_blocks = (struct agx_native_blocks_support){0};
    int ret = asahi_simple_ioctl(dev, DRM_IOCTL_ASAHI_VM_CREATE, &vm_create);
    if (ret) {
       fprintf(stderr, "DRM_IOCTL_ASAHI_VM_CREATE failed: %m\n");
       assert(0);
       return false;
    }
+
+   /* The kernel latches profile+generation at VM_CREATE and retains that
+    * profile for the VM lifetime. A concurrent mode change fails closed. */
+   struct agx_native_mesh_support after =
+      agx_native_mesh_probe(dev->fd, classes);
+   dev->native_mesh_qualified =
+      agx_native_mesh_same_qualification(before, after);
+
+   /* Batched native blocks are a property of the same latched profile: both
+    * attributes, sampled around VM_CREATE, must agree on one generation. */
+   struct agx_native_blocks_support blocks_after =
+      classes ? agx_native_blocks_probe(dev->fd)
+              : (struct agx_native_blocks_support){0};
+   if (dev->native_mesh_qualified &&
+       agx_native_blocks_same(blocks_before, blocks_after) &&
+       blocks_before.generation == before.generation)
+      dev->native_blocks = blocks_before;
 
    /* Round the user VA window to powers-of-two... */
    user_start = util_next_power_of_two64(user_start);
@@ -715,19 +762,40 @@ agx_open_device(void *memctx, struct agx_device *dev)
    assert(((user_start + (user_size - 1)) & dev->sparse_ro_offset) == 0);
 
    simple_mtx_init(&dev->vma_lock, mtx_plain);
-   util_vma_heap_init(&dev->main_heap, user_start, user_size);
-   util_vma_heap_init(&dev->usc_heap, dev->shader_base, shader_size);
+   /* Capture-replay allocations (VK_*_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT) come
+    * from the top of each heap, which nothing else uses: a captured address
+    * is then free at replay, whatever the replaying driver allocated first.
+    * Only devices created for capture or replay reserve them.
+    */
+   uint64_t replay_size =
+      dev->capture_replay ? MIN2(user_size / 8, 16ull << 30) : 0;
+   uint64_t replay_usc_size = dev->capture_replay ? shader_size / 8 : 0;
+   util_vma_heap_init(&dev->main_heap, user_start, user_size - replay_size);
+   util_vma_heap_init(&dev->replay_heap, user_start + user_size - replay_size,
+                      replay_size);
+   util_vma_heap_init(&dev->usc_heap, dev->shader_base,
+                      shader_size - replay_usc_size);
+   util_vma_heap_init(&dev->replay_usc_heap,
+                      dev->shader_base + shader_size - replay_usc_size,
+                      replay_usc_size);
    /* The low 64 MiB contain existing fixed context/firmware aliases. The
     * kernel owns the top of this aperture on native G16. PPP and VDM records
     * occupy the remaining interval and are retained by their submitting batch.
     * Keep this heap disjoint from main_heap and the fixed USC aperture. */
-   uint64_t context_start = AGX_APPLE9_RENDER_CONTEXT_BASE + 0x4000000ull;
+   /* G17P's source-owned initial tiler-growth tranche occupies offsets
+    * [0x02000000, 0x05200000). Keep caller command/PPP state above it;
+    * later growth tranches are selected around existing caller mappings. */
+   uint64_t context_start = AGX_APPLE9_RENDER_CONTEXT_BASE +
+      (dev->params.gpu_generation == 17 ? 0x8000000ull : 0x4000000ull);
    uint64_t context_end =
       MIN2(vm_create.kernel_start,
            AGX_APPLE9_RENDER_CONTEXT_BASE + (1ull << 32));
    util_vma_heap_init(&dev->context_heap, context_start,
                       fixed_apple9_usc_base ? context_end - context_start : 0);
    dev->context_heap.alloc_high = false;
+   agx_va_quarantine_init(dev, user_size - replay_size,
+                          shader_size - replay_usc_size,
+                          fixed_apple9_usc_base ? context_end - context_start : 0);
 
    /* The compact Apple9 entry arena must start at the USC base. Allocate
     * it first from the bottom of the heap; shader bodies and batch state can
@@ -747,51 +815,36 @@ agx_open_device(void *memctx, struct agx_device *dev)
       dev->libagx_programs = libagx_g13g;
    }
 
-   switch (dev->params.gpu_generation) {
-   case 13:
-      dev->chip = dev->params.num_clusters_total > 1 ? AGX_CHIP_G13X
-                                                     : AGX_CHIP_G13G;
-      break;
-   case 14:
-   case 15:
-      dev->chip = dev->params.num_clusters_total > 1 ? AGX_CHIP_G14X
-                                                     : AGX_CHIP_G14G;
-      break;
-   case 16:
-      assert(dev->params.gpu_variant == 'G');
-      dev->chip = AGX_CHIP_G16G;
-      break;
-   case 17:
-      assert(dev->params.gpu_variant == 'P');
-      dev->chip = AGX_CHIP_G17P;
-      break;
-   default:
-      UNREACHABLE("Unsupported AGX generation");
-   }
-
    /* Apple9 GPUs require their generation-specific graphics path. */
-   dev->apple9_direct_render =
-      dev->chip == AGX_CHIP_G16G || dev->chip == AGX_CHIP_G17P;
+   dev->apple9_direct_render = agx_is_apple9(dev);
    dev->apple9_trace = agx_apple9_trace_enabled();
 
-   if (dev->chip == AGX_CHIP_G16G || dev->chip == AGX_CHIP_G17P) {
+   if (agx_is_apple9(dev)) {
       simple_mtx_init(&dev->apple9_entry_lock, mtx_plain);
+      list_inithead(&dev->apple9_entry_lru);
       util_vma_heap_init(&dev->apple9_entry_heap, AGX_APPLE9_ENTRY_HEADER_SIZE,
                         AGX_APPLE9_ENTRY_ARENA_SIZE - AGX_APPLE9_ENTRY_HEADER_SIZE);
       dev->apple9_entry_heap.alloc_high = false;
-      /* Entry instructions are CPU-authored and GPU-read-only. The same
-       * mapping remains installed for every graphics and compute job. */
-      dev->apple9_entries =
-         agx_bo_create(dev, AGX_APPLE9_ENTRY_ARENA_SIZE,
-                       AGX_APPLE9_ENTRY_ARENA_SIZE,
-                       AGX_BO_EXEC | AGX_BO_LOW_VA | AGX_BO_WRITEBACK |
-                          AGX_BO_READONLY, "Apple9 shader entries");
-      if (!dev->apple9_entries ||
-          dev->apple9_entries->va->addr != dev->shader_base) {
+   }
+
+   /* Entry instructions are CPU-authored and GPU-read-only. The same mapping
+    * remains installed for every graphics and compute job. Reserve the arena
+    * and back its first chunk, which holds the header; later chunks are backed
+    * as entries reach them. */
+   if (agx_is_apple9(dev) &&
+       !dev->probe_only) {
+      dev->apple9_entry_va =
+         agx_va_alloc(dev, AGX_APPLE9_ENTRY_ARENA_SIZE,
+                      AGX_APPLE9_ENTRY_ARENA_SIZE, AGX_VA_USC | AGX_VA_FIXED,
+                      dev->shader_base);
+      if (!dev->apple9_entry_va) {
          fprintf(stderr, "Failed to reserve compact Apple9 shader entries\n");
          return false;
       }
-      dev->apple9_entry_map = agx_bo_map(dev->apple9_entries);
+      if (!agx_apple9_entry_back(dev, AGX_APPLE9_ENTRY_HEADER_SIZE)) {
+         fprintf(stderr, "Failed to back compact Apple9 shader entries\n");
+         return false;
+      }
    }
 
    /* Bind read-only zero page at 2^32. This is in our reservation, and can be
@@ -839,31 +892,97 @@ agx_open_device(void *memctx, struct agx_device *dev)
    }
 
    u_printf_init(&dev->printf, bo, agx_bo_map(bo));
+   /* Start only after initialization succeeds: no worker may outlive a
+    * failed device open. All allocations made above are still idle. */
+   if (!agx_bo_cache_start(dev)) {
+      agx_finish_device(dev);
+      return false;
+   }
    return true;
+}
+
+bool
+agx_apple9_entry_back(struct agx_device *dev, uint32_t end_B)
+{
+   assert(end_B <= AGX_APPLE9_ENTRY_ARENA_SIZE);
+   for (unsigned i = 0; i * AGX_APPLE9_ENTRY_CHUNK_SIZE < end_B; ++i) {
+      if (dev->apple9_entry_chunks[i])
+         continue;
+
+      struct agx_bo *bo =
+         agx_bo_create(dev, AGX_APPLE9_ENTRY_CHUNK_SIZE, 0,
+                       AGX_BO_EXEC | AGX_BO_WRITEBACK | AGX_BO_READONLY,
+                       "Apple9 shader entries");
+      if (!bo)
+         return false;
+
+      /* The chunk's place in the arena, read-only for the GPU. */
+      uint32_t offset = i * AGX_APPLE9_ENTRY_CHUNK_SIZE;
+      if (agx_bo_bind(dev, bo, dev->shader_base + offset,
+                      AGX_APPLE9_ENTRY_CHUNK_SIZE, 0, DRM_ASAHI_BIND_READ) ||
+          !agx_bo_map(bo)) {
+         agx_bo_unreference(dev, bo);
+         return false;
+      }
+
+      dev->apple9_entry_chunks[i] = bo;
+   }
+   return true;
+}
+
+void
+agx_apple9_entry_write(struct agx_device *dev, uint32_t offset,
+                       const void *data, uint32_t size)
+{
+   const uint8_t *src = data;
+   while (size) {
+      struct agx_bo *bo =
+         dev->apple9_entry_chunks[offset / AGX_APPLE9_ENTRY_CHUNK_SIZE];
+      uint32_t in_chunk = offset % AGX_APPLE9_ENTRY_CHUNK_SIZE;
+      uint32_t n = MIN2(size, AGX_APPLE9_ENTRY_CHUNK_SIZE - in_chunk);
+      memcpy((uint8_t *)agx_bo_map(bo) + in_chunk, src, n);
+      agx_bo_note_cpu_write(bo, in_chunk, n);
+      offset += n;
+      src += n;
+      size -= n;
+   }
+}
+
+static void
+agx_finish_device(struct agx_device *dev)
+{
+   for (unsigned i = 0; i < AGX_APPLE9_ENTRY_CHUNKS; ++i)
+      agx_bo_unreference(dev, dev->apple9_entry_chunks[i]);
+   if (dev->apple9_entry_va)
+      agx_va_free(dev, dev->apple9_entry_va, true);
+   agx_bo_unreference(dev, dev->printf.bo);
+   agx_bo_unreference(dev, dev->zero_bo);
+   agx_bo_unreference(dev, dev->scratch_bo);
+   u_printf_destroy(&dev->printf);
+   agx_bo_cache_finish(dev);
+   agx_va_quarantine_finish(dev);
+   if (agx_is_apple9(dev)) {
+      util_vma_heap_finish(&dev->apple9_entry_heap);
+      simple_mtx_destroy(&dev->apple9_entry_lock);
+   }
+   util_sparse_array_finish(&dev->bo_map);
+   pthread_mutex_destroy(&dev->bo_map_lock);
+   agxdecode_destroy_context(dev->agxdecode);
+
+   util_vma_heap_finish(&dev->main_heap);
+   util_vma_heap_finish(&dev->replay_heap);
+   util_vma_heap_finish(&dev->usc_heap);
+   util_vma_heap_finish(&dev->replay_usc_heap);
+   util_vma_heap_finish(&dev->context_heap);
+   glsl_type_singleton_decref();
 }
 
 void
 agx_close_device(struct agx_device *dev)
 {
-   agx_bo_unreference(dev, dev->apple9_entries);
-   agx_bo_unreference(dev, dev->printf.bo);
-   agx_bo_unreference(dev, dev->zero_bo);
-   agx_bo_unreference(dev, dev->scratch_bo);
-   u_printf_destroy(&dev->printf);
-   agx_bo_cache_evict_all(dev);
-   if (dev->chip == AGX_CHIP_G16G || dev->chip == AGX_CHIP_G17P) {
-      util_vma_heap_finish(&dev->apple9_entry_heap);
-      simple_mtx_destroy(&dev->apple9_entry_lock);
-   }
-   util_sparse_array_finish(&dev->bo_map);
-   agxdecode_destroy_context(dev->agxdecode);
-
-   util_vma_heap_finish(&dev->main_heap);
-   util_vma_heap_finish(&dev->usc_heap);
-   util_vma_heap_finish(&dev->context_heap);
-   glsl_type_singleton_decref();
-
+   agx_finish_device(dev);
    close(dev->fd);
+   dev->fd = -1;
 }
 
 uint32_t
@@ -931,6 +1050,26 @@ agx_import_sync_file(struct agx_device *dev, struct agx_bo *bo, int fd)
    assert(ret >= 0);
 
    return ret;
+}
+
+/* Error status of a signalled binary syncobj's fence: negative errno if the
+ * work it tracks failed (GPU fault, timeout, or a banned queue), 0 otherwise.
+ * The kernel completes failed work's fences with an error rather than leaving
+ * them pending, so waits return; this is how a client learns about it.
+ */
+int
+agx_syncobj_error(struct agx_device *dev, uint32_t syncobj)
+{
+   int fd = -1;
+   if (drmSyncobjExportSyncFile(dev->fd, syncobj, &fd) || fd < 0)
+      return 0;
+
+   struct sync_file_info info = {0};
+   int status = 0;
+   if (ioctl(fd, SYNC_IOC_FILE_INFO, &info) == 0 && info.status < 0)
+      status = info.status;
+   close(fd);
+   return status;
 }
 
 int

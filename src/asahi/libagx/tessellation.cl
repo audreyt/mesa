@@ -19,12 +19,18 @@ libagx_tess_setup_indirect(
    global uint32_t *tcs_statistic)
 {
    uint count = indirect[0], instance_count = indirect[1];
-   unsigned in_patches = count / p->input_patch_size;
 
-   /* TCS invocation counter increments once per-patch */
-   if (tcs_statistic) {
-      *tcs_statistic += in_patches;
+   /* A draw whose buffers cannot be allocated is dropped: with zero counts,
+    * every grid below is empty.
+    */
+   if (!poly_tess_indirect_fits(count, instance_count, p->input_patch_size,
+                                p->tcs_stride_el, vertex_outputs,
+                                p->heap->size)) {
+      count = 0;
+      instance_count = 0;
    }
+
+   unsigned in_patches = count / p->input_patch_size;
 
    size_t draw_stride = 5 * sizeof(uint32_t);
    unsigned unrolled_patches = in_patches * instance_count;
@@ -43,8 +49,22 @@ libagx_tess_setup_indirect(
    uint vb_size = poly_tcs_in_size(count * instance_count, vertex_outputs);
    alloc += vb_size;
 
-   /* Allocate all patch calculations in one go */
-   global uchar *blob = poly_heap_alloc(p->heap, alloc);
+   /* Allocate all patch calculations in one go. An exhausted heap drops the
+    * draw like one that cannot fit at all.
+    */
+   global uchar *blob = poly_heap_try_alloc(p->heap, alloc);
+   if (!blob) {
+      count = 0;
+      instance_count = 0;
+      in_patches = 0;
+      unrolled_patches = 0;
+      blob = p->heap->base;
+   }
+
+   /* TCS invocation counter increments once per-patch */
+   if (tcs_statistic) {
+      *tcs_statistic += in_patches;
+   }
 
    p->tcs_buffer = (global float *)(blob + tcs_out_offs);
    p->patches_per_instance = in_patches;

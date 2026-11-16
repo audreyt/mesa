@@ -5,18 +5,16 @@
  * SPDX-License-Identifier: MIT
  */
 #include "util/format/u_formats.h"
-#include <stdio.h>
 #include "util/macros.h"
 #include "util/u_math.h"
 #include "vulkan/vulkan_core.h"
 #include "hk_cmd_buffer.h"
-#include "hk_apple9_trace.h"
-#include "asahi/lib/agx_apple9_compute.h"
 #include "layout.h"
 
 #include "hk_device.h"
 #include "hk_entrypoints.h"
 #include "hk_image.h"
+#include "hk_feedback.h"
 #include "hk_image_view.h"
 #include "hk_physical_device.h"
 
@@ -28,16 +26,14 @@ hk_clear_image(struct hk_cmd_buffer *cmd, struct hk_image *image,
                enum pipe_format view_format, const uint32_t *clear_value,
                const VkImageSubresourceRange *range, bool whole_3d)
 {
-   if (agx_apple9_compute_enabled(&hk_cmd_buffer_device(cmd)->dev) &&
-       hk_apple9_trace(HK_APPLE9_TRACE_META)) {
-      fprintf(stderr,
-              "APPLE9_META op=clear-image cmd=%p aspect=0x%x level=%u+%u layer=%u+%u\n",
-              (void *)cmd, range->aspectMask, range->baseMipLevel, range->levelCount,
-              range->baseArrayLayer, range->layerCount);
-      hk_apple9_trace_image("dst", hk_image_to_handle(image));
-   }
    const uint32_t level_count =
       vk_image_subresource_level_count(&image->vk, range);
+
+   /* Empty-render optimization also calls here directly, without meta_begin.
+    * A fast clear writes solid compression metadata, so it ends raw storage.
+    */
+   hk_feedback_invalidate_range(cmd, image, range->baseMipLevel, level_count,
+      range->baseArrayLayer, vk_image_subresource_layer_count(&image->vk, range));
 
    bool z = (range->aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT);
    bool s = (range->aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT);
@@ -142,7 +138,9 @@ hk_CmdClearColorImage(VkCommandBuffer commandBuffer, VkImage _image,
                       const VkImageSubresourceRange *pRanges)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   hk_cmd_flush_empty_clears(cmd);
    VK_FROM_HANDLE(hk_image, image, _image);
+   hk_cmd_use_implicit_sync(cmd, image->implicit_sync_res);
 
    for (uint32_t r = 0; r < rangeCount; r++) {
       hk_clear_image(cmd, image, PIPE_FORMAT_NONE, pColor->uint32, &pRanges[r],
@@ -158,7 +156,9 @@ hk_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer, VkImage _image,
                              const VkImageSubresourceRange *pRanges)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   hk_cmd_flush_empty_clears(cmd);
    VK_FROM_HANDLE(hk_image, image, _image);
+   hk_cmd_use_implicit_sync(cmd, image->implicit_sync_res);
 
    for (uint32_t r = 0; r < rangeCount; r++) {
       uint32_t colour[4] = {fui(pDepthStencil->depth), pDepthStencil->stencil};

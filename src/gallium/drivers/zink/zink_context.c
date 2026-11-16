@@ -1348,6 +1348,9 @@ static void
 zink_set_polygon_stipple(struct pipe_context *pctx,
                          const struct pipe_poly_stipple *ps)
 {
+   struct zink_context *ctx = zink_context(pctx);
+   /* pushed with each draw that uses the poly_stipple fs key */
+   memcpy(ctx->poly_stipple, ps->stipple, sizeof(ctx->poly_stipple));
 }
 
 ALWAYS_INLINE static void
@@ -1576,7 +1579,11 @@ zink_bind_vertex_buffers_internal(struct zink_context *ctx, const struct pipe_ve
    for (unsigned i = 0; i < elems->hw_state.num_bindings; i++) {
       const struct pipe_vertex_buffer *vb = vbuffers + elems->hw_state.binding_map[i];
       assert(vb);
-      if (vb->buffer.resource) {
+      /* GL allows binding at or past the end of the buffer, where every fetch
+       * is out of bounds; Vulkan requires the offset to be inside the buffer.
+       * Bind no buffer instead (nullDescriptor): out-of-bounds reads are zero.
+       */
+      if (vb->buffer.resource && vb->buffer_offset < vb->buffer.resource->width0) {
          struct zink_resource *res = zink_resource(vb->buffer.resource);
          assert(res->obj->buffer);
          buffers[i] = res->obj->buffer;
@@ -3070,6 +3077,12 @@ prep_fb_attachment(struct zink_context *ctx, struct zink_resource *res, unsigned
          zink_update_fbfetch(ctx);
    }
    if (ctx->blitting && !(res->base.b.bind & ZINK_BIND_TRANSIENT)) {
+      /* The blit set this attachment's layout; keep zsbuf_readonly describing
+       * the attached image, not the previous depth buffer, or a deferred
+       * depth clear flushed in this render would leave the render pass.
+       */
+      if (!(res->aspect & VK_IMAGE_ASPECT_COLOR_BIT))
+         ctx->zsbuf_readonly = res->layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
       zink_batch_resource_usage_set(ctx->bs, res, true, false);
       return true;
    }
@@ -3354,7 +3367,8 @@ begin_rendering(struct zink_context *ctx, bool check_attachment_shadow)
             iv = zink_create_fb_surface(&ctx->base, &templ)->image_view;
          }
          if (ctx->fb_state.cbufs[i].nr_samples && !has_msrtss) {
-            ctx->dynamic_fb.attachments[i].resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+            ctx->dynamic_fb.attachments[i].resolveMode =
+               util_format_is_pure_integer(ctx->fb_state.cbufs[i].format) ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_AVERAGE_BIT;
             ctx->dynamic_fb.attachments[i].resolveImageView = iv;
             ctx->dynamic_fb.attachments[i].resolveImageLayout = res->layout;
 
@@ -3501,7 +3515,9 @@ begin_rendering(struct zink_context *ctx, bool check_attachment_shadow)
          unsigned idx = is_depth ? PIPE_MAX_COLOR_BUFS : 0;
          screen->image_barrier(ctx, res, layout, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
          zink_resource_disable_unordered(res, true);
-         ctx->dynamic_fb.attachments[idx].resolveMode = is_depth ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_AVERAGE_BIT;
+         /* integer formats can't be averaged: GL resolves them to a single sample */
+         ctx->dynamic_fb.attachments[idx].resolveMode =
+            is_depth || util_format_is_pure_integer(format) ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_AVERAGE_BIT;
          ctx->dynamic_fb.attachments[idx].resolveImageLayout = res->layout;
          ctx->dynamic_fb.attachments[idx].resolveImageView = surf->image_view;
          if (idx == PIPE_MAX_COLOR_BUFS) {
@@ -3631,6 +3647,8 @@ zink_batch_rp(struct zink_context *ctx)
       if (ctx->vertices_query || !list_is_empty(&ctx->primitives_generated_queries))
          zink_query_update_gs_states(ctx);
    }
+   if (!ctx->queries_disabled)
+      zink_suspend_cs_query_for_renderpass(ctx);
    unsigned clear_buffers = begin_rendering(ctx, true);
    assert(!ctx->rp_changed);
    if (ctx->unordered_blitting)
@@ -3648,8 +3666,10 @@ zink_batch_rp(struct zink_context *ctx)
       zink_clear_framebuffer(ctx, clear_buffers);
       zink_update_depth_state(ctx);
    }
-   /* unable to previously determine that queries didn't split renderpasses: ensure queries start inside renderpass */
-   if (!ctx->queries_disabled && maybe_has_query_ends && !list_is_empty(&ctx->suspended_queries)) {
+   /* unable to previously determine that queries didn't split renderpasses: ensure queries start inside renderpass.
+    * Graphics statistics queries only start inside one, so they may still be waiting.
+    */
+   if (!ctx->queries_disabled && !list_is_empty(&ctx->suspended_queries)) {
       zink_resume_queries(ctx);
       if (ctx->vertices_query || !list_is_empty(&ctx->primitives_generated_queries))
          zink_query_update_gs_states(ctx);
@@ -4070,8 +4090,21 @@ flush_batch(struct zink_context *ctx, bool sync)
       zink_select_draw_mesh_tasks(ctx);
       zink_select_launch_grid(ctx);
 
-      if (ctx->oom_stall)
+      /* destroyed resources piling up behind submitted batches (e.g. a
+       * stream of create/draw/delete with flushes in between)
+       */
+      const int64_t zombie_bytes = p_atomic_read(&screen->zombie_bytes);
+      ctx->oom_zombie_floor = MIN2(ctx->oom_zombie_floor, zombie_bytes);
+      if (zombie_bytes >= ctx->oom_zombie_floor + (int64_t)screen->zombie_bytes_limit)
+         ctx->oom_stall = true;
+      if (ctx->oom_stall) {
          stall(ctx);
+         /* completed batch states keep their resources until they are
+          * recycled: release them now, as this flush is for memory
+          */
+         zink_batch_reset_all(ctx);
+         ctx->oom_zombie_floor = p_atomic_read(&screen->zombie_bytes);
+      }
       zink_reset_ds3_states(ctx);
 
       ctx->oom_flush = false;
@@ -4555,8 +4588,13 @@ zink_flush(struct pipe_context *pctx,
       mfence->fence = &bs->fence;
       mfence->sem = export_sem;
       if (bs) {
-         mfence->submit_count = bs->usage.submit_count;
+         /* store the count from before this batch's submit so that
+          * a diff of 1 in zink_fence_finish always means 'submitted once'
+          */
+         mtx_lock(&bs->usage.mtx);
+         mfence->submit_count = bs->usage.submit_count - (bs->fence.submitted ? 1 : 0);
          util_dynarray_append(&bs->fence.mfences, mfence);
+         mtx_unlock(&bs->usage.mtx);
       }
       if (export_sem) {
          pipe_reference(NULL, &mfence->reference);
@@ -4633,8 +4671,11 @@ zink_texture_barrier(struct pipe_context *pctx, unsigned flags)
                        VK_ACCESS_INPUT_ATTACHMENT_READ_BIT :
                        VK_ACCESS_SHADER_READ_BIT;
 
-   /* if this is a fb barrier, flush all pending clears */
-   if (ctx->rp_clears_enabled && dst == VK_ACCESS_INPUT_ATTACHMENT_READ_BIT)
+   /* A sampler barrier also makes earlier clears visible to feedback reads.
+    * Materialize them before the barrier, rather than folding them into the
+    * following rendering instance's loadOp where sampling can miss them.
+    */
+   if (ctx->clears_enabled)
       zink_flush_clears(ctx);
 
    /* this is not an in-renderpass barrier */
@@ -5805,8 +5846,13 @@ static void
 zink_tc_parse_dsa(void *state, struct tc_renderpass_info *info)
 {
    struct zink_depth_stencil_alpha_state *cso = state;
-   info->zsbuf_write_dsa |= (cso->hw_state.depth_write || cso->hw_state.stencil_test);
-   info->zsbuf_read_dsa |= (cso->hw_state.depth_test || cso->hw_state.stencil_test);
+   /* Disabled depth tests cannot write; KEEP-only stencil tests only read. */
+   info->zsbuf_write_dsa |=
+      (cso->hw_state.depth_test && cso->hw_state.depth_write) ||
+      util_writes_stencil(&cso->base.stencil[0]) ||
+      util_writes_stencil(&cso->base.stencil[1]);
+   info->zsbuf_read_dsa |= cso->hw_state.depth_test ||
+      cso->hw_state.depth_bounds_test || cso->hw_state.stencil_test;
    /* TODO: if zsbuf fbfetch is ever supported */
 }
 
@@ -5993,6 +6039,10 @@ zink_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
             ctx->gfx_pipeline_state.shader_keys.key[pstage].key.vs_base.robust_access = true;
          ctx->gfx_pipeline_state.shader_keys.key[MESA_SHADER_FRAGMENT].key.fs.robust_access = true;
       }
+   } else {
+      /* generated GS programs use the full keys: these mirror the optimal key bits */
+      ctx->gfx_pipeline_state.shader_keys.key[MESA_SHADER_GEOMETRY].size = sizeof(struct zink_vs_key_base);
+      ctx->gfx_pipeline_state.shader_keys.key[MESA_SHADER_FRAGMENT].size = sizeof(struct zink_fs_key_base);
    }
    for (unsigned i = 0; i < ARRAY_SIZE(ctx->rendering_state_cache); i++)
       _mesa_set_init(&ctx->rendering_state_cache[i], ctx, hash_rendering_state, equals_rendering_state);
@@ -6212,6 +6262,9 @@ zink_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
    if (tc && (struct zink_context*)tc != ctx) {
       ctx->track_renderpasses = screen->driver_workarounds.track_renderpasses;
       threaded_context_init_bytes_mapped_limit(tc, 4);
+      /* with unified memory, also keep queued uploads below the zombie memory limit */
+      if (screen->zombie_bytes_limit < screen->clamp_video_mem)
+         tc->bytes_mapped_limit = MIN2(tc->bytes_mapped_limit, screen->zombie_bytes_limit);
       ctx->base.set_context_param = zink_set_context_param;
    }
 

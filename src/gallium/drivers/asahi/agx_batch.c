@@ -84,7 +84,15 @@ agx_encoder_allocate(struct agx_device *dev, bool vdm)
    unsigned flags = vdm && agx_apple9_direct_render_enabled(dev)
                        ? AGX_BO_CONTEXT | AGX_BO_WRITEBACK
                        : 0;
-   struct agx_bo *bo = agx_bo_create(dev, 0x80000, 0, flags, "Encoder");
+
+   /* VDM streams link to continuation buffers when they fill up (see
+    * agx_ensure_cmdbuf_has_space), so start them small: most render passes
+    * encode well under a kilobyte, and every batch keeps its encoder until it
+    * is reaped. CDM streams cannot link yet and flush the batch when full, so
+    * they keep the full size.
+    */
+   size_t size = vdm ? AGX_VDM_ENCODER_SIZE : AGX_CDM_ENCODER_SIZE;
+   struct agx_bo *bo = agx_bo_create(dev, size, 0, flags, "Encoder");
    uint8_t *map = agx_bo_map(bo);
    return (struct agx_encoder){
       .bo = bo,
@@ -124,9 +132,13 @@ agx_batch_init(struct agx_context *ctx,
    } else {
       memset(batch->bo_list.set, 0, batch->bo_list.bit_count / 8);
    }
+   batch->bo_bytes = 0;
 
    batch->apple9_render_initialized = false;
+   batch->attachments_were_valid = 0;
    batch->apple9_draw_count = 0;
+   batch->apple9_vdm_draws = 0;
+   batch->primitive_count = 0;
 
    if (agx_batch_is_compute(batch)) {
       batch->cdm = agx_encoder_allocate(dev, false);
@@ -262,6 +274,17 @@ agx_batch_cleanup(struct agx_context *ctx, struct agx_batch *batch, bool reset)
          agx_bo_unreference(dev, agx_lookup_bo(dev, handle));
       }
    } else {
+      if (ctx->check_fence_errors && !ctx->any_faults) {
+         int err = agx_syncobj_error(dev, batch->syncobj);
+         if (err < 0) {
+            mesa_loge("asahi: GPU work of this context failed (%s); context lost",
+                      strerror(-err));
+            ctx->any_faults = true;
+            ctx->reset_status = err == -ECANCELED ? PIPE_INNOCENT_CONTEXT_RESET
+                                                  : PIPE_GUILTY_CONTEXT_RESET;
+         }
+      }
+
       int handle;
       AGX_BATCH_FOREACH_BO_HANDLE(batch, handle) {
          struct agx_bo *bo = agx_lookup_bo(dev, handle);
@@ -284,6 +307,7 @@ agx_batch_cleanup(struct agx_context *ctx, struct agx_batch *batch, bool reset)
    agx_bo_unreference(dev, batch->cdm.bo);
    batch->apple9_render_initialized = false;
    batch->apple9_draw_count = 0;
+   batch->apple9_vdm_draws = 0;
    agx_pool_cleanup(&batch->pool);
    agx_pool_cleanup(&batch->pipeline_pool);
    agx_pool_cleanup(&batch->apple9_context_pool);
@@ -411,6 +435,26 @@ agx_get_compute_batch(struct agx_context *ctx)
    struct pipe_framebuffer_state key = {.width = AGX_COMPUTE_BATCH_WIDTH};
    ctx->batch = agx_get_batch_for_framebuffer(ctx, &key);
    return ctx->batch;
+}
+
+/* Uploads can leave ctx->batch pointing at compute (or NULL after flush),
+ * while a graphics batch still owns all the textures uploaded so far. */
+void
+agx_flush_over_budget_batches(struct agx_context *ctx)
+{
+   if (ctx->draw_depth)
+      return;
+
+   /* Flushing may draw a tile helper before the outer draw has started. */
+   ctx->draw_depth++;
+   uint64_t budget = agx_screen(ctx->base.screen)->batch_memory_budget;
+   unsigned i;
+   foreach_active(ctx, i) {
+      struct agx_batch *batch = &ctx->batches.slots[i];
+      if (batch->bo_bytes > budget)
+         agx_flush_batch_for_reason(ctx, batch, "Batch memory budget");
+   }
+   ctx->draw_depth--;
 }
 
 void
@@ -569,9 +613,13 @@ agx_batch_reads_fragment(struct agx_batch *batch, struct agx_resource *rsrc)
    if (!rsrc->base.screen)
       return;
 
-   /* Hazard: read-after-write */
+   /* Hazard: read-after-write, including a separate stencil written as
+    * another batch's depth/stencil attachment. */
    agx_flush_writer_except(batch->ctx, rsrc, batch, "Read from another batch",
                            false);
+   if (rsrc->separate_stencil)
+      agx_flush_writer_except(batch->ctx, rsrc->separate_stencil, batch,
+                              "Read from another batch", false);
 }
 
 void
@@ -923,6 +971,10 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
    }
 
    if (render) {
+      if ((dev->params.features & DRM_ASAHI_FEATURE_FEW_PRIMITIVES) &&
+          agx_has_few_primitives(batch->primitive_count))
+         render->flags |= DRM_ASAHI_RENDER_FEW_PRIMITIVES;
+
       struct attachments att = {.count = 0};
       struct pipe_framebuffer_state *fb = &batch->key;
 
@@ -997,12 +1049,25 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
             c->layers, c->samples);
       }
 
-      /* A failed submit has not published the timeline point allocated for
-       * this batch. Continuing would attach an unsignaled, fabricated seqid
-       * to BOs and let fixed-USC ownership advance past work that never
-       * existed. There is no initialized-batch discard path, so fail closed
-       * in release builds as well as debug builds. */
-      abort();
+      /* The kernel refused the work (device lost, queue banned after a GPU
+       * timeout, or an invalid command). Discard the batch: publish its
+       * out-fences as signalled ourselves, so nothing waits on work that
+       * never existed and the seqid and BO writer tracking below stay
+       * consistent, and mark the context lost so robust clients see a reset.
+       */
+      int sret = drmSyncobjSignal(dev->fd, &batch->syncobj, 1);
+      uint64_t point = seqid;
+      int tret = drmSyncobjTimelineSignal(dev->fd, &screen->flush_syncobj, &point, 1);
+      if (sret || tret) {
+         fprintf(stderr, "asahi: cannot discard failed batch (%d/%d); aborting\n",
+                 sret, tret);
+         abort();
+      }
+      if (!ctx->any_faults) {
+         mesa_loge("asahi: submission rejected; context lost");
+         ctx->reset_status = PIPE_UNKNOWN_CONTEXT_RESET;
+      }
+      ctx->any_faults = true;
    }
 
    /* Now stash our batch fence into any shared BOs. */
@@ -1096,9 +1161,13 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
    if (ctx->batch == batch)
       ctx->batch = NULL;
 
-   /* Try to clean up up to two batches, to keep memory usage down */
-   if (agx_cleanup_batches(ctx) >= 0)
-      agx_cleanup_batches(ctx);
+   /* Reap every batch that has completed, to keep memory usage down. Each
+    * submitted batch holds its encoders, pools and resource references until
+    * it is reaped, and new batches take unused slots first, so batches left
+    * here would only be reclaimed once all AGX_MAX_BATCHES slots are in use.
+    */
+   while (agx_cleanup_batches(ctx) >= 0)
+      ;
 }
 
 void
@@ -1142,6 +1211,36 @@ agx_sync_all(struct agx_context *ctx, const char *reason)
 
    foreach_submitted(ctx, idx) {
       agx_sync_batch(ctx, &ctx->batches.slots[idx]);
+   }
+}
+
+/* A render that is recorded but never submitted wrote nothing. Its
+ * attachments were marked valid when the batch state was initialized, so
+ * restore what they were before: a later batch must not reload, sample or
+ * decompress contents that do not exist. */
+void
+agx_batch_undo_render_writes(struct agx_batch *batch)
+{
+   const struct pipe_framebuffer_state *key = &batch->key;
+
+   for (unsigned i = 0; i < key->nr_cbufs; ++i) {
+      if (key->cbufs[i].texture &&
+          !(batch->attachments_were_valid & BITFIELD_BIT(i)))
+         BITSET_CLEAR(agx_resource(key->cbufs[i].texture)->data_valid,
+                      key->cbufs[i].level);
+   }
+
+   if (key->zsbuf.texture) {
+      struct agx_resource *rsrc = agx_resource(key->zsbuf.texture);
+      unsigned level = key->zsbuf.level;
+
+      if (!(batch->attachments_were_valid &
+            BITFIELD_BIT(PIPE_MAX_COLOR_BUFS)))
+         BITSET_CLEAR(rsrc->data_valid, level);
+      if (rsrc->separate_stencil &&
+          !(batch->attachments_were_valid &
+            BITFIELD_BIT(PIPE_MAX_COLOR_BUFS + 1)))
+         BITSET_CLEAR(rsrc->separate_stencil->data_valid, level);
    }
 }
 

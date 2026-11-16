@@ -19,6 +19,10 @@ extern "C" {
 #define AGX_APPLE9_UNIFORM_COUNT       256
 #define AGX_APPLE9_HALF_REGISTER_COUNT (2 * AGX_APPLE9_GPR_COUNT)
 
+/* Compact scratch encodings have different address ranges. */
+#define AGX_APPLE9_FILL_WORD_COUNT 1024
+#define AGX_APPLE9_SAVE_WORD_COUNT 2048
+
 enum agx_apple9_evidence {
    AGX_APPLE9_EVIDENCE_UNRESOLVED = 0,
    AGX_APPLE9_EVIDENCE_BYTE_DIFF,
@@ -119,6 +123,8 @@ enum agx_apple9_encoding {
    AGX_APPLE9_ENC_PACK_HALF_2X16,
    AGX_APPLE9_ENC_PACK_UNORM_2X16,
    AGX_APPLE9_ENC_PACK_UNORM_4X8,
+   AGX_APPLE9_ENC_PACK_FORMAT,
+   AGX_APPLE9_ENC_PACK_FORMAT_RGB,
    AGX_APPLE9_ENC_HALF_TO_FLOAT,
    AGX_APPLE9_ENC_UNPACK_NORM,
    AGX_APPLE9_ENC_HALF2,
@@ -177,6 +183,8 @@ enum agx_apple9_encoding {
    AGX_APPLE9_ENC_FLOAT2_EXPORT,
    AGX_APPLE9_ENC_BLOCK_STORE_PARAMS,
    AGX_APPLE9_ENC_BLOCK_STORE_EXTENDED_PARAMS,
+   AGX_APPLE9_ENC_IMAGE_WRITE_PARAMS,
+   AGX_APPLE9_ENC_IMAGE_WRITE,
    AGX_APPLE9_ENC_BLOCK_IMAGE_STORE,
    AGX_APPLE9_ENC_BLOCK_IMAGE_STORE_EXTENDED,
    AGX_APPLE9_ENC_TEXTURE_COORDS,
@@ -193,6 +201,7 @@ enum agx_apple9_encoding {
    AGX_APPLE9_ENC_ITER,
    AGX_APPLE9_ENC_ITER_FLAT,
    AGX_APPLE9_ENC_VARY_STORE,
+   AGX_APPLE9_ENC_OBJECT_GRID_EXPORT,
    AGX_APPLE9_ENC_COVERAGE,
    AGX_APPLE9_ENC_DEPTH_STORE,
    AGX_APPLE9_ENC_PUBLICATION_PAIR,
@@ -204,17 +213,23 @@ enum agx_apple9_encoding {
    AGX_APPLE9_ENC_TILE_FENCE,
    AGX_APPLE9_ENC_DEVICE_LOAD,
    AGX_APPLE9_ENC_DEVICE_LOAD_INDIRECT,
+   AGX_APPLE9_ENC_DEVICE_LOAD_POINTER,
+   AGX_APPLE9_ENC_UNIFORM_MOVE,
    AGX_APPLE9_ENC_DEVICE_STORE,
    AGX_APPLE9_ENC_DEVICE_ATOMIC,
    AGX_APPLE9_ENC_DEVICE_ATOMIC_INDIRECT,
    AGX_APPLE9_ENC_SUBGROUP_SCAN_IADD,
+   AGX_APPLE9_ENC_SUBGROUP_REDUCE_UMAX,
    AGX_APPLE9_ENC_SUBGROUP_BROADCAST,
    AGX_APPLE9_ENC_SUBGROUP_BALLOT,
    AGX_APPLE9_ENC_WORKGROUP_BARRIER,
    AGX_APPLE9_ENC_DEVICE_FENCE,
    AGX_APPLE9_ENC_HALT,
    AGX_APPLE9_ENC_SHARED_LOAD,
+   AGX_APPLE9_ENC_SHARED_ATOMIC,
    AGX_APPLE9_ENC_SHARED_STORE,
+   AGX_APPLE9_ENC_LOCAL_STORE,
+   AGX_APPLE9_ENC_LOCAL_STORE_INDEXED,
    AGX_APPLE9_ENC_PRIVATE_LOAD,
    AGX_APPLE9_ENC_PRIVATE_STORE,
    AGX_APPLE9_ENC_DEVICE_ATOMIC_RESULT,
@@ -222,6 +237,14 @@ enum agx_apple9_encoding {
    AGX_APPLE9_ENC_SPILL_LOAD,
    AGX_APPLE9_ENC_DEVICE_STORE_INDIRECT,
    AGX_APPLE9_ENC_TILE_LOAD_COORDS,
+   AGX_APPLE9_ENC_WAIT,
+   AGX_APPLE9_ENC_FLOAT_SPECIAL_UNIFORM,
+   AGX_APPLE9_ENC_MESH_CONTROL,
+   AGX_APPLE9_ENC_MESH_SUBMIT_SCALAR,
+   AGX_APPLE9_ENC_MESH_SUBMIT_CHANNEL,
+   AGX_APPLE9_ENC_OBJECT_CALL,
+   AGX_APPLE9_ENC_OBJECT_RETURN,
+   AGX_APPLE9_ENC_OBJECT_RESUME,
    AGX_APPLE9_ENC_COUNT,
 
    /* Semantic IR pseudos have no machine encoding.  Keep them out of the
@@ -245,6 +268,20 @@ enum agx_apple9_dependency_layout {
    AGX_APPLE9_DEPENDENCY_MASK_61_63_93_95,
 };
 
+/*
+ * Pending producers grouped by what a completion barrier must order against.
+ * Memory results are device, private and threadgroup loads and returning
+ * atomics. Publications are scalar exports, consumed only through
+ * their readers' dependency fields. Everything else (fixed producers such as
+ * system values and mesh control, texture reads, scratch traffic, tile
+ * loads) is "other".
+ */
+enum agx_apple9_completion_class {
+   AGX_APPLE9_COMPLETION_MEMORY = 1 << 0,
+   AGX_APPLE9_COMPLETION_PUBLICATION = 1 << 1,
+   AGX_APPLE9_COMPLETION_OTHER = 1 << 2,
+};
+
 #define AGX_APPLE9_MAX_ENCODING_OPERANDS 11
 
 struct agx_apple9_encoding_info {
@@ -254,6 +291,36 @@ struct agx_apple9_encoding_info {
    bool allocator_safe;
    enum agx_apple9_evidence evidence;
    enum agx_apple9_dependency_layout dependency_layout;
+
+   /* A consumer that waits through its dependency field may keep the
+    * completed operands live: each register source has its own release
+    * flag. Without it, a folded wait must also be the operand's last use. */
+   bool dependency_retains_sources;
+
+   /* Implicit producer slot, 1..6, or zero for no fixed assignment. This is
+    * scheduler metadata, not an encoded output-tag field. Existing producers
+    * with a programmable output tag continue to allocate their slot normally. */
+   uint8_t fixed_producer_slot;
+
+   /* Other slots that also complete this fixed producer. They are reserved
+    * while it is pending, but are alternative selectors, not extra waits.
+    * Ordinary producers still complete only on their own assigned slot. */
+   uint8_t fixed_producer_alternates;
+
+   /* The instruction consumes completion of all previously issued, still
+    * pending producers, independently of its GPR operands. This is a
+    * scheduling requirement, not a claim that the encoding has an input
+    * dependency field. The scheduler derives any wait from its live state. */
+   bool requires_prior_completion;
+
+   /* Pending producer classes the instruction does not order against, even
+    * though it requires prior completion of the others. See
+    * agx_apple9_completion_class. */
+   uint8_t prior_completion_exempt;
+
+   /* Several native instructions each write part of the destination, so it
+    * cannot share a register with a source. */
+   bool split_result;
 
    struct agx_apple9_operand_constraint
       operands[AGX_APPLE9_MAX_ENCODING_OPERANDS];

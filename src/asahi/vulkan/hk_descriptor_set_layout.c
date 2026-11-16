@@ -5,6 +5,8 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_descriptor_set_layout.h"
+#include "hk_descriptor_buffer.h"
+#include "asahi/lib/agx_bo.h"
 
 #include "hk_descriptor_set.h"
 #include "hk_device.h"
@@ -30,21 +32,79 @@ binding_has_immutable_samplers(const VkDescriptorSetLayoutBinding *binding)
 void
 hk_descriptor_stride_align_for_type(
    const struct hk_physical_device *pdev, VkDescriptorType type,
-   const VkMutableDescriptorTypeListEXT *type_list, uint32_t *stride,
-   uint32_t *alignment)
+   const VkMutableDescriptorTypeListEXT *type_list, bool descriptor_buffer,
+   uint32_t *stride, uint32_t *alignment)
 {
+   /* Descriptor-buffer layouts use the advertised descriptor sizes: the
+    * internal records zero-padded to a power of two, see
+    * hk_descriptor_buffer.h. */
+   if (descriptor_buffer && agx_is_apple9(&pdev->dev) &&
+       type != VK_DESCRIPTOR_TYPE_MUTABLE_EXT &&
+       type != VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+      *alignment = HK_APPLE9_DB_ALIGNMENT;
+      switch (type) {
+      case VK_DESCRIPTOR_TYPE_SAMPLER:
+         *stride = HK_APPLE9_DB_SAMPLER_SIZE;
+         return;
+      case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+         *stride = HK_APPLE9_DB_COMBINED_SIZE;
+         return;
+      case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+      case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+         *stride = HK_APPLE9_DB_SAMPLED_SIZE;
+         return;
+      case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+      case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+         *stride = HK_APPLE9_DB_STORAGE_SIZE;
+         return;
+      case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+         *stride = HK_APPLE9_DB_TEXEL_SIZE;
+         return;
+      case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+      case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+         *stride = HK_APPLE9_DB_BUFFER_SIZE;
+         return;
+      default:
+         /* Dynamic buffers are not allowed in descriptor-buffer layouts. */
+         *stride = *alignment = 0;
+         return;
+      }
+   }
+
    switch (type) {
    case VK_DESCRIPTOR_TYPE_SAMPLER:
    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
       /* TODO: How do samplers work? */
    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
    case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+      if (agx_is_apple9(&pdev->dev)) {
+         /* Image part, sampler part, or both for a combined image sampler. */
+         *stride = type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                      ? HK_APPLE9_COMBINED_DESCRIPTOR_SIZE
+                   : type == VK_DESCRIPTOR_TYPE_SAMPLER
+                      ? sizeof(struct hk_apple9_sampler_part)
+                      : sizeof(struct hk_apple9_image_part);
+         *alignment = AGX_APPLE9_TEXTURE_TABLE_STRIDE;
+         break;
+      }
       *stride = *alignment = sizeof(struct hk_sampled_image_descriptor);
       break;
 
-   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+      if (agx_is_apple9(&pdev->dev)) {
+         *stride = sizeof(struct hk_apple9_texel_descriptor);
+         *alignment = AGX_APPLE9_TEXTURE_TABLE_STRIDE;
+         break;
+      }
+      FALLTHROUGH;
+   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+      if (agx_is_apple9(&pdev->dev) &&
+          type != VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER) {
+         *stride = sizeof(struct hk_apple9_storage_descriptor);
+         *alignment = AGX_APPLE9_TEXTURE_TABLE_STRIDE;
+         break;
+      }
       *stride = sizeof(struct hk_storage_image_descriptor);
       *alignment = 8;
       break;
@@ -76,7 +136,8 @@ hk_descriptor_stride_align_for_type(
          uint32_t desc_stride, desc_align;
          hk_descriptor_stride_align_for_type(pdev,
                                              type_list->pDescriptorTypes[i],
-                                             NULL, &desc_stride, &desc_align);
+                                             NULL, descriptor_buffer,
+                                             &desc_stride, &desc_align);
          *stride = MAX2(*stride, desc_stride);
          *alignment = MAX2(*alignment, desc_align);
       }
@@ -104,6 +165,18 @@ hk_descriptor_get_type_list(VkDescriptorType type,
    return type_list;
 }
 
+static void
+hk_descriptor_set_layout_destroy(struct vk_device *vk_dev,
+                                 struct vk_descriptor_set_layout *vk_layout)
+{
+   struct hk_device *dev = container_of(vk_dev, struct hk_device, vk);
+   struct hk_descriptor_set_layout *layout =
+      vk_to_hk_descriptor_set_layout(vk_layout);
+   if (layout->embedded_samplers)
+      agx_bo_unreference(&dev->dev, layout->embedded_samplers);
+   vk_descriptor_set_layout_destroy(vk_dev, vk_layout);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 hk_CreateDescriptorSetLayout(VkDevice device,
                              const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
@@ -112,6 +185,8 @@ hk_CreateDescriptorSetLayout(VkDevice device,
 {
    VK_FROM_HANDLE(hk_device, dev, device);
    struct hk_physical_device *pdev = hk_device_physical(dev);
+   const bool descriptor_buffer =
+      pCreateInfo->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
 
    uint32_t num_bindings = 0;
    uint32_t immutable_sampler_count = 0;
@@ -202,7 +277,8 @@ hk_CreateDescriptorSetLayout(VkDevice device,
 
       uint32_t stride, alignment;
       hk_descriptor_stride_align_for_type(pdev, binding->descriptorType,
-                                          type_list, &stride, &alignment);
+                                          type_list, descriptor_buffer,
+                                          &stride, &alignment);
 
       uint8_t max_plane_count = 1;
 
@@ -225,7 +301,7 @@ hk_CreateDescriptorSetLayout(VkDevice device,
       stride *= max_plane_count;
 
       if (stride > 0) {
-         assert(stride <= UINT8_MAX);
+         assert(stride <= UINT16_MAX);
          assert(util_is_power_of_two_nonzero(alignment));
 
          buffer_size = align64(buffer_size, alignment);
@@ -257,6 +333,7 @@ hk_CreateDescriptorSetLayout(VkDevice device,
    }
 
    layout->non_variable_descriptor_buffer_size = buffer_size;
+   layout->descriptor_buffer = descriptor_buffer;
    layout->vk.dynamic_descriptor_count = dynamic_buffer_count;
 
    struct mesa_blake3 blake3_ctx;
@@ -267,6 +344,7 @@ hk_CreateDescriptorSetLayout(VkDevice device,
    BLAKE3_UPDATE_VALUE(layout->non_variable_descriptor_buffer_size);
    BLAKE3_UPDATE_VALUE(layout->vk.dynamic_descriptor_count);
    BLAKE3_UPDATE_VALUE(layout->binding_count);
+   BLAKE3_UPDATE_VALUE(layout->descriptor_buffer);
 
    for (uint32_t b = 0; b < num_bindings; b++) {
       BLAKE3_UPDATE_VALUE(layout->binding[b].type);
@@ -291,6 +369,22 @@ hk_CreateDescriptorSetLayout(VkDevice device,
 
    _mesa_blake3_final(&blake3_ctx, layout->vk.blake3);
 
+   if (pCreateInfo->flags &
+       VK_DESCRIPTOR_SET_LAYOUT_CREATE_EMBEDDED_IMMUTABLE_SAMPLERS_BIT_EXT) {
+      /* Shaders address it like any descriptor buffer: in the USC aperture. */
+      layout->embedded_samplers = agx_bo_create(
+         &dev->dev, MAX2(buffer_size, HK_APPLE9_DB_ALIGNMENT), 0,
+         agx_is_apple9(&dev->dev) ? AGX_BO_LOW_VA | AGX_BO_WRITEBACK : 0,
+         "Embedded samplers");
+      if (!layout->embedded_samplers) {
+         vk_descriptor_set_layout_unref(&dev->vk, &layout->vk);
+         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      }
+      layout->vk.destroy = hk_descriptor_set_layout_destroy;
+      hk_descriptor_pack_embedded_samplers(dev, layout,
+                                           agx_bo_map(layout->embedded_samplers));
+   }
+
    *pSetLayout = hk_descriptor_set_layout_to_handle(layout);
 
    return VK_SUCCESS;
@@ -303,6 +397,8 @@ hk_GetDescriptorSetLayoutSupport(
 {
    VK_FROM_HANDLE(hk_device, dev, device);
    struct hk_physical_device *pdev = hk_device_physical(dev);
+   const bool descriptor_buffer =
+      pCreateInfo->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
 
    const VkMutableDescriptorTypeCreateInfoEXT *mutable_info =
       vk_find_struct_const(pCreateInfo->pNext,
@@ -323,7 +419,8 @@ hk_GetDescriptorSetLayoutSupport(
 
       uint32_t stride, alignment;
       hk_descriptor_stride_align_for_type(pdev, binding->descriptorType,
-                                          type_list, &stride, &alignment);
+                                          type_list, descriptor_buffer,
+                                          &stride, &alignment);
       max_align = MAX2(max_align, alignment);
    }
 
@@ -348,10 +445,11 @@ hk_GetDescriptorSetLayoutSupport(
 
       uint32_t stride, alignment;
       hk_descriptor_stride_align_for_type(pdev, binding->descriptorType,
-                                          type_list, &stride, &alignment);
+                                          type_list, descriptor_buffer,
+                                          &stride, &alignment);
 
       if (stride > 0) {
-         assert(stride <= UINT8_MAX);
+         assert(stride <= UINT16_MAX);
          assert(util_is_power_of_two_nonzero(alignment));
 
          if (flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) {
@@ -421,4 +519,29 @@ hk_GetDescriptorSetLayoutSupport(
          break;
       }
    }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+hk_GetDescriptorSetLayoutSizeEXT(VkDevice device, VkDescriptorSetLayout _layout,
+                                 VkDeviceSize *pLayoutSizeInBytes)
+{
+   VK_FROM_HANDLE(hk_descriptor_set_layout, layout, _layout);
+   uint64_t size = layout->non_variable_descriptor_buffer_size;
+   /* A variable-count binding is last; count its declared maximum. */
+   for (uint32_t b = 0; b < layout->binding_count; ++b) {
+      const struct hk_descriptor_set_binding_layout *bl = &layout->binding[b];
+      if (bl->flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT)
+         size = MAX2(size, bl->offset + (uint64_t)bl->stride * bl->array_size);
+   }
+   *pLayoutSizeInBytes = align64(size, HK_APPLE9_DB_ALIGNMENT);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+hk_GetDescriptorSetLayoutBindingOffsetEXT(VkDevice device,
+                                          VkDescriptorSetLayout _layout,
+                                          uint32_t binding,
+                                          VkDeviceSize *pOffset)
+{
+   VK_FROM_HANDLE(hk_descriptor_set_layout, layout, _layout);
+   *pOffset = layout->binding[binding].offset;
 }

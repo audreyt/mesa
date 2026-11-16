@@ -5,9 +5,9 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_image.h"
-#include "hk_apple9_msaa.h"
-#include "asahi/lib/agx_apple9_compute.h"
+#include "hk_feedback.h"
 #include "asahi/layout/layout.h"
+#include "asahi/lib/agx_apple9.h"
 #include "drm-uapi/drm_fourcc.h"
 #include "util/bitscan.h"
 #include "util/format/u_format.h"
@@ -15,10 +15,10 @@
 #include "util/macros.h"
 #include "util/u_math.h"
 #include "vulkan/vulkan_core.h"
+#include <sys/mman.h>
 
 #include "agx_bo.h"
 #include "hk_buffer.h"
-#include "hk_apple9.h"
 #include "hk_device.h"
 #include "hk_device_memory.h"
 #include "hk_entrypoints.h"
@@ -51,11 +51,6 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
 
    enum pipe_format p_format = hk_format_to_pipe_format(vk_format);
    if (p_format == PIPE_FORMAT_NONE)
-      return 0;
-
-   /* Native transfers reject block-compressed images in either direction. */
-   if (agx_apple9_compute_enabled(&pdev->dev) &&
-       vk_format_is_compressed(vk_format))
       return 0;
 
    /* NPOT formats only supported for texel buffers */
@@ -111,13 +106,24 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
       features |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;
    }
 
-   if (agx_apple9_compute_enabled(&pdev->dev)) {
-      features &= ~VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT;
-      if (!hk_apple9_formatless_store_supported(p_format)) {
+   if (agx_is_apple9(&pdev->dev)) {
+      /* Image atomics address device memory, which has FP32 addition. */
+      if (p_format == PIPE_FORMAT_R32_FLOAT && tiling == VK_IMAGE_TILING_OPTIMAL)
+         features |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;
+      /* As in the native GL path, shared-exponent color export is not yet
+       * implemented. Sampling, storage and transfer access remain available.
+       */
+      if (p_format == PIPE_FORMAT_R9G9B9E5_FLOAT)
+         features &= ~(VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT |
+                       VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT |
+                       VK_FORMAT_FEATURE_2_BLIT_DST_BIT);
+      /* Storage descriptors carry the format for loads and stores, so
+       * access without a shader format needs no extra support. */
+      if (!hk_apple9_storage_format_supported(vk_format))
          features &= ~(VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
-                       VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT |
-                       VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT);
-      }
+                       VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT |
+                       VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
+                       VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT);
    }
 
    if (features != 0) {
@@ -190,11 +196,6 @@ hk_get_image_format_features(struct hk_physical_device *pdev,
    if (cosited_chroma)
       features |= VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT;
 
-   if (agx_apple9_compute_enabled(&pdev->dev)) {
-      features &= ~(VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT |
-                    VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT);
-   }
-
    return features;
 }
 
@@ -243,12 +244,6 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
    if (dev->debug & AGX_DBG_NOCOMPRESS)
       return false;
 
-   /* Apple9 compute reads images as plain textures and cannot decode
-    * compressed layouts, so copies and sampling of compressed images fail.
-    */
-   if (agx_apple9_compute_enabled(dev))
-      return false;
-
    /* TODO: Handle compression with sparse. This should be doable but it's a bit
     * subtle. Correctness first.
     */
@@ -264,9 +259,11 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
     * Compression is not supported in hardware for storage images or mutable
     * formats in general.
     *
-    * Feedback loops are problematic with compression. The GL driver bans them.
-    * Interestingly, the relevant CTS tests pass on G13G and G14C, but not on
-    * G13D. For now, conservatively ban compression with feedback loops.
+    * Feedback reads can race compressed block writeback even when the read
+    * and write texels are disjoint. Keep the allocation ban unless image init
+    * qualified the single-sample G16 colour or depth/stencil format for raw
+    * feedback stores. MSAA, and formats without a bit-preserving view, remain
+    * banned.
     */
    if (usage &
        (VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT | VK_IMAGE_USAGE_STORAGE_BIT |
@@ -283,6 +280,11 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
    }
 
    enum pipe_format p_format = hk_format_to_pipe_format(format);
+
+   /* Shared-exponent encodings do not round-trip through texture reads.
+    * Apple9's raw transfer path preserves their bits without compression. */
+   if (agx_is_apple9(dev) && p_format == PIPE_FORMAT_R9G9B9E5_FLOAT)
+      return false;
 
    /* Check for format compatibility if mutability is enabled. */
    if (flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) {
@@ -313,6 +315,24 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
    }
 
    return true;
+}
+
+/* Whether the compressed DRM format modifier can describe an image with this
+ * usage. Feedback loops only keep hk from choosing compression for its own
+ * allocations: an image whose modifier is explicitly compressed (an imported
+ * dma-buf, or a list naming only that modifier) is compressed whatever its
+ * usage, and refusing the modifier made importers fall back to reading the
+ * compressed buffer as linear.
+ */
+static bool
+hk_can_use_compressed_modifier(const struct agx_device *dev, VkFormat format,
+                               unsigned plane, unsigned width, unsigned height,
+                               unsigned samples, VkImageCreateFlags flags,
+                               VkImageUsageFlags usage, const void *pNext)
+{
+   return hk_can_compress(dev, format, plane, width, height, samples, flags,
+                          usage & ~VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT,
+                          pNext);
 }
 
 bool
@@ -368,6 +388,9 @@ hk_GetPhysicalDeviceImageFormatProperties2(
    if (pImageFormatInfo->flags & (VK_IMAGE_CREATE_SPARSE_ALIASED_BIT |
                                   VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
                                   VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT)) {
+      if (!pdev->vk.supported_features.sparseBinding)
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
       features &= ~VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
 
       /* We also do not support sparse RGB32 uniform texel buffers, as we do not
@@ -398,6 +421,29 @@ hk_GetPhysicalDeviceImageFormatProperties2(
        pImageFormatInfo->type != VK_IMAGE_TYPE_2D)
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
+   /* A compressed modifier is a promise of a compressed layout. Image creation
+    * cannot honour it for usage or flags that rule compression out, such as
+    * storage or incompatible mutable formats, so do not advertise it there.
+    */
+   if (pImageFormatInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
+      const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *mod_info =
+         vk_find_struct_const(pImageFormatInfo->pNext,
+                              PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
+      if (mod_info &&
+          mod_info->drmFormatModifier == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED) {
+         unsigned planes = vk_format_get_plane_count(pImageFormatInfo->format);
+         for (unsigned plane = 0; plane < planes; ++plane) {
+            if (!hk_can_use_compressed_modifier(&pdev->dev,
+                                                pImageFormatInfo->format, plane,
+                                                64, 64, 1,
+                                                pImageFormatInfo->flags,
+                                                pImageFormatInfo->usage,
+                                                pImageFormatInfo->pNext))
+               return VK_ERROR_FORMAT_NOT_SUPPORTED;
+         }
+      }
+   }
+
    if (ycbcr_info && pImageFormatInfo->type != VK_IMAGE_TYPE_2D)
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
@@ -414,8 +460,21 @@ hk_GetPhysicalDeviceImageFormatProperties2(
     *    VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT"
     */
    if (pImageFormatInfo->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT &&
+       !pdev->vk.supported_features.sparseResidencyImage2D)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
+   if (pImageFormatInfo->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT &&
        (pImageFormatInfo->type == VK_IMAGE_TYPE_1D ||
         pImageFormatInfo->tiling == VK_IMAGE_TILING_LINEAR))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
+   /* VUID-VkImageCreateInfo-imageType-00971: 3D sparse residency requires
+    * sparseResidencyImage3D. Sparse format queries go through here too, so
+    * without this they reported 2D tile granularity for 3D images.
+    */
+   if (pImageFormatInfo->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT &&
+       pImageFormatInfo->type == VK_IMAGE_TYPE_3D &&
+       !pdev->vk.supported_features.sparseResidencyImage3D)
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
    /* From the Vulkan 1.3.279 spec:
@@ -447,7 +506,10 @@ hk_GetPhysicalDeviceImageFormatProperties2(
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    }
 
-   const uint32_t max_dim = 16384;
+   const uint32_t max_dim = agx_is_apple9(&pdev->dev) &&
+                                   pImageFormatInfo->type == VK_IMAGE_TYPE_3D
+                              ? AGX_APPLE9_MAX_3D_TEXTURE_DIMENSION
+                              : 16384;
    VkExtent3D maxExtent;
    uint32_t maxArraySize;
    switch (pImageFormatInfo->type) {
@@ -466,20 +528,8 @@ hk_GetPhysicalDeviceImageFormatProperties2(
    default:
       UNREACHABLE("Invalid image type");
    }
-   if (pImageFormatInfo->tiling == VK_IMAGE_TILING_LINEAR) {
+   if (pImageFormatInfo->tiling == VK_IMAGE_TILING_LINEAR)
       maxArraySize = 1;
-      const VkImageUsageFlags transfer =
-         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-      /* Native raw copies rebase each layer against AIL's allocated linear
-       * layer stride. Qualify two layers for that path only; sampler/PBE,
-       * external and flagged images keep their existing admission. */
-      if (agx_apple9_compute_enabled(&pdev->dev) &&
-          ycbcr_info == NULL && external_info == NULL &&
-          pImageFormatInfo->flags == 0 &&
-          !(pImageFormatInfo->usage & ~transfer) &&
-          vk_format_get_blocksize(pImageFormatInfo->format) <= 16)
-         maxArraySize = 2;
-   }
 
    assert(util_is_power_of_two_nonzero(max_dim));
    uint32_t maxMipLevels = util_logbase2(max_dim) + 1;
@@ -495,17 +545,6 @@ hk_GetPhysicalDeviceImageFormatProperties2(
 
       sampleCounts =
          VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT;
-   }
-
-   if (agx_apple9_compute_enabled(&pdev->dev) &&
-       (features & VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT)) {
-      enum pipe_format format = hk_format_to_pipe_format(pImageFormatInfo->format);
-      struct agx_tilebuffer_layout tib;
-      for (unsigned samples = 2; samples <= 4; samples *= 2) {
-         if ((sampleCounts & samples) &&
-             !hk_apple9_tilebuffer(format, samples, &tib))
-            sampleCounts &= ~samples;
-      }
    }
 
    /* From the Vulkan 1.2.199 spec:
@@ -540,6 +579,12 @@ hk_GetPhysicalDeviceImageFormatProperties2(
 
    const VkExternalMemoryProperties *ext_mem_props = NULL;
    if (external_info != NULL && external_info->handleType != 0) {
+      if (!pdev->vk.supported_extensions.KHR_external_memory_fd ||
+          (external_info->handleType ==
+              VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT &&
+           !pdev->vk.supported_extensions.EXT_external_memory_dma_buf))
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
       bool tiling_has_explicit_layout;
       switch (pImageFormatInfo->tiling) {
       case VK_IMAGE_TILING_LINEAR:
@@ -752,9 +797,19 @@ static bool
 hk_can_compress_create_info(struct hk_device *dev, unsigned plane,
                             const VkImageCreateInfo *info)
 {
+   VkImageUsageFlags usage = info->usage;
+   if (hk_feedback_can_compress(&dev->dev, info->imageType, info->format,
+                                info->samples)) {
+      /* The render boundary path decompresses these subresources and keeps
+       * feedback stores raw: PBE stores for colour, ZLS stores for depth and
+       * stencil. MSAA, 3D and colour formats without a bit-preserving integer
+       * compression alias retain 0ac160e1c41's ban.
+       */
+      usage &= ~VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+   }
    return hk_can_compress(&dev->dev, info->format, plane, info->extent.width,
                           info->extent.height, info->samples, info->flags,
-                          info->usage, info->pNext);
+                          usage, info->pNext);
 }
 
 static enum ail_tiling
@@ -820,12 +875,28 @@ choose_drm_format_mod(struct hk_device *dev, uint8_t plane_count,
 {
    uint64_t best_mod = UINT64_MAX;
    uint32_t best_score = 0;
-   bool can_compress = true;
+   bool can_compress = true, can_use_compressed = true;
 
    for (uint8_t plane = 0; plane < plane_count; plane++) {
       if (!hk_can_compress_create_info(dev, plane, info))
          can_compress = false;
+      if (!hk_can_use_compressed_modifier(&dev->dev, info->format, plane,
+                                          info->extent.width,
+                                          info->extent.height, info->samples,
+                                          info->flags, info->usage,
+                                          info->pNext))
+         can_use_compressed = false;
    }
+
+   /* Prefer an uncompressed modifier where compression is only avoided by
+    * policy (feedback loops), but honour a list naming only the compressed
+    * one, which the format query advertised.
+    */
+   bool other = false;
+   for (uint32_t i = 0; i < modifier_count; ++i)
+      other |= modifiers[i] != DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED;
+   if (!can_compress && can_use_compressed && !other)
+      can_compress = true;
 
    for (uint32_t i = 0; i < modifier_count; ++i) {
       if (!can_compress &&
@@ -954,28 +1025,89 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
       };
 
       ail_make_miptree(&image->planes[plane].layout);
+
+      /* Imported planes live where the exporter put them. Texture and PBE
+       * descriptors address 16-byte units; keep compressed layouts on the
+       * alignment hk gives its own planes.
+       */
+      if (mod_explicit_info &&
+          plane < mod_explicit_info->drmFormatModifierPlaneCount) {
+         uint64_t offset_B = mod_explicit_info->pPlaneLayouts[plane].offset;
+         unsigned align_B = compressed ? HK_PLANE_ALIGN_B : 16;
+         if (offset_B % align_B)
+            return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT;
+         image->planes[plane].has_explicit_offset = true;
+         image->planes[plane].explicit_offset_B = offset_B;
+      }
    }
 
    return VK_SUCCESS;
 }
 
+void
+hk_apple9_residency_init(struct hk_apple9_residency *r,
+                         const struct ail_layout *layout)
+{
+   const unsigned block_w = util_format_get_blockwidth(layout->format);
+   const unsigned block_h = util_format_get_blockheight(layout->format);
+
+   r->layer_pages = ail_bytes_to_pages(layout->layer_stride_B);
+   r->pages = r->layer_pages * layout->depth_px;
+
+   for (unsigned l = 0; l < AIL_MAX_MIP_LEVELS; ++l) {
+      unsigned level = MIN2(l, layout->levels - 1);
+      struct ail_tile tile = layout->tilesize_el[level];
+      unsigned tile_w = tile.width_el * block_w;
+      unsigned tile_h = tile.height_el * block_h;
+      struct hk_apple9_residency_level *out = &r->level[l];
+
+      /* Outside the mip tail, a hardware tile is exactly one page. */
+      out->page = layout->level_offsets_B[level] / AIL_PAGESIZE;
+      if (level < layout->mip_tail_first_lod &&
+          util_is_power_of_two_nonzero(tile_w) &&
+          util_is_power_of_two_nonzero(tile_h)) {
+         out->tiles_per_row =
+            DIV_ROUND_UP(layout->stride_el[level], tile.width_el);
+         out->shift_x = util_logbase2(tile_w);
+         out->shift_y = util_logbase2(tile_h);
+      } else {
+         out->shift_x = out->shift_y = 31;
+      }
+   }
+}
+
+/* Sparse planes own their address and residency table, and descriptors embed
+ * both. Descriptor-buffer capture replay places them in the replay range, at
+ * the captured addresses on replay (replay == NULL: anywhere in the range).
+ */
 static VkResult
 hk_image_plane_alloc_vma(struct hk_device *dev, struct hk_image_plane *plane,
-                         VkImageCreateFlags create_flags)
+                         VkImageCreateFlags create_flags,
+                         const struct hk_image_plane_capture_data *replay)
 {
    const bool sparse_bound = create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT;
    const bool sparse_resident =
       create_flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT;
    assert(sparse_bound || !sparse_resident);
 
+   const bool capture_replay =
+      create_flags & VK_IMAGE_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT;
+   const uint64_t replay_va = replay ? replay->va : 0;
+   const uint64_t replay_residency = replay ? replay->residency : 0;
+
    if (sparse_bound) {
       size_t size = align(plane->layout.size_B, HK_SPARSE_ALIGN_B);
-      plane->va = agx_va_alloc(&dev->dev, size, AIL_PAGESIZE, 0, 0);
-      plane->addr = plane->va->addr;
-      if (plane->addr == 0) {
-         return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+      enum agx_va_flags va_flags =
+         capture_replay ? AGX_VA_REPLAY | (replay_va ? AGX_VA_FIXED : 0) : 0;
+      plane->va =
+         agx_va_alloc(&dev->dev, size, AIL_PAGESIZE, va_flags, replay_va);
+      if (!plane->va) {
+         return vk_errorf(dev, replay_va
+                                  ? VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS
+                                  : VK_ERROR_OUT_OF_DEVICE_MEMORY,
                           "Sparse VMA allocation failed");
       }
+      plane->addr = plane->va->addr;
 
       /* Bind scratch pages to discard writes, including from lowered software
        * texture atomics. Reads will use the hardware texture unit sparse
@@ -987,7 +1119,30 @@ hk_image_plane_alloc_vma(struct hk_device *dev, struct hk_image_plane *plane,
       hk_bind_scratch(dev, plane->va, 0, size);
    }
 
-   if (sparse_resident) {
+   if (sparse_resident && agx_is_apple9(&dev->dev)) {
+      /* Unbound pages read the scratch page. Every page starts unbound. */
+      const struct ail_layout *layout = &plane->layout;
+      size_t size_B = sizeof(struct hk_apple9_residency) +
+                      align(ail_bytes_to_pages(layout->layer_stride_B) *
+                               layout->depth_px, 4);
+      enum agx_va_flags va_flags =
+         capture_replay
+            ? AGX_VA_REPLAY | (replay_residency ? AGX_VA_FIXED : 0)
+            : 0;
+      plane->apple9_residency =
+         agx_bo_create_va(&dev->dev, size_B, 0, 0, va_flags, replay_residency,
+                          "Apple9 residency");
+      if (!plane->apple9_residency) {
+         return vk_errorf(dev, replay_residency
+                                  ? VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS
+                                  : VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                          "Residency table allocation failed");
+      }
+
+      struct hk_apple9_residency *r = agx_bo_map(plane->apple9_residency);
+      memset(r, 0, size_B);
+      hk_apple9_residency_init(r, layout);
+   } else if (sparse_resident) {
       plane->sparse_map =
          agx_bo_create(&dev->dev, plane->layout.sparse_table_size_B,
                        AIL_PAGESIZE, 0, "Sparse map");
@@ -1012,6 +1167,7 @@ hk_image_plane_finish(struct hk_device *dev, struct hk_image_plane *plane,
    }
 
    agx_bo_unreference(&dev->dev, plane->sparse_map);
+   agx_bo_unreference(&dev->dev, plane->apple9_residency);
 }
 
 static void
@@ -1050,9 +1206,24 @@ hk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
       return result;
    }
 
+   struct hk_image_capture_data replay_data;
+   const struct hk_image_capture_data *replay = NULL;
+   if (image->vk.create_flags &
+       VK_IMAGE_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT) {
+      const VkOpaqueCaptureDescriptorDataCreateInfoEXT *cap_info =
+         vk_find_struct_const(pCreateInfo->pNext,
+                              OPAQUE_CAPTURE_DESCRIPTOR_DATA_CREATE_INFO_EXT);
+      if (cap_info && cap_info->opaqueCaptureDescriptorData) {
+         memcpy(&replay_data, cap_info->opaqueCaptureDescriptorData,
+                sizeof(replay_data));
+         replay = &replay_data;
+      }
+   }
+
    for (uint8_t plane = 0; plane < image->plane_count; plane++) {
       result = hk_image_plane_alloc_vma(dev, &image->planes[plane],
-                                        image->vk.create_flags);
+                                        image->vk.create_flags,
+                                        replay ? &replay->planes[plane] : NULL);
       if (result != VK_SUCCESS) {
          hk_image_finish(dev, image, pAllocator);
          vk_free2(&dev->vk.alloc, pAllocator, image);
@@ -1088,6 +1259,11 @@ hk_image_plane_add_req(struct hk_image_plane *plane, bool sparse,
    assert(util_is_power_of_two_or_zero64(plane_align_B));
 
    *align_B = MAX2(*align_B, plane_align_B);
+   if (plane->has_explicit_offset) {
+      *size_B = MAX2(*size_B, plane->explicit_offset_B + plane->layout.size_B);
+      return;
+   }
+
    *size_B = align64(*size_B, plane_align_B);
    *size_B += plane->layout.size_B;
 }
@@ -1098,7 +1274,7 @@ hk_get_image_memory_requirements(struct hk_device *dev, struct hk_image *image,
                                  VkMemoryRequirements2 *pMemoryRequirements)
 {
    struct hk_physical_device *pdev = hk_device_physical(dev);
-   uint32_t memory_types = (1 << pdev->mem_type_count) - 1;
+   uint32_t memory_types = hk_general_memory_types(pdev);
    bool sparse =
       image->vk.create_flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
                                 VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT);
@@ -1297,7 +1473,9 @@ hk_get_image_subresource_layout(UNUSED struct hk_device *dev,
    const struct hk_image_plane *plane = &image->planes[p];
 
    uint64_t offset_B = 0;
-   if (!image->disjoint) {
+   if (plane->has_explicit_offset) {
+      offset_B = plane->explicit_offset_B;
+   } else if (!image->disjoint) {
       uint32_t align_B = 0;
       /* TODO: sparse? */
       for (unsigned plane = 0; plane < p; plane++)
@@ -1366,9 +1544,13 @@ hk_GetDeviceImageSubresourceLayoutKHR(
 
 static void
 hk_image_plane_bind(struct hk_device *dev, struct hk_image_plane *plane,
-                    struct hk_device_memory *mem, uint64_t *offset_B)
+                    struct hk_device_memory *mem, uint64_t base_B,
+                    uint64_t *offset_B)
 {
-   *offset_B = align64(*offset_B, HK_PLANE_ALIGN_B);
+   if (plane->has_explicit_offset)
+      *offset_B = base_B + plane->explicit_offset_B;
+   else
+      *offset_B = align64(*offset_B, HK_PLANE_ALIGN_B);
 
    if (plane->va) {
 #if 0
@@ -1382,8 +1564,12 @@ hk_image_plane_bind(struct hk_device *dev, struct hk_image_plane *plane,
       UNREACHABLE("todo");
    } else {
       plane->addr = mem->bo->va->addr + *offset_B;
-      plane->map = agx_bo_map(mem->bo) + *offset_B;
-      plane->rem = mem->bo->size - (*offset_B);
+      plane->bo = mem->bo;
+      plane->offset_B = *offset_B;
+      if (sizeof(void *) > 4) {
+         void *map = agx_bo_map(mem->bo);
+         plane->map = map ? (char *)map + *offset_B : NULL;
+      }
    }
 
    *offset_B += plane->layout.size_B;
@@ -1412,16 +1598,19 @@ hk_BindImageMemory2(VkDevice device, uint32_t bindInfoCount,
 #endif
 
       assert(mem);
+      image->implicit_sync_res = mem->implicit_sync ? mem->bo->uapi_handle : 0;
       uint64_t offset_B = pBindInfos[i].memoryOffset;
       if (image->disjoint) {
          const VkBindImagePlaneMemoryInfo *plane_info = vk_find_struct_const(
             pBindInfos[i].pNext, BIND_IMAGE_PLANE_MEMORY_INFO);
          uint8_t plane =
             hk_image_aspects_to_plane(image, plane_info->planeAspect);
-         hk_image_plane_bind(dev, &image->planes[plane], mem, &offset_B);
+         hk_image_plane_bind(dev, &image->planes[plane], mem,
+                             pBindInfos[i].memoryOffset, &offset_B);
       } else {
          for (unsigned plane = 0; plane < image->plane_count; plane++) {
-            hk_image_plane_bind(dev, &image->planes[plane], mem, &offset_B);
+            hk_image_plane_bind(dev, &image->planes[plane], mem,
+                             pBindInfos[i].memoryOffset, &offset_B);
          }
       }
 
@@ -1452,9 +1641,48 @@ hk_plane_index(VkFormat format, VkImageAspectFlags aspect_mask)
    }
 }
 
+/* Keep the cached mapping policy on 64-bit, but do not retain image mappings
+ * across operations in the constrained 32-bit CPU address space. Host copies
+ * do not track shim CPU-write generations, so preserve agx_bo_map's conservative
+ * epoch revocation even though these operation-owned pointers do not escape.
+ */
+struct hk_image_plane_map {
+   void *base;
+   void *ptr;
+   size_t size;
+};
+
+static VkResult
+hk_image_plane_map(struct hk_device *dev, const struct hk_image_plane *plane,
+                   struct hk_image_plane_map *map)
+{
+   if (sizeof(void *) > 4) {
+      map->ptr = plane->map;
+   } else {
+      struct agx_bo *bo = plane->bo;
+      if (bo->size > SIZE_MAX)
+         return vk_error(dev, VK_ERROR_MEMORY_MAP_FAILED);
+
+      map->size = bo->size;
+      map->base = agx_bo_map_range(bo, NULL, map->size);
+      if (map->base)
+         map->ptr = (char *)map->base + plane->offset_B;
+   }
+
+   return map->ptr ? VK_SUCCESS : vk_error(dev, VK_ERROR_MEMORY_MAP_FAILED);
+}
+
+static void
+hk_image_plane_unmap(struct hk_image_plane_map *map)
+{
+   if (map->base)
+      munmap(map->base, map->size);
+}
+
 static void
 hk_copy_memory_to_image(struct hk_device *device, struct hk_image *dst_image,
-                        const VkMemoryToImageCopyEXT *info, bool copy_memcpy)
+                        const VkMemoryToImageCopyEXT *info, bool copy_memcpy,
+                        void *map)
 {
    unsigned plane =
       hk_plane_index(dst_image->vk.format, info->imageSubresource.aspectMask);
@@ -1492,17 +1720,22 @@ hk_copy_memory_to_image(struct hk_device *device, struct hk_image *dst_image,
       layout, info->imageSubresource.mipLevel);
 
    const char *src = (const char *)info->pHostPointer;
-   char *dst = (char *)dst_image->planes[plane].map + image_offset;
+   char *dst = (char *)map + image_offset;
    for (unsigned layer = 0; layer < layers;
         layer++, src += src_layer_stride, dst += dst_layer_stride) {
       if (copy_memcpy) {
          memcpy(dst, src, ail_get_level_size_B(layout, level));
       } else if (!tiled) {
+         /* Linear rows are blocks: offsets and extents are in texels. */
+         enum pipe_format format = layout->format;
          uint32_t dst_pitch = ail_get_linear_stride_B(layout, level);
-         /*TODO:comp*/
-         for (unsigned y = 0; y < extent.height; y++) {
-            memcpy(dst + dst_pitch * (y + offset.y) + offset.x * blocksize_B,
-                   src + src_pitch * y, extent.width * blocksize_B);
+         uint32_t x_el = util_format_get_nblocksx(format, offset.x);
+         uint32_t y_el = util_format_get_nblocksy(format, offset.y);
+         uint32_t w_el = util_format_get_nblocksx(format, extent.width);
+         uint32_t h_el = util_format_get_nblocksy(format, extent.height);
+         for (unsigned y = 0; y < h_el; y++) {
+            memcpy(dst + dst_pitch * (y + y_el) + x_el * blocksize_B,
+                   src + src_pitch * y, w_el * blocksize_B);
          }
       } else {
          ail_tile(dst, (void *)src, layout, level, src_pitch, offset.x,
@@ -1519,8 +1752,18 @@ hk_CopyMemoryToImageEXT(VkDevice _device,
    VK_FROM_HANDLE(hk_image, dst_image, info->dstImage);
 
    for (unsigned i = 0; i < info->regionCount; i++) {
+      unsigned plane = hk_plane_index(
+         dst_image->vk.format, info->pRegions[i].imageSubresource.aspectMask);
+      struct hk_image_plane_map map = {0};
+      VkResult result =
+         hk_image_plane_map(device, &dst_image->planes[plane], &map);
+      if (result != VK_SUCCESS)
+         return result;
+
       hk_copy_memory_to_image(device, dst_image, &info->pRegions[i],
-                              info->flags & VK_HOST_IMAGE_COPY_MEMCPY_EXT);
+                              info->flags & VK_HOST_IMAGE_COPY_MEMCPY_EXT,
+                              map.ptr);
+      hk_image_plane_unmap(&map);
    }
 
    return VK_SUCCESS;
@@ -1528,7 +1771,8 @@ hk_CopyMemoryToImageEXT(VkDevice _device,
 
 static void
 hk_copy_image_to_memory(struct hk_device *device, struct hk_image *src_image,
-                        const VkImageToMemoryCopyEXT *info, bool copy_memcpy)
+                        const VkImageToMemoryCopyEXT *info, bool copy_memcpy,
+                        const void *map)
 {
    unsigned plane =
       hk_plane_index(src_image->vk.format, info->imageSubresource.aspectMask);
@@ -1571,7 +1815,7 @@ hk_copy_image_to_memory(struct hk_device *device, struct hk_image *src_image,
    bool tiled = ail_is_level_twiddled_uncompressed(
       layout, info->imageSubresource.mipLevel);
 
-   const char *src = (const char *)src_image->planes[plane].map + image_offset;
+   const char *src = (const char *)map + image_offset;
    char *dst = (char *)info->pHostPointer;
    for (unsigned layer = 0; layer < layers;
         layer++, src += src_layer_stride, dst += dst_layer_stride) {
@@ -1579,12 +1823,17 @@ hk_copy_image_to_memory(struct hk_device *device, struct hk_image *src_image,
       if (copy_memcpy) {
          memcpy(dst, src, dst_layer_stride);
       } else if (!tiled) {
-         /* TODO: comp */
+         /* Linear rows are blocks: offsets and extents are in texels. */
+         enum pipe_format format = layout->format;
          uint32_t src_pitch = ail_get_linear_stride_B(layout, level);
-         for (unsigned y = 0; y < extent.height; y++) {
+         uint32_t x_el = util_format_get_nblocksx(format, offset.x);
+         uint32_t y_el = util_format_get_nblocksy(format, offset.y);
+         uint32_t w_el = util_format_get_nblocksx(format, extent.width);
+         uint32_t h_el = util_format_get_nblocksy(format, extent.height);
+         for (unsigned y = 0; y < h_el; y++) {
             memcpy(dst + dst_pitch * y,
-                   src + src_pitch * (y + offset.y) + offset.x * blocksize_B,
-                   extent.width * blocksize_B);
+                   src + src_pitch * (y + y_el) + x_el * blocksize_B,
+                   w_el * blocksize_B);
          }
       } else {
          ail_detile((void *)src, dst, layout, info->imageSubresource.mipLevel,
@@ -1601,14 +1850,23 @@ hk_CopyImageToMemoryEXT(VkDevice _device,
    VK_FROM_HANDLE(hk_image, image, info->srcImage);
 
    for (unsigned i = 0; i < info->regionCount; i++) {
+      unsigned plane = hk_plane_index(
+         image->vk.format, info->pRegions[i].imageSubresource.aspectMask);
+      struct hk_image_plane_map map = {0};
+      VkResult result = hk_image_plane_map(device, &image->planes[plane], &map);
+      if (result != VK_SUCCESS)
+         return result;
+
       hk_copy_image_to_memory(device, image, &info->pRegions[i],
-                              info->flags & VK_HOST_IMAGE_COPY_MEMCPY_EXT);
+                              info->flags & VK_HOST_IMAGE_COPY_MEMCPY_EXT,
+                              map.ptr);
+      hk_image_plane_unmap(&map);
    }
 
    return VK_SUCCESS;
 }
 
-static void
+static VkResult
 hk_copy_image_to_image_cpu(struct hk_device *device, struct hk_image *src_image,
                            struct hk_image *dst_image, const VkImageCopy2 *info,
                            bool copy_memcpy)
@@ -1657,9 +1915,18 @@ hk_copy_image_to_image_cpu(struct hk_device *device, struct hk_image *src_image,
    bool dst_tiled = ail_is_level_twiddled_uncompressed(
       dst_layout, info->dstSubresource.mipLevel);
 
-   const char *src =
-      (const char *)src_image->planes[src_plane].map + src_image_offset;
-   char *dst = (char *)dst_image->planes[dst_plane].map + dst_image_offset;
+   struct hk_image_plane_map src_map = {0}, dst_map = {0};
+   VkResult result =
+      hk_image_plane_map(device, &src_image->planes[src_plane], &src_map);
+   if (result != VK_SUCCESS)
+      return result;
+
+   result = hk_image_plane_map(device, &dst_image->planes[dst_plane], &dst_map);
+   if (result != VK_SUCCESS)
+      goto out;
+
+   const char *src = (const char *)src_map.ptr + src_image_offset;
+   char *dst = (char *)dst_map.ptr + dst_image_offset;
    for (unsigned layer = 0; layer < layers_to_copy;
         layer++, src += src_layer_stride, dst += dst_layer_stride) {
 
@@ -1672,19 +1939,28 @@ hk_copy_image_to_image_cpu(struct hk_device *device, struct hk_image *src_image,
          assert(src_size == dst_size);
          memcpy(dst, src, src_size);
       } else if (!src_tiled && !dst_tiled) {
-         /* TODO comp */
+         /* Linear rows are blocks. The extent and source offset are in
+          * source texels, the destination offset in destination texels.
+          */
          uint32_t src_pitch =
             ail_get_linear_stride_B(src_layout, info->srcSubresource.mipLevel);
 
          uint32_t dst_pitch =
             ail_get_linear_stride_B(dst_layout, info->dstSubresource.mipLevel);
 
-         for (unsigned y = 0; y < extent.height; y++) {
-            memcpy(dst + dst_pitch * (y + dst_offset.y) +
-                      dst_offset.x * dst_block_B,
-                   src + src_pitch * (y + src_offset.y) +
-                      src_offset.x * src_block_B,
-                   extent.width * src_block_B);
+         enum pipe_format src_format = src_layout->format;
+         enum pipe_format dst_format = dst_layout->format;
+         uint32_t src_x_el = util_format_get_nblocksx(src_format, src_offset.x);
+         uint32_t src_y_el = util_format_get_nblocksy(src_format, src_offset.y);
+         uint32_t dst_x_el = util_format_get_nblocksx(dst_format, dst_offset.x);
+         uint32_t dst_y_el = util_format_get_nblocksy(dst_format, dst_offset.y);
+         uint32_t w_el = util_format_get_nblocksx(src_format, extent.width);
+         uint32_t h_el = util_format_get_nblocksy(src_format, extent.height);
+
+         for (unsigned y = 0; y < h_el; y++) {
+            memcpy(dst + dst_pitch * (y + dst_y_el) + dst_x_el * dst_block_B,
+                   src + src_pitch * (y + src_y_el) + src_x_el * src_block_B,
+                   w_el * src_block_B);
          }
       } else if (!src_tiled) {
          UNREACHABLE("todo");
@@ -1724,6 +2000,10 @@ hk_copy_image_to_image_cpu(struct hk_device *device, struct hk_image *src_image,
           * buffer.
           */
          char *temp_tile = malloc(temp_tile_size);
+         if (!temp_tile) {
+            result = vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+            goto out;
+         }
 
          for (unsigned by = src_offset.y / block_height;
               by * block_height < src_offset.y + extent.height; by++) {
@@ -1750,6 +2030,11 @@ hk_copy_image_to_image_cpu(struct hk_device *device, struct hk_image *src_image,
          free(temp_tile);
       }
    }
+
+out:
+   hk_image_plane_unmap(&dst_map);
+   hk_image_plane_unmap(&src_map);
+   return result;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -1768,15 +2053,19 @@ hk_CopyImageToImageEXT(VkDevice _device,
          u_foreach_bit(b, info.dstSubresource.aspectMask) {
             info.srcSubresource.aspectMask = BITFIELD_BIT(b);
             info.dstSubresource.aspectMask = BITFIELD_BIT(b);
-            hk_copy_image_to_image_cpu(device, src_image, dst_image, &info,
-                                       copy_memcpy);
+            VkResult result = hk_copy_image_to_image_cpu(
+               device, src_image, dst_image, &info, copy_memcpy);
+            if (result != VK_SUCCESS)
+               return result;
          }
          continue;
       }
 
-      hk_copy_image_to_image_cpu(device, src_image, dst_image,
-                                 pCopyImageToImageInfo->pRegions + i,
-                                 copy_memcpy);
+      VkResult result = hk_copy_image_to_image_cpu(
+         device, src_image, dst_image, pCopyImageToImageInfo->pRegions + i,
+         copy_memcpy);
+      if (result != VK_SUCCESS)
+         return result;
    }
 
    return VK_SUCCESS;
@@ -1788,5 +2077,29 @@ hk_TransitionImageLayoutEXT(
    const VkHostImageLayoutTransitionInfoEXT *transitions)
 {
    /* We don't do anything with layouts so this should be a no-op */
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_GetImageOpaqueCaptureDescriptorDataEXT(
+   UNUSED VkDevice device, const VkImageCaptureDescriptorDataInfoEXT *pInfo,
+   void *pData)
+{
+   VK_FROM_HANDLE(hk_image, image, pInfo->image);
+
+   /* Bound images take their addresses from capture-replay memory; only
+    * sparse planes have addresses of their own.
+    */
+   struct hk_image_capture_data data = {0};
+   for (uint8_t p = 0; p < image->plane_count; p++) {
+      const struct hk_image_plane *plane = &image->planes[p];
+      if (plane->va && (plane->va->flags & AGX_VA_REPLAY))
+         data.planes[p].va = plane->va->addr;
+      if (plane->apple9_residency &&
+          (plane->apple9_residency->va->flags & AGX_VA_REPLAY))
+         data.planes[p].residency = plane->apple9_residency->va->addr;
+   }
+
+   memcpy(pData, &data, sizeof(data));
    return VK_SUCCESS;
 }

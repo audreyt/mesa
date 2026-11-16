@@ -7,6 +7,9 @@
 
 #pragma once
 
+#include "asahi/lib/agx_primitive_count.h"
+#include "asahi/lib/agx_apple9.h"
+
 #include "util/macros.h"
 
 #include "util/list.h"
@@ -21,13 +24,15 @@
 #include "shader_enums.h"
 
 #include "hk_private.h"
+#include "hk_apple9_native_batch.h"
 #include "hk_shader.h"
+#include "hk_sync.h"
 
 #include "hk_cmd_pool.h"
+#include "hk_upload.h"
 #include "hk_descriptor_set.h"
 
 #include "asahi/lib/agx_nir_lower_vbo.h"
-#include "asahi/lib/agx_apple9_compute.h"
 #include "util/u_dynarray.h"
 #include "vulkan/vulkan_core.h"
 
@@ -35,9 +40,14 @@
 
 #include <stdio.h>
 
+/* Occlusion queries active at once, and segment slots per control stream. */
+#define HK_MAX_ACTIVE_OCCLUSION_QUERIES 64
+#define HK_OCCLUSION_SEGMENTS           512
+
 struct hk_buffer;
 struct hk_cmd_bo;
 struct hk_cmd_pool;
+struct agx_apple9_compute_profile;
 struct hk_image_view;
 struct hk_push_descriptor_set;
 struct hk_shader;
@@ -59,6 +69,8 @@ struct hk_root_descriptor_table {
       struct {
          uint32_t view_index;
          uint32_t ppp_multisamplectl;
+         uint32_t draw_id;
+         uint32_t _pad0;
 
          /* Vertex input state */
          uint64_t attrib_base[AGX_MAX_VBUFS];
@@ -77,6 +89,9 @@ struct hk_root_descriptor_table {
          /* Address of geometry param buffer if GS is used, else 0 */
          uint64_t geometry_params;
 
+         /* struct libagx_mesh_params of a mesh shader draw */
+         uint64_t mesh_params;
+
          /* Pipeline statistics queries. This is a base address with flags. */
          uint64_t pipeline_stats;
          VkQueryPipelineStatisticFlags pipeline_stats_flags;
@@ -89,7 +104,10 @@ struct hk_root_descriptor_table {
          uint16_t force_never_in_shader;
          uint16_t _pad3;
          uint16_t provoking;
-         uint16_t _pad4;
+         /* Rasterized primitive class for per-vertex fragment inputs:
+          * 0 triangles, 1 lines, 2 points; bit 2 if the rasterizer's vertex
+          * order is the API order rotated (first-provoking fans). */
+         uint16_t rasterized_prim;
 
          /* True if there is an API geometry shader. If false, there may still
           * be a geometry shader in use (notably for transform feedback) but it
@@ -100,6 +118,11 @@ struct hk_root_descriptor_table {
 
          uint16_t rasterization_stream;
          uint16_t _pad6;
+
+         /* Fragment depth exports clamp to this range: viewport 0's depth
+          * range, or the user range, with depth clamping; [0, 1] without.
+          */
+         float depth_clamp[2];
 
          /* Mapping from varying slots written by the last vertex stage to UVS
           * indices. This mapping must be compatible with the fragment shader.
@@ -115,12 +138,23 @@ struct hk_root_descriptor_table {
    /* Client push constants */
    uint8_t push[HK_MAX_PUSH_SIZE];
 
-   /* Dynamic buffer bindings */
-   struct hk_buffer_address dynamic_buffers[HK_MAX_DYNAMIC_BUFFERS];
-
    /* Start index in dynamic_buffers where each set starts */
    uint8_t set_dynamic_buffer_start[HK_MAX_SETS];
+
+   /* Dynamic buffer bindings. Table-free roots stop after the slots in use. */
+   struct hk_buffer_address dynamic_buffers[HK_MAX_DYNAMIC_BUFFERS];
+
+   /* Optional tail: read-only shader data, indexed by API stage (including
+    * emulated stages). Keeping it last preserves the existing layout and
+    * upload size of every program without constant tables, including those
+    * using dynamic descriptors.
+    */
+   uint64_t constant_data[MESA_SHADER_MESH_STAGES];
 };
+
+/* Bumped whenever hk_root_descriptor_table offsets change: compiled shaders
+ * bake them, so pipeline and disk cache keys include it. */
+#define HK_ROOT_LAYOUT_VERSION 5
 
 /* helper macro for computing root descriptor byte offsets */
 #define hk_root_descriptor_offset(member)                                      \
@@ -130,6 +164,35 @@ struct hk_descriptor_state {
    bool root_dirty;
    struct hk_root_descriptor_table root;
 
+   /* VK_EXT_descriptor_buffer: bound buffer addresses, indexed by
+    * vkCmdSetDescriptorBufferOffsets bufferIndices. */
+   uint64_t descriptor_buffers[HK_MAX_SETS];
+   /* Sets bound from descriptor memory rather than a set object or push
+    * descriptors. */
+   uint32_t descriptor_buffer_sets;
+
+   /* Last uploaded root (self-address normalized to 0) and its GPU address.
+    * An identical root reuses the upload instead of hashing into the
+    * per-command-buffer upload cache. Zeroed with the rest of the state on
+    * reset, i.e. whenever the upload pool is. */
+   /* Dynamic buffer slots bound since the last reset: roots are uploaded up
+    * to the end of these. */
+   uint32_t root_dynamic_count;
+   /* Nonzero constant-data pointers, maintained on shader binds. */
+   uint32_t root_constant_stages;
+
+   bool root_last_valid;
+   uint32_t root_last_size;
+   uint64_t root_last_gpu;
+   uint64_t root_last_push_mask;
+   struct hk_root_descriptor_table root_last;
+
+   /* Last direct-dispatch group count upload, reused for identical counts so
+    * the root (which holds its address) stays comparable across dispatches. */
+   bool group_count_last_valid;
+   uint32_t group_count_last[3];
+   uint64_t group_count_last_addr;
+
    uint32_t set_sizes[HK_MAX_SETS];
    struct hk_descriptor_set *sets[HK_MAX_SETS];
    uint32_t sets_dirty;
@@ -138,12 +201,27 @@ struct hk_descriptor_state {
    uint32_t push_dirty;
 };
 
+static inline size_t
+hk_descriptor_root_size(const struct hk_descriptor_state *desc)
+{
+   assert(!(desc->root_constant_stages &
+            ~BITFIELD_MASK(ARRAY_SIZE(desc->root.constant_data))));
+   if (desc->root_constant_stages)
+      return hk_root_descriptor_offset(constant_data) +
+             util_last_bit(desc->root_constant_stages) * sizeof(uint64_t);
+
+   return hk_root_descriptor_offset(dynamic_buffers) +
+          desc->root_dynamic_count * sizeof(struct hk_buffer_address);
+}
+
+
 struct hk_attachment {
    VkFormat vk_format;
    struct hk_image_view *iview;
 
    VkResolveModeFlagBits resolve_mode;
    struct hk_image_view *resolve_iview;
+   VkRenderingAttachmentFlagsKHR flags;
 
    bool clear;
    uint32_t clear_colour[4];
@@ -187,6 +265,30 @@ struct hk_render_registers {
 };
 
 struct hk_rendering_state {
+   /* Stages that may depend on the open render this pass continued. */
+   VkPipelineStageFlags2 merge_reach;
+   /* Colour attachments this render pass stores (bit per attachment). */
+   uint32_t store_mask;
+   /* Depth/stencil aspects whose stores must survive a merged pass. */
+   uint8_t ds_store_mask;
+   uint8_t ds_read_only;
+   /* An attachment is in a layout that also allows shader access (GENERAL
+    * or a feedback loop): passes may read it as a texture. */
+   bool feedback;
+
+   /* Depth and stencil loads of a merged or suspend/resume chain in one
+    * hardware render: those of its first render pass. */
+   bool chain_load[2];
+   /* This render pass resumed a suspended one in its render. */
+   bool resumed;
+   /* A stored colour attachment is linear, so buffers aliasing its memory
+    * can observe the render's writes (hk_queue's tiling-wait elision). */
+   bool linear_store;
+   /* Feedback stores stay raw until the end of this render instance. */
+   uint8_t raw_color_mask;
+   /* The depth/stencil planes are raw: ZLS loads and stores uncompressed. */
+   bool raw_zs;
+
    VkRenderingFlagBits flags;
 
    VkRect2D area;
@@ -198,8 +300,17 @@ struct hk_rendering_state {
    struct hk_attachment depth_att;
    struct hk_attachment stencil_att;
 
+   /* Immutable inputs shared by this render's background/store helpers. */
+   uint64_t apple9_arguments, apple9_sysvals;
+
    struct agx_tilebuffer_layout tilebuffer;
    struct hk_render_registers cr;
+
+   /* Control streams other than the last store depth/stencil for the next
+    * one to load. The last control stream honours the store operations:
+    * zls_last if it is also the first, zls_partial_last otherwise. */
+   struct hk_cs *first_cs;
+   struct agx_zls_control_packed zls_last, zls_partial_last;
 };
 
 struct hk_index_buffer_state {
@@ -228,12 +339,40 @@ struct hk_graphics_state {
    uint64_t draw_params;
    uint64_t draw_id_ptr;
 
-   /* Apple9 sysval words 0/1/2: first vertex (or vertex offset), first instance,
-    * and draw ID. */
-   uint32_t apple9_draw_params[3];
-
    uint32_t shaders_dirty;
    struct hk_api_shader *shaders[MESA_SHADER_MESH + 1];
+
+   /* Graphics shaders bound through the API. On Apple9, deferred shaders are
+    * resolved from these into concrete variants in shaders[] at draw time.
+    */
+   struct hk_api_shader *apple9_api[HK_APPLE9_GFX_STAGES];
+
+   /* Last resolution of apple9_api, reused while none of the graphics key's
+    * inputs change. render_gen counts render pass instances. */
+   struct {
+      bool valid;
+      bool prefer_native;
+      /* Whether it counted fragment invocations for an active query. */
+      bool fs_statistics;
+      /* Whether the resolution exported depth late for a depth/stencil
+       * feedback loop that the draw could write. */
+      bool late_zs;
+      uint32_t render_gen;
+      struct hk_api_shader *api[HK_APPLE9_GFX_STAGES];
+      struct hk_api_shader *out[HK_APPLE9_GFX_STAGES];
+   } apple9_resolved;
+   uint32_t render_gen;
+
+   /* The current draw is a last-provoking fan unrolled to triangles. */
+   bool apple9_fan_unrolled;
+   /* The bound vertex shader writes barycentric weights for this draw, a
+    * non-indexed triangle list, without the passthrough geometry shader. */
+   bool apple9_weights_by_vs;
+   /* The bound passthrough geometry shader continues line stipple, see
+    * hk_apple9_line_stipple_gs. */
+   bool apple9_stipple_gs;
+   /* The bound passthrough geometry shader draws polygon points. */
+   bool apple9_polygon_points;
 
    /* Vertex buffers */
    struct hk_addr_range vb[AGX_MAX_VBUFS];
@@ -255,6 +394,42 @@ struct hk_graphics_state {
     */
    uint64_t xfb_query[4];
 
+   /* GPU counters of active primitives generated queries, per stream. They
+    * count the primitives of the passthrough or API geometry stage. */
+   uint64_t pg_query[4];
+
+   /* Mesh primitives generated query */
+   uint64_t mesh_pg_query;
+
+   /* Input assembly statistics of direct draws not yet added to the
+    * counters at addr: vertices (IA vertices and VS invocations), primitives
+    * (IA primitives) and clipper primitives (clipping invocations and
+    * primitives, which geometry and tessellation count themselves). See
+    * hk_flush_ia_stats. */
+   struct hk_ia_stats {
+      uint64_t addr[5];
+      uint32_t vertices, prims, clipped;
+   } ia_stats;
+
+   /* Apple9 packed sample positions of the current draw. */
+   uint32_t apple9_sample_positions;
+   /* The runtime sysval block of the last draw and the per-draw inputs it
+    * was built from, see hk_apple9_upload_textures. */
+   uint64_t apple9_sysvals;
+   float apple9_sysvals_blend_constants[4];
+   uint32_t apple9_sysvals_color_write_enables;
+   uint32_t apple9_sysvals_positions;
+   uint32_t apple9_sysvals_depth_never;
+   bool apple9_sysvals_first_fan;
+   uint32_t apple9_sysvals_line_stipple;
+   struct agx_apple9_polygon_point_params apple9_sysvals_polygon_points;
+   float apple9_sysvals_viewports[HK_MAX_VIEWPORTS][4];
+
+   /* Attachment metadata is immutable command-pool data. Keep its compact
+    * input key outside render state so identical later renders can share it. */
+   uint64_t apple9_render_sysvals;
+   uint32_t apple9_render_dimensions[HK_MAX_RTS][5];
+
    struct hk_index_buffer_state index;
    enum agx_primitive topology;
    enum agx_object_type object_type;
@@ -265,12 +440,25 @@ struct hk_graphics_state {
    uint8_t provoking;
 
    struct {
+      /* Mode and hardware index the next draws use. */
       enum agx_visibility_mode mode;
-
-      /* If enabled, index of the current occlusion query in the occlusion heap.
-       * There can only be one active at a time (hardware contraint).
-       */
       uint16_t index;
+
+      /* Several occlusion queries may be active at once (vkd3d-proton's
+       * virtual queries rely on it), but a draw counts into one visibility
+       * slot. Draws therefore count into a per-render segment slot, and each
+       * segment is added into every query active while it counted (see
+       * hk_occlusion_prepare_draw). A new segment starts whenever the active
+       * set changes or a new control stream begins.
+       */
+      bool segment_dirty;
+      bool paused;
+      enum agx_visibility_mode segment_mode;
+      unsigned active_count;
+      struct {
+         uint64_t report;
+         bool precise;
+      } active[HK_MAX_ACTIVE_OCCLUSION_QUERIES];
    } occlusion;
 
    /* Fast linked shader data structures */
@@ -336,14 +524,82 @@ enum hk_cs_type {
    HK_CS_VDM,
 };
 
+/* Why a control stream ended (HK_TIMELINE_FILE per-command records). */
+enum hk_cs_end {
+   HK_CS_END_UNKNOWN = 0,
+   HK_CS_END_CMDBUF = 1,      /* vkEndCommandBuffer */
+   HK_CS_END_RENDER_PASS = 2, /* vkCmdEndRendering */
+   HK_CS_END_BARRIER = 3,     /* pipeline barrier that split the stream */
+   HK_CS_END_EVENT = 4,       /* set/reset/wait event */
+   HK_CS_END_QUERY = 5,       /* timestamp or occlusion segment */
+   HK_CS_END_RENDER_SPLIT = 6,/* scissor/bias/state overflow, render split */
+   HK_CS_END_BEGIN_RENDER = 7,/* compute ended by vkCmdBeginRendering */
+   HK_CS_END_PASS_SPLIT = 8,  /* HK_GPU_PASS_SPLIT */
+};
+
 struct hk_cs {
    struct list_head node;
+
+   /* GPU pass attribution (diagnostic): first shader, its grid, and count. */
+   uint64_t pass_code;
+   uint32_t pass_grid[3];
+   uint32_t pass_count;
+
+   /* Render merging: a draw of this stream writes memory, and an image
+    * barrier was hoisted ahead of this stream (hk_cmd_sync_barrier). */
+   bool merge_writes, merge_hoisted;
+   /* An attachment barrier was moved ahead of this render to keep it open.
+    * Its fragment dependency must also follow the render when it closes.
+    */
+   bool merge_attachment_barrier;
+
+   /* enum hk_pre_raster_reads of the stream's draws: what their
+    * pre-rasterization stages read (hk_queue's tiling-wait elision). */
+   uint8_t pre_raster_reads;
+   /* The stream's render stores a linear colour attachment. */
+   bool linear_store;
+
+   /* The stream leads with a native mesh block. With a qualified
+    * asahi_native_blocks profile, further native and (if mixed) ordinary
+    * blocks may follow it (hk_apple9_native_stream_admits). */
+   bool apple9_native_mesh;
+   /* Native dispatches (blocks) in the stream. */
+   unsigned apple9_native_dispatches;
+   /* Estimated binned primitives of the stream's native render (blocks
+    * and the ordinary draws between them). */
+   uint64_t apple9_native_primitives;
+   /* PPP state of the stream's last native block, for blocks that update
+    * only what changed (on by default; HK_APPLE9_NATIVE_PPP_DELTA=0 turns it off). Any other draw clears it. */
+   bool apple9_ppp_valid;
+   uint16_t apple9_ppp_size;
+   /* Its viewport block's offset and words: records of the same size can
+    * place it differently. */
+   uint16_t apple9_ppp_viewport_offset, apple9_ppp_viewport_words;
+   uint8_t apple9_ppp_last[AGX_APPLE9_PPP_RECORD_MAX];
+
+   /* enum hk_cs_end, and whether an hk meta operation created the stream. */
+   uint8_t end_reason;
+   bool meta;
+   bool feedback_decompression, feedback_color;
 
    /* Parent command buffer. Convenience. */
    struct hk_cmd_buffer *cmd;
 
    /* Data master */
    enum hk_cs_type type;
+
+   uint32_t sync_id;
+   unsigned sync_stages;
+   /* The whole pre-graphics stream is ordered at its render's first event. */
+   bool sync_before_gfx;
+   bool cdm_dirty;
+
+   /* The last dispatch ended with the compute-only barrier: later compute
+    * dispatches are ordered after it, but anything else (indirect grid
+    * fetches, the stream end, non-Apple9 launches) needs a full flush first.
+    * cdm_dirty stays set so those paths flush.
+    */
+   bool cdm_compute_barrier;
 
    /* Address of the root control stream for the job */
    uint64_t addr;
@@ -353,6 +609,14 @@ struct hk_cs {
 
    /* Start pointer of the root control stream */
    void *start;
+
+   /* Size of the root allocation, retained when continuation blocks are added. */
+   size_t root_size;
+
+   /* Occlusion segment slots for this graphics control stream, allocated on
+    * the first counting draw, and the number used so far. */
+   uint64_t occlusion_base;
+   uint32_t occlusion_segments;
 
    /* Current pointer within the control stream */
    void *current;
@@ -398,6 +662,7 @@ struct hk_cs {
    } timestamp;
 
    /* Remaining state is for graphics only, ignored for compute */
+   uint8_t primitive_count; /* Saturated at AGX_PRIMITIVE_COUNT_UNKNOWN. */
    struct agx_tilebuffer_layout tib;
 
    struct util_dynarray scissor, depth_bias;
@@ -414,15 +679,24 @@ struct hk_cs {
 
    struct hk_render_registers cr;
 
-   bool apple9_render;
-   struct drm_asahi_attachment apple9_attachment;
-
    /* Active restart index if one is set. Zero if there is no restart index set
     * yet, since Vulkan does not allow zero restart indices (unlike OpenGL).
     * This is used in place of dirty tracking, because dirty tracking
     * restart indices is complicated and just checking the saved value is cheap.
     */
    uint32_t restart_index;
+
+   /* HK_TIMELINE_FILE (TL_RENDER_INFO): what this render stream targets. */
+   struct {
+      uint64_t color0, depth;          /* image identity */
+      uint32_t area;                   /* width | height << 16 */
+      uint32_t view;                   /* base mip | base layer << 8 | layers << 20 */
+      uint32_t color0_format, depth_format;
+      uint8_t color_count, samples;
+      /* bit 0 colour-0 cleared, 1 depth cleared, 2 colour-0 compressed,
+       * 3 colour-0 storage usage, 4 depth compressed */
+      uint8_t clears;
+   } diag;
 };
 
 /*
@@ -462,10 +736,49 @@ struct hk_uploader {
    /** List of hk_cmd_bo */
    struct list_head bos;
 
-   /* Current addresses */
-   uint8_t *map;
-   uint64_t base;
-   uint32_t offset;
+   struct hk_upload_chunk chunks[HK_UPLOAD_CHUNKS];
+};
+
+#define HK_TESS_BATCH_LANES 5
+
+/* Most batched tessellated draws folded into one flush */
+#define HK_TESS_FOLD_MAX_DRAWS 256
+
+/* A batched tessellated draw whose libagx passes are folded with those of
+ * the other draws in its batch (see tess_batch in struct hk_cmd_buffer).
+ */
+struct hk_tess_fold {
+   uint64_t params;
+   uint32_t nr_patches;
+   enum tess_primitive_mode prim;
+};
+
+enum hk_upload_last {
+   HK_UPLOAD_LAST_DRAW_PARAMS,
+   HK_UPLOAD_LAST_VERTEX_BUFFERS,
+   HK_UPLOAD_LAST_VERTEX_TABLE,
+   HK_UPLOAD_LAST_FRAGMENT_TABLE,
+   HK_UPLOAD_LAST_RENDER_PARAMS,
+   HK_UPLOAD_LAST_COUNT,
+};
+
+/* Identity of a render pass's attachments, for HK_APPLE9_MERGE_RENDERS. */
+struct hk_render_merge_key {
+   const struct vk_image *image[HK_MAX_RTS + 2];
+   uint32_t level[HK_MAX_RTS + 2];
+   uint32_t layer[HK_MAX_RTS + 2];
+   VkFormat format[HK_MAX_RTS + 2];
+   /* Conservatively require identical depth/stencil render areas. */
+   VkRect2D ds_area;
+   uint8_t ds_read_only;
+   uint32_t color_count, layer_count, view_mask;
+};
+
+/* Barriers postponed while an empty render may supply a later load clear. */
+struct hk_empty_barrier {
+   VkPipelineStageFlags2 src, dst;
+   VkAccessFlags2 src_access, dst_access;
+   uint32_t group;
 };
 
 struct hk_cmd_buffer {
@@ -474,18 +787,122 @@ struct hk_cmd_buffer {
    struct {
       struct hk_graphics_state gfx;
       struct hk_compute_state cs;
+
+      /* VK_EXT_conditional_rendering: draws, dispatches and attachment
+       * clears run only when the 32-bit predicate is non-zero (zero if
+       * inverted). Meta operations other than clears are unpredicated.
+       */
+      struct {
+         uint64_t predicate;
+         bool active, inverted, meta;
+      } cond_render;
    } state;
 
-   struct {
-      struct hk_uploader main, usc;
-   } uploader;
+   struct hk_uploader uploader[HK_CMD_POOL_COUNT];
 
-   /* Native Apple9 launch/resource records, owned like the command buffer. */
-   struct agx_pool apple9_compute;
-   struct agx_pool apple9_context;
+   /* Per-draw tables whose contents usually change from one draw to the next
+    * (they carry the root address): the last upload of each kind, reused only
+    * when the next is identical, see hk_pool_upload_last. */
+   struct hk_upload_last_entry {
+      uint64_t gpu;
+      uint32_t size;
+      /* The largest table: vertex buffers or a stage's resource table. */
+      uint8_t data[MAX2(AGX_MAX_VBUFS * 32,
+                        AGX_APPLE9_MAX_GRAPHICS_BUFFERS * sizeof(uint64_t))];
+   } upload_last[HK_UPLOAD_LAST_COUNT];
+
+   /* The current and previous Apple9 draw records, alternating: a draw
+    * compares against the previous draw in the same graphics control stream,
+    * so an unchanged launch, coefficient table or PPP record is reused
+    * without hashing. Records are allocated per control stream (batch). */
+   struct agx_apple9_uniform_draw apple9_draw[2];
+   unsigned apple9_draw_current;
+   /* Estimated binned primitives of the draw being recorded, for the native
+    * render bound (hk_apple9_native_stream_admits); UINT64_MAX: unknown. */
+   uint64_t apple9_draw_primitives;
+   struct hk_cs *apple9_prev_cs;
+
+   /* Prepared ordinary draw state. Dynamic/shader/vertex state dirties this
+    * cache; root descriptor changes only need new resource tables/launches.
+    * The command buffer owns the referenced immutable uploads. */
+   struct {
+      bool valid;
+      uint32_t render_gen;
+      uint32_t first_vertex, base_instance;
+      struct agx_apple9_render_pipeline pipeline;
+      struct hk_shader *fragment;
+   } apple9_draw_state;
+
+   /* The last linked Apple9 (vertex, fragment) pair, by program id: shader
+    * objects pair stages only at draw time, so link once per change. */
+   struct agx_apple9_render_pipeline apple9_linked;
+   /* Stage-derived PPP bytes of apple9_linked (agx_apple9_build_ppp_static). */
+   uint8_t apple9_ppp_static[AGX_APPLE9_PPP_STATIC_SIZE];
+   uint64_t apple9_linked_id[2];
+
+   /* The null fragment stage carrying the vertex stage's varying layout,
+    * for the vertex program apple9_null_fs_vertex_id. */
+   struct agx_apple9_render_stage apple9_null_fs;
+   uint64_t apple9_null_fs_vertex_id;
+   bool apple9_null_fs_trivial;
 
    /* List of all recorded control streams */
    struct list_head control_streams;
+
+   /* Immutable after recording; resolved afresh for every queue submission. */
+   struct util_dynarray sync_events;
+   struct util_dynarray sync_remap;
+   /* First event for each stable stream ID, or HK_SYNC_NONE until work is
+    * recorded. Reordering updates only the affected event range. */
+   struct util_dynarray sync_first_event;
+   uint32_t sync_next_group;
+   unsigned sync_scope;
+   unsigned sync_render_stages;
+   bool sync_render_continuation;
+   bool sync_fallback;
+   bool api_dispatch;
+   bool feedback_decompress;
+   bool rendering;
+   struct util_dynarray feedback_raw;
+   struct hk_feedback_stats feedback_stats;
+
+   /* HK_APPLE9_MERGE_RENDERS: the control stream of a render pass that has
+    * ended but is kept open, so the next render pass on the same attachments
+    * can continue it. Ending graphics, or any command other than a
+    * render-pass-internal barrier, closes it (hk_cmd_render_merge_flush).
+    */
+   struct hk_cs *merge_cs;
+   struct hk_render_merge_key merge_key;
+   /* sync_events index of merge_cs's first event, where barriers recorded
+    * between the merged passes go. */
+   unsigned merge_event;
+   bool merge_first_cs;
+   /* Colour attachments the open render's passes stored: a continuing pass
+    * must store them too, or the merged render would drop those stores. */
+   uint32_t merge_store_mask;
+   uint8_t merge_ds_store_mask;
+   bool merge_feedback;
+   /* The open render is a suspended render pass, which only its resuming
+    * render pass may continue (HK_APPLE9_MERGE_RESUME). */
+   bool merge_suspended;
+   bool merge_chain_load[2];
+   /* Compute or transfer work recorded while a render is kept open, which
+    * nothing makes depend on the render, runs in this stream placed before
+    * it. merge_reach: the stages that may depend on the open render (its
+    * graphics stages and the destinations of barriers from them);
+    * merge_move_stage: the stage of the command being recorded, if it may
+    * move ahead of the render. */
+   struct hk_cs *merge_pre_cs;
+   VkPipelineStageFlags2 merge_reach, merge_move_stage;
+   /* The kept-open render has no draws yet: its render state, which the
+    * empty-render optimization needs if it ends without being continued. */
+   struct hk_rendering_state *merge_empty_render;
+   bool merge_empty;
+   struct util_dynarray empty_barriers;
+   /* The image barrier being recorded by vkCmdPipelineBarrier2, if any, and
+    * whether it transfers queue-family ownership. */
+   struct hk_image *barrier_image;
+   bool barrier_qfot;
 
    /* Current recorded control stream */
    struct {
@@ -506,10 +923,32 @@ struct hk_cmd_buffer {
       struct hk_cs *post_gfx;
    } current_cs;
 
+   /* Pre-rasterization dispatch records of batched tessellated draws, one
+    * lane per stage (VS, TCS, count, prefix sum, emit). The draws are
+    * independent, so each lane's records run without barriers between them
+    * and the lanes are emitted in order into the pre-gfx stream with one
+    * compute barrier after each (hk_tess_batch_flush). capture, if set,
+    * redirects hk_apple9_dispatch into a lane.
+    *
+    * With folding (hk_tess_fold_enabled, the default), batched draws leave the count,
+    * prefix sum and emit lanes empty and append a struct hk_tess_fold to
+    * fold instead; the flush turns them into one dispatch per stage and
+    * primitive.
+    */
+   struct {
+      struct util_dynarray lane[HK_TESS_BATCH_LANES];
+      struct util_dynarray *capture;
+      unsigned draws;
+      struct util_dynarray fold;
+   } tess_batch;
+
    /* Are we currently inside a vk_meta operation? This alters sample location
     * behaviour.
     */
    bool in_meta;
+
+   /* enum hk_cs_end for the next stream end (timeline diagnostics). */
+   uint8_t end_hint;
 
    /* XXX: move me?
     *
@@ -521,9 +960,34 @@ struct hk_cmd_buffer {
 
    /* Does the command buffer use the geometry heap? */
    bool uses_heap;
+   /* Diagnostic count of heap-using renders in this command buffer. */
+   uint32_t heap_renders;
+   /* Geometry heap bytes the recorded work needs backed, see hk_heap. */
+   uint64_t heap_min_B;
+   bool uses_mesh_heap;
+
+   /* Query counter increments and availability writes (struct
+    * libagx_imm_write) that are due once earlier rendering completes. They
+    * are applied together before the queries can next be observed, rather
+    * than splitting rendering with a compute dispatch after every render
+    * pass. See hk_flush_query_writes. */
+   struct util_dynarray query_adds, query_writes;
+
+   /* Occlusion segment accumulations (struct libagx_occlusion_accum), applied
+    * with the query writes. */
+   struct util_dynarray occlusion_accum;
 
    /* Owned large BOs */
    struct util_dynarray large_bos;
+
+   /* Virtio resource ids (uint32_t) of implicit-sync (WSI) memory this
+    * recording accesses; submissions list them as external resources. */
+   struct util_dynarray implicit_sync_res;
+
+   /* Apple9 shader bodies whose arena entries this recording may encode, each
+    * referenced and pinned once until reset, and the last two pinned. */
+   struct set *apple9_pinned;
+   struct agx_shader_body *apple9_last_pin[2];
 };
 
 VK_DEFINE_HANDLE_CASTS(hk_cmd_buffer, vk.base, VkCommandBuffer,
@@ -548,7 +1012,11 @@ hk_bound_hw_vs(struct hk_graphics_state *gfx)
    struct hk_api_shader *tes = gfx->shaders[MESA_SHADER_TESS_EVAL];
    struct hk_api_shader *gs = gfx->shaders[MESA_SHADER_GEOMETRY];
 
-   if (gs)
+   struct hk_api_shader *mesh = gfx->shaders[MESA_SHADER_MESH];
+
+   if (mesh)
+      return &mesh->variants[HK_MESH_VARIANT_RAST];
+   else if (gs)
       return &gs->variants[HK_GS_VARIANT_RAST];
    else if (tes)
       return &tes->variants[HK_VS_VARIANT_HW];
@@ -579,56 +1047,183 @@ hk_bound_sw_vs_before_gs(struct hk_graphics_state *gfx)
 }
 
 struct agx_ptr hk_pool_alloc_internal(struct hk_cmd_buffer *cmd, uint32_t size,
-                                      uint32_t alignment, bool usc);
+                                      uint32_t alignment, enum hk_cmd_pool_kind kind);
 
 uint64_t hk_pool_upload(struct hk_cmd_buffer *cmd, const void *data,
                         uint32_t size, uint32_t alignment);
 
+uint64_t hk_pool_upload_last(struct hk_cmd_buffer *cmd,
+                             enum hk_upload_last slot, const void *data,
+                             uint32_t size, uint32_t alignment);
 static inline struct agx_ptr
 hk_pool_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment)
 {
-   return hk_pool_alloc_internal(cmd, size, alignment, false);
+   return hk_pool_alloc_internal(cmd, size, alignment, HK_CMD_POOL_MAIN);
 }
 
 static inline struct agx_ptr
 hk_pool_usc_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment)
 {
-   return hk_pool_alloc_internal(cmd, size, alignment, true);
+   return hk_pool_alloc_internal(cmd, size, alignment, HK_CMD_POOL_USC);
+}
+
+static inline struct agx_ptr
+hk_pool_context_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment)
+{
+   return hk_pool_alloc_internal(cmd, size, alignment, HK_CMD_POOL_CONTEXT);
+}
+
+static inline struct agx_ptr
+hk_pool_cs_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment,
+                 bool compute)
+{
+   return !compute && agx_is_apple9(&hk_cmd_buffer_device(cmd)->dev)
+             ? hk_pool_context_alloc(cmd, size, alignment)
+             : hk_pool_alloc(cmd, size, alignment);
 }
 
 void hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+void hk_cmd_sync_work(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                      unsigned stages);
+bool hk_cmd_sync_before_gfx(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+void hk_cmd_sync_barrier(struct hk_cmd_buffer *cmd,
+                         VkPipelineStageFlags2 src, VkPipelineStageFlags2 dst,
+                         VkAccessFlags2 src_access, VkAccessFlags2 dst_access);
+void hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs);
+
+static inline void
+hk_cmd_use_implicit_sync(struct hk_cmd_buffer *cmd, uint32_t res)
+{
+   if (!res)
+      return;
+   util_dynarray_foreach(&cmd->implicit_sync_res, uint32_t, r) {
+      if (*r == res)
+         return;
+   }
+   util_dynarray_append(&cmd->implicit_sync_res, res);
+}
+void hk_cdm_compute_barrier(struct hk_device *dev, struct hk_cs *cs);
 uint32_t hk_default_sample_positions(unsigned nr_samples);
+struct vk_sample_locations_state;
+uint32_t hk_pack_ppp_multisamplectrl(const struct vk_sample_locations_state *sl);
+
+/* The pipeline stages a render pass instance runs in. */
+static inline VkPipelineStageFlags2
+hk_merge_graphics_stages(void)
+{
+   return VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
+          VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT |
+          VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT |
+          VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
+          VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT |
+          VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+          VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT |
+          VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT |
+          VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT |
+          VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT |
+          VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT |
+          VK_PIPELINE_STAGE_2_TRANSFORM_FEEDBACK_BIT_EXT |
+          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+          VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+          VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+          VK_PIPELINE_STAGE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR |
+          VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT |
+          VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT;
+}
+
+bool hk_render_merge_key_init(struct hk_render_merge_key *key,
+                              VkRenderingFlags flags, uint32_t layer_count,
+                              uint32_t view_mask, uint32_t color_count,
+                              struct hk_image_view *const *views,
+                              struct hk_image_view *depth,
+                              struct hk_image_view *stencil, uint8_t ds_read_only,
+                              VkRect2D area);
+void hk_cmd_empty_barriers_flush(struct hk_cmd_buffer *cmd, bool merge);
+void hk_cmd_render_merge_flush_why(struct hk_cmd_buffer *cmd, const char *why);
+struct hk_cs *hk_render_merge_pre_cs(struct hk_cmd_buffer *cmd, unsigned stages);
+void hk_render_merge_trace(const char *why, uint64_t a, uint64_t b);
+bool hk_render_merge_move_enabled(void);
+#define hk_cmd_render_merge_flush(cmd) hk_cmd_render_merge_flush_why(cmd, __func__)
+
+/* Do this before an outside-render operation uploads data or changes the meta
+ * state/scope: a pending clear must precede that operation in its original
+ * graphics scope, with the original allocation order on the fallback path. */
+static inline void
+hk_cmd_flush_empty_clears(struct hk_cmd_buffer *cmd)
+{
+   if (cmd->empty_barriers.size)
+      hk_cmd_render_merge_flush(cmd);
+}
+
+
+/* Geometry heap sizes: the fixed VA range, at most, and the backing of
+ * geometry and tessellation, and of the other users, at least. */
+#define HK_HEAP_VA_MAX_B       (1024ull * 1024 * 1024)
+#define HK_HEAP_GEOMETRY_MIN_B (128ull * 1024 * 1024)
+#define HK_HEAP_MIN_B          (8ull * 1024 * 1024)
+/* Period over which a grown geometry heap may shrink back, see hk_heap_decay. */
+#define HK_HEAP_DECAY_NS       (10ull * 1000 * 1000 * 1000)
+
+uint64_t hk_heap(struct hk_cmd_buffer *cmd);
+void hk_heap_prepare_submit(struct hk_device *dev, uint64_t min_B);
+
+size_t hk_apple9_graphics_root_size(const struct hk_device *dev);
 
 static inline struct hk_cs *
 hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
-                             bool compute)
+                             bool compute, unsigned stages)
 {
+   /* Work recorded outside a render pass ends a render kept open for
+    * merging. A merged render pass takes the stream before drawing. */
+   if (unlikely(cmd->merge_cs) && ptr != &cmd->merge_pre_cs) {
+      if (compute && ptr == &cmd->current_cs.cs && cmd->merge_move_stage &&
+          !cmd->merge_suspended && !cmd->empty_barriers.size &&
+          !(cmd->merge_move_stage & cmd->merge_reach) &&
+          hk_render_merge_move_enabled())
+         return hk_render_merge_pre_cs(cmd, stages);
+      hk_cmd_render_merge_flush(cmd);
+   }
+
    if ((*ptr) == NULL) {
-      /* Allocate root control stream */
-      size_t initial_size = 65536;
-      bool native = !compute &&
-         agx_apple9_compute_enabled(&hk_cmd_pool_device(hk_cmd_buffer_pool(cmd))->dev);
-      struct agx_ptr root = native
-         ? agx_pool_alloc_aligned(&cmd->apple9_context, initial_size, 1024)
-         : hk_pool_alloc(cmd, initial_size, 1024);
+      /* Most control streams are short. Reserve only a small root block;
+       * hk_ensure_cs_has_space() chains larger blocks for long streams.
+       */
+      size_t initial_size =
+         compute ? 4096 : hk_apple9_graphics_root_size(hk_cmd_buffer_device(cmd));
+      struct agx_ptr root = hk_pool_cs_alloc(cmd, initial_size, 1024, compute);
       if (!root.cpu)
          return NULL;
 
       /* Allocate hk_cs for the new stream */
       struct hk_cs *cs = malloc(sizeof(*cs));
+      if (!cs) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return NULL;
+      }
       *cs = (struct hk_cs){
          .cmd = cmd,
          .type = compute ? HK_CS_CDM : HK_CS_VDM,
          .addr = root.gpu,
          .start = root.cpu,
+         .root_size = initial_size,
          .chunk = root,
          .current = root.cpu,
          .end = root.cpu + initial_size,
+         .sync_id = util_dynarray_num_elements(&cmd->sync_remap, uint32_t),
+         .meta = cmd->in_meta,
+         .feedback_decompression = cmd->feedback_decompress,
       };
+
+      util_dynarray_append(&cmd->sync_remap, cs->sync_id);
+      util_dynarray_append(&cmd->sync_first_event, (uint32_t)HK_SYNC_NONE);
 
       list_inithead(&cs->node);
 
       bool before_gfx = (ptr == &cmd->current_cs.pre_gfx);
+      /* Post-graphics operations may still have events interleaved with their
+       * render. Keep the fallback until those operations are classified. */
+      cmd->sync_fallback |= ptr == &cmd->current_cs.post_gfx;
 
       /* Insert into the command buffer. We usually append to the end of the
        * command buffer, except for pre-graphics streams which go right before
@@ -636,7 +1231,7 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
        * that's allowed by Vulkan and required for efficient
        * geometry/tessellation shaders.)
        */
-      if (before_gfx && cmd->current_cs.gfx) {
+      if ((before_gfx || ptr == &cmd->merge_pre_cs) && cmd->current_cs.gfx) {
          list_addtail(&cs->node, &cmd->current_cs.gfx->node);
       } else {
          list_addtail(&cs->node, &cmd->control_streams);
@@ -644,11 +1239,28 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
 
       *ptr = cs;
 
-      if (!compute)
+      if (!compute) {
          hk_cs_init_graphics(cmd, cs);
+      } else if (hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17P) {
+         /* Firmware dependencies order the producer, but do not invalidate
+          * the consumer's caches. In particular, compressed image readback
+          * after rendering needs visibility before its first texture fetch.
+          * A flush at the end of the preceding CDM stream happens too early.
+          *
+          * This was only observed on G17P. G16 is not known to need it, and
+          * the full barrier includes the costly drain, so G16 streams start
+          * without one.
+          */
+         hk_cdm_cache_flush(hk_cmd_buffer_device(cmd), cs);
+      }
+
+      if (before_gfx && !hk_cmd_sync_before_gfx(cmd, cs))
+         cmd->sync_fallback = true;
    }
 
    assert(*ptr != NULL);
+   if (!(*ptr)->sync_before_gfx)
+      hk_cmd_sync_work(cmd, *ptr, stages);
    return *ptr;
 }
 
@@ -656,7 +1268,10 @@ static inline struct hk_cs *
 hk_cmd_buffer_get_cs(struct hk_cmd_buffer *cmd, bool compute)
 {
    struct hk_cs **ptr = compute ? &cmd->current_cs.cs : &cmd->current_cs.gfx;
-   return hk_cmd_buffer_get_cs_general(cmd, ptr, compute);
+   unsigned stages = cmd->sync_scope ? cmd->sync_scope :
+      compute ? HK_SYNC_COMPUTE | HK_SYNC_DISPATCH_INDIRECT :
+                HK_SYNC_GRAPHICS | HK_SYNC_DRAW_INDIRECT;
+   return hk_cmd_buffer_get_cs_general(cmd, ptr, compute, stages);
 }
 
 void hk_ensure_cs_has_space(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
@@ -699,6 +1314,16 @@ hk_cs_destroy(struct hk_cs *cs)
 }
 
 void hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+void hk_tess_batch_flush(struct hk_cmd_buffer *cmd);
+bool hk_tess_fold_enabled(void);
+
+/* Record why the next stream end happens, unless a caller already did. */
+static inline void
+hk_cs_end_hint(struct hk_cmd_buffer *cmd, enum hk_cs_end reason)
+{
+   if (!cmd->end_hint)
+      cmd->end_hint = reason;
+}
 
 static void
 hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
@@ -706,6 +1331,8 @@ hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
 {
    if (*ptr) {
       struct hk_cs *cs = *ptr;
+      if (!cs->end_reason)
+         cs->end_reason = cmd->end_hint;
 
       /* This control stream may write immediates as it ends. Queue the writes
        * now that we're done emitting everything else.
@@ -713,6 +1340,13 @@ hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
       if (cs->imm_writes.size) {
          hk_dispatch_imm_writes(cmd, cs);
       }
+
+      /* Availability at the stream boundary, including the last dispatch. A
+       * stream that only carries an end timestamp needs the full flush too:
+       * without the drain at its end, the timestamp never lands.
+       */
+      if (cs->cdm_dirty || cs->timestamp.end.handle)
+         hk_cdm_cache_flush(hk_cmd_buffer_device(cmd), cs);
    }
 
    *ptr = NULL;
@@ -722,17 +1356,48 @@ static void
 hk_cmd_buffer_end_compute(struct hk_cmd_buffer *cmd)
 {
    hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.cs);
+   cmd->end_hint = HK_CS_END_UNKNOWN;
 }
 
 void hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd);
 
+bool hk_cond_render_applies(struct hk_cmd_buffer *cmd);
+uint64_t hk_predicate_indirect(struct hk_cmd_buffer *cmd, uint64_t in,
+                               unsigned words, bool graphics);
+
 static void
 hk_cmd_buffer_end_graphics(struct hk_cmd_buffer *cmd)
 {
+   /* Empty-render conversion emits meta work. Keep its own barriers separate
+    * from the API barriers that must execute after the converted clears. */
+   struct util_dynarray pending = cmd->empty_barriers;
+   cmd->empty_barriers = UTIL_DYNARRAY_INIT;
    struct hk_cs *cs = cmd->current_cs.gfx;
+   /* An empty render kept open for merging ends after its render pass: the
+    * empty-render optimization needs that pass's render state back. */
+   const bool restore = cs && cs == cmd->merge_cs && cmd->merge_empty;
+   const bool attachment_barrier = cs && cs->merge_attachment_barrier;
+   cmd->merge_cs = NULL;
+   cmd->merge_empty = false;
+   cmd->merge_suspended = false;
+   cmd->merge_reach = 0;
+   hk_cmd_buffer_end_compute_internal(cmd, &cmd->merge_pre_cs);
+   if (cs && !cs->end_reason)
+      cs->end_reason = cmd->end_hint;
+   if (cs) {
+      cmd->sync_render_stages = cs->sync_stages;
+      cmd->sync_render_continuation = true;
+   }
 
    if (cs && cs->stats.cmds == 0) {
-      hk_optimize_empty_vdm(cmd);
+      if (restore) {
+         struct hk_rendering_state *render = &cmd->state.gfx.render;
+         memcpy(render, cmd->merge_empty_render, sizeof(*render));
+         hk_optimize_empty_vdm(cmd);
+         memset(render, 0, sizeof(*render));
+      } else {
+         hk_optimize_empty_vdm(cmd);
+      }
    } else if (cs) {
       /* Scissor and depth bias arrays are staged to dynamic arrays on the
        * CPU. When we end the control stream, they're done growing and are
@@ -745,24 +1410,42 @@ hk_cmd_buffer_end_graphics(struct hk_cmd_buffer *cmd)
          hk_pool_upload(cmd, cs->depth_bias.data, cs->depth_bias.size, 64);
 
       /* TODO: maybe free scissor/depth_bias now? */
-      if (cs->apple9_render)
-         cs->current += sizeof(uint32_t); /* Already ends in native STOP. */
-      else
-         cs->current = agx_vdm_terminate(cs->current);
+      cs->current = agx_vdm_terminate(cs->current);
+   }
+
+   /* Within one hardware render, tile order satisfies attachment barriers.
+    * Once it ends, later fragment work still needs those dependencies, even
+    * if a later pass could not merge. The copy ahead of the render only
+    * orders work that preceded it; it cannot order the render's own writes.
+    */
+   if (attachment_barrier) {
+      struct hk_sync_event event = {
+         .stream = HK_SYNC_NONE,
+         .src = hk_sync_stage_mask(VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                   true),
+         .dst = HK_SYNC_FRAGMENT,
+      };
+      util_dynarray_append(&cmd->sync_events, event);
    }
 
    cmd->current_cs.gfx = NULL;
 
+   hk_tess_batch_flush(cmd);
    hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.pre_gfx);
    hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.post_gfx);
 
    assert(cmd->current_cs.pre_gfx == NULL);
    assert(cmd->current_cs.post_gfx == NULL);
+   cmd->end_hint = HK_CS_END_UNKNOWN;
 
-   /* We just flushed out the heap use. If we want to use it again, we'll need
-    * to queue a free for it again.
+   /* The next render must acquire and reset the geometry heap again. Mesh
+    * heap releases remain in the post-graphics stream.
     */
    cmd->uses_heap = false;
+   cmd->uses_mesh_heap = false;
+   assert(!cmd->empty_barriers.size);
+   cmd->empty_barriers = pending;
+   hk_cmd_empty_barriers_flush(cmd, false);
 }
 
 static inline uint64_t
@@ -828,6 +1511,10 @@ hk_get_descriptors_state(struct hk_cmd_buffer *cmd,
    }
 };
 
+void hk_flush_ia_stats(struct hk_cmd_buffer *cmd);
+void hk_flush_query_writes(struct hk_cmd_buffer *cmd);
+struct hk_cs *hk_occlusion_prepare_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+
 void hk_cmd_buffer_flush_push_descriptors(struct hk_cmd_buffer *cmd,
                                           struct hk_descriptor_state *desc);
 
@@ -845,12 +1532,6 @@ uint32_t hk_upload_usc_words(struct hk_cmd_buffer *cmd, struct hk_shader *s,
 
 void hk_usc_upload_spilled_rt_descs(struct agx_usc_builder *b,
                                     struct hk_cmd_buffer *cmd);
-
-void hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs);
-
-bool hk_apple9_dispatch_shader(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
-                               struct hk_shader *s, struct agx_grid grid,
-                               struct agx_workgroup local_size);
 
 void hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
                                  struct agx_cdm_launch_word_0_packed launch,
@@ -871,17 +1552,27 @@ hk_dispatch_with_local_size(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       return;
 
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (s->apple9) {
-      if (!hk_apple9_dispatch_shader(cmd, cs, s, grid, local_size))
-         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_INITIALIZATION_FAILED);
-      return;
-   }
-
    uint32_t usc = hk_upload_usc_words(cmd, s, s->only_linked);
 
    hk_reserve_scratch(cmd, cs, s);
    hk_dispatch_with_usc(dev, cs, &s->b.info, usc, grid, local_size);
 }
+
+/* Buffers bound for software pre-rasterization kernels, which read the
+ * graphics descriptors and the draw's vertex input tables.
+ */
+struct hk_apple9_prerast_bindings {
+   uint64_t draw_params;
+   uint64_t vertex_buffers;
+};
+
+/* Native grid counts are threads; indirect grids point to group counts. */
+void hk_apple9_dispatch(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                       struct agx_shader_body *body,
+                       const struct agx_apple9_compute_profile *profile,
+                       struct agx_grid grid, uint64_t root,
+                       const struct hk_shader *shader,
+                       const struct hk_apple9_prerast_bindings *prerast);
 
 void hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
                          enum agx_barrier barrier, enum libagx_program idx,
@@ -896,3 +1587,79 @@ void agx_fill_velem_keys(const struct vk_vertex_input_state *vi,
                          uint64_t attribs_read, struct agx_velem_key *keys);
 
 struct agx_robustness hk_prolog_robustness(struct hk_device *dev);
+
+void hk_apple9_tile_helpers_finish(struct hk_device *dev);
+struct hk_bg_eot hk_apple9_build_bg_eot(
+   struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
+   bool store, bool partial, bool incomplete);
+
+bool hk_apple9_pin_entry(void *allocator, struct agx_shader_body *body);
+void hk_apple9_unpin_entries(struct hk_cmd_buffer *cmd);
+/* reads_buffers: the draw's tiling reads buffer memory itself (indices or
+ * indirect arguments). */
+struct hk_apple9_native_profile hk_apple9_native_profile(const struct hk_device *dev);
+bool hk_apple9_native_blocks_enabled(const struct hk_device *dev);
+bool hk_apple9_native_lanes(const struct hk_device *dev);
+uint64_t hk_apple9_native_render_primitives(void);
+void hk_apple9_end_native_batch(struct hk_cmd_buffer *cmd);
+bool hk_apple9_prepare_draw(struct hk_cmd_buffer *cmd, bool reads_buffers,
+                             bool native_mesh);
+bool hk_apple9_use_native_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw);
+bool hk_apple9_use_native_tess(struct hk_cmd_buffer *cmd, struct agx_draw draw);
+bool hk_apple9_use_native_mesh(struct hk_cmd_buffer *cmd, const uint32_t *direct,
+                                uint64_t count_addr);
+void hk_apple9_draw_native_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
+                                uint64_t grid);
+/* Software-stage outputs, queries and multiview have additional per-draw
+ * state. Keep their existing preparation path. A null/out-of-range index
+ * binding allocates a fresh zero range, so it must also use that path. */
+static inline bool
+hk_apple9_draw_cache_supported(const struct hk_cmd_buffer *cmd,
+                               struct agx_draw draw, uint64_t native_grid)
+{
+   const struct hk_graphics_state *gfx = &cmd->state.gfx;
+   return !native_grid && !agx_is_indirect(draw.b) && !cmd->in_meta &&
+          !gfx->render.view_mask && !gfx->xfb_enabled &&
+          !gfx->shaders[MESA_SHADER_GEOMETRY] &&
+          !gfx->shaders[MESA_SHADER_TESS_EVAL] &&
+          !gfx->shaders[MESA_SHADER_MESH] &&
+          !gfx->apple9_fan_unrolled && !gfx->occlusion.active_count &&
+          !gfx->occlusion.segment_dirty &&
+          gfx->occlusion.mode == AGX_VISIBILITY_MODE_NONE &&
+          !gfx->descriptors.root.draw.pipeline_stats_flags &&
+          (cmd->vk.dynamic_graphics_state.ia.primitive_topology <=
+              VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) &&
+          (!draw.indexed || (uint64_t)draw.start *
+               agx_index_size_to_B(draw.index_size) < draw.index_buffer_range_B);
+}
+
+static inline bool
+hk_apple9_draw_state_reusable(const struct hk_cmd_buffer *cmd,
+                              struct agx_draw draw, uint64_t native_grid)
+{
+   const struct hk_graphics_state *gfx = &cmd->state.gfx;
+   return cmd->apple9_draw_state.valid &&
+          cmd->current_cs.gfx && cmd->current_cs.gfx == cmd->apple9_prev_cs &&
+          !cmd->merge_cs && cmd->apple9_draw_state.render_gen == gfx->render_gen &&
+          !gfx->dirty && !gfx->shaders_dirty &&
+          !vk_dynamic_graphics_state_any_dirty(&cmd->vk.dynamic_graphics_state) &&
+          hk_apple9_draw_cache_supported(cmd, draw, native_grid) &&
+          /* Prepared bindings read only first vertex/base vertex and base
+           * instance. Counts and index fetch state belong to the VDM draw. */
+          (draw.indexed ? draw.index_bias : draw.start) ==
+             cmd->apple9_draw_state.first_vertex &&
+          draw.start_instance == cmd->apple9_draw_state.base_instance;
+}
+
+bool hk_apple9_reads_draw_id(const struct hk_graphics_state *gfx);
+void hk_apple9_draw(struct hk_cmd_buffer *cmd, uint32_t draw_id,
+                    struct agx_draw draw);
+struct hk_apple9_prerast_bindings
+hk_apple9_draw_bindings(struct hk_cmd_buffer *cmd, struct agx_draw draw);
+void hk_apple9_compute_sysvals(struct hk_device *dev, void *out);
+bool hk_apple9_upload_textures(struct hk_cmd_buffer *cmd,
+   const struct hk_shader *shader, bool graphics, bool first_fan, bool lines,
+   uint64_t *textures, uint64_t *samplers, uint64_t *sysvals);
+
+/* Discard retained CPU storage of an initial command buffer. */
+void hk_trim_cmd_buffer(struct hk_cmd_buffer *cmd);

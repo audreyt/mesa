@@ -28,6 +28,7 @@
 #include "agx_state.h"
 #include "compiler/nir/nir_format_convert.h"
 #include "agx_apple9.h"
+#include "asahi/lib/agx_nir_apple9_tilebuffer.h"
 #include "glsl_types.h"
 #include "nir.h"
 #include "nir_builder_opcodes.h"
@@ -540,16 +541,16 @@ agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
                             info->src.format);
 
    bool apple9 = agx_apple9_direct_render_enabled(agx_device(pipe->screen));
-   if (apple9 && asahi_raw_resolve(pipe, info))
-      return;
-   /* Depth and stencil planes have ordinary tiled storage. Reinterpret
-    * matching single-sample planes as integer colour for nearest blits,
-    * including scaling. This preserves their bits and avoids requiring
-    * fragment shader stencil/depth export for an attachment copy. */
+   /* Copy matching depth/stencil planes through integer colour views. These
+    * views preserve both the pixel bits and the compression channel class.
+    * In particular, compressed MSAA planes cannot use the raw resolve, and
+    * u_blitter cannot export stencil on Apple9. Its integer colour path can
+    * sample compressed planes and resolves by selecting one sample rather
+    * than averaging the reinterpreted depth bits.
+    */
    if (apple9 && util_format_is_depth_or_stencil(info->src.format) &&
        util_format_is_depth_or_stencil(info->dst.format) &&
-       !(info->mask & ~PIPE_MASK_ZS) && info->filter == PIPE_TEX_FILTER_NEAREST &&
-       info->src.resource->nr_samples <= 1 && info->dst.resource->nr_samples <= 1) {
+       !(info->mask & ~PIPE_MASK_ZS) && info->filter == PIPE_TEX_FILTER_NEAREST) {
       struct agx_resource *source = agx_resource(info->src.resource);
       struct agx_resource *target = agx_resource(info->dst.resource);
       bool compatible = true;
@@ -585,7 +586,14 @@ agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
          return;
       }
    }
-   if (apple9 && util_try_blit_via_copy_region(pipe, info, false))
+   if (apple9 && asahi_raw_resolve(pipe, info))
+      return;
+
+   /* Raw copies cannot access lossless-compressed pixels. Keep them on the
+    * texture/PBE path, including staging transfers used for CPU mapping. */
+   if (apple9 && !agx_resource(info->src.resource)->layout.compressed &&
+       !agx_resource(info->dst.resource)->layout.compressed &&
+       util_try_blit_via_copy_region(pipe, info, false))
       return;
 
    if (!apple9 && asahi_compute_blit_supported(info)) {
@@ -619,7 +627,8 @@ try_copy_via_blit(struct pipe_context *pctx, struct pipe_resource *dst,
       return false;
 
    /* TODO: Handle these for rusticl copies */
-   if (dst->target != src->target)
+   if (dst->target != src->target &&
+       !agx_apple9_direct_render_enabled(agx_device(pctx->screen)))
       return false;
 
    struct pipe_blit_info info = {
@@ -696,16 +705,6 @@ asahi_tiled_pixel(nir_builder *b, nir_def *x, nir_def *y,
       nir_ior(b, tail, nir_ior(b, ix, nir_ishl_imm(b, iy, 1))));
 }
 
-/* Background and partial-load shaders fetch the attachment through the
- * texture unit, then pack its tile representation. EOT uses native PBE block
- * stores; both descriptors retain the allocation's full mip tree. */
-struct agx_color_reload_key {
-   enum pipe_format formats[8];
-   unsigned samples, mask, count;
-   bool store, layered;
-   unsigned array_mask;
-};
-
 struct agx_color_reload {
    struct blitter_context *blitter;
    struct hash_table *shaders;
@@ -715,13 +714,13 @@ struct agx_color_reload {
 static uint32_t
 asahi_reload_hash(const void *key)
 {
-   return _mesa_hash_data(key, sizeof(struct agx_color_reload_key));
+   return _mesa_hash_data(key, sizeof(struct agx_apple9_tilebuffer_key));
 }
 
 static bool
 asahi_reload_equal(const void *a, const void *b)
 {
-   return !memcmp(a, b, sizeof(struct agx_color_reload_key));
+   return !memcmp(a, b, sizeof(struct agx_apple9_tilebuffer_key));
 }
 
 static void *
@@ -742,88 +741,10 @@ asahi_reload_vs(struct pipe_context *pctx)
 }
 
 static void *
-asahi_reload_fs(struct pipe_context *pctx, const struct agx_color_reload_key *key)
+asahi_reload_fs(struct pipe_context *pctx, const struct agx_apple9_tilebuffer_key *key)
 {
-   nir_builder b = nir_builder_init_simple_shader(
-      MESA_SHADER_FRAGMENT, pctx->screen->nir_options[MESA_SHADER_FRAGMENT],
-      key->store ? "color store" : "color reload");
-   if (!key->mask) {
-      nir_shader_gather_info(b.shader, b.impl);
-      return pipe_shader_from_nir(pctx, b.shader);
-   }
-   if (key->store) {
-      b.shader->info.num_images = key->count;
-      nir_def *group = nir_load_workgroup_id(&b);
-      nir_def *xy = nir_vec2(
-         &b, nir_imul_imm(&b, nir_channel(&b, group, 0), 32),
-         nir_imul_imm(&b, nir_channel(&b, group, 1), key->samples == 4 ? 16 : 32));
-      unsigned offset = 0;
-      for (unsigned rt = 0; rt < key->count; ++rt) {
-         if (key->mask & BITFIELD_BIT(rt)) {
-            nir_image_store_block_agx(
-               &b, nir_imm_int(&b, rt), nir_imm_int(&b, offset),
-               key->layered
-                  ? nir_vec4(&b, nir_channel(&b, xy, 0), nir_channel(&b, xy, 1),
-                              nir_load_layer_id(&b), nir_imm_int(&b, 0))
-                  : nir_pad_vec4(&b, xy),
-               .image_array = key->layered,
-               .format = agx_apple9_color_tile_format(key->formats[rt]),
-               .image_dim = key->samples > 1 ? GLSL_SAMPLER_DIM_MS : GLSL_SAMPLER_DIM_2D);
-         }
-         offset += 4 * agx_apple9_color_words(key->formats[rt]);
-      }
-   } else {
-      b.shader->info.num_ubos = 1;
-      nir_def *xy = nir_u2u32(&b, nir_load_pixel_coord(&b));
-      unsigned offset = 0;
-      for (unsigned rt = 0; rt < key->count; ++rt) {
-         unsigned words = agx_apple9_color_words(key->formats[rt]);
-         if (key->mask & BITFIELD_BIT(rt)) {
-            bool array = key->array_mask & BITFIELD_BIT(rt);
-            nir_def *params = nir_load_ubo(&b, 2, 32, nir_imm_int(&b, 0),
-               nir_imm_int(&b, rt * 8), .align_mul = 4, .range = 64);
-            nir_def *coords = xy;
-            if (array) {
-               nir_def *layer = nir_channel(&b, params, 1);
-               if (key->layered)
-                  layer = nir_iadd(&b, layer, nir_load_layer_id(&b));
-               coords = nir_vec3(&b, nir_channel(&b, xy, 0),
-                                nir_channel(&b, xy, 1), layer);
-            }
-            enum pipe_format format = key->formats[rt];
-            nir_alu_type type = util_format_is_pure_uint(format) ? nir_type_uint32 :
-                                util_format_is_pure_sint(format) ? nir_type_int32 :
-                                                                  nir_type_float32;
-            enum pipe_format tile_format = util_format_linear(agx_apple9_color_tile_format(format));
-            if (tile_format == PIPE_FORMAT_B8G8R8A8_UNORM ||
-                tile_format == PIPE_FORMAT_B8G8R8X8_UNORM)
-               tile_format = PIPE_FORMAT_R8G8B8A8_UNORM;
-            for (unsigned sample = 0; sample < key->samples; ++sample) {
-               nir_def *color;
-               if (key->samples > 1) {
-                  color = nir_txf_ms(&b, coords, nir_imm_int(&b, sample),
-                     .texture_index = rt, .sampler_index = rt,
-                     .dim = GLSL_SAMPLER_DIM_MS, .is_array = array, .dest_type = type);
-               } else {
-                  color = nir_txf(&b, coords, .lod = nir_channel(&b, params, 0),
-                     .texture_index = rt, .sampler_index = rt,
-                     .dim = GLSL_SAMPLER_DIM_2D, .is_array = array, .dest_type = type);
-               }
-               nir_def *packed = nir_format_pack_rgba(&b, tile_format, color);
-               /* Narrow tile formats occupy a padded 32-bit word. */
-               packed = nir_u2u32(&b, packed);
-               nir_store_local_pixel_agx(
-                  &b, nir_trim_vector(&b, packed, words),
-                  nir_imm_intN_t(&b, 1u << sample, 16), nir_undef(&b, 2, 16),
-                  .base = offset, .format = agx_apple9_color_raw_format(words),
-                  .write_mask = BITFIELD_MASK(words));
-            }
-         }
-         offset += 4 * words;
-      }
-   }
-   nir_shader_gather_info(b.shader, b.impl);
-   return pipe_shader_from_nir(pctx, b.shader);
+   return pipe_shader_from_nir(pctx, agx_nir_apple9_tilebuffer(
+      pctx->screen->nir_options[MESA_SHADER_FRAGMENT], key));
 }
 
 void
@@ -861,7 +782,7 @@ agx_apple9_reload_color(struct agx_batch *batch)
       if (batch->key.cbufs[rt].texture)
          mask |= BITFIELD_BIT(rt);
    }
-   struct agx_color_reload_key key = {
+   struct agx_apple9_tilebuffer_key key = {
       .samples = batch->tilebuffer_layout.nr_samples,
       .mask = mask, .count = batch->key.nr_cbufs,
       .layered = util_framebuffer_get_num_layers(&batch->key) > 1,
@@ -873,9 +794,6 @@ agx_apple9_reload_color(struct agx_batch *batch)
                           ? PIPE_FORMAT_R8G8B8A8_UNORM : surf->format;
       if (!(mask & BITFIELD_BIT(rt)))
          continue;
-      const struct ail_layout *layout = &agx_resource(surf->texture)->layout;
-      if (ail_is_level_logically_compressed(layout, surf->level))
-         return false;
       if (surf->texture->target == PIPE_TEXTURE_1D_ARRAY ||
           surf->texture->target == PIPE_TEXTURE_2D_ARRAY ||
           surf->texture->target == PIPE_TEXTURE_3D ||
@@ -909,7 +827,7 @@ agx_apple9_reload_color(struct agx_batch *batch)
    struct agx_color_reload *r = ctx->color_reload;
    struct hash_entry *entry = _mesa_hash_table_search(r->shaders, &key);
    if (!entry) {
-      struct agx_color_reload_key *saved_key = malloc(sizeof(key));
+      struct agx_apple9_tilebuffer_key *saved_key = malloc(sizeof(key));
       void *fs = asahi_reload_fs(pctx, &key);
       if (!saved_key || !fs) {
          free(saved_key);
@@ -921,11 +839,11 @@ agx_apple9_reload_color(struct agx_batch *batch)
    }
    struct hash_entry *store_entry = NULL;
    {
-      struct agx_color_reload_key store_key = key;
+      struct agx_apple9_tilebuffer_key store_key = key;
       store_key.store = true;
       store_entry = _mesa_hash_table_search(r->shaders, &store_key);
       if (!store_entry) {
-         struct agx_color_reload_key *saved_key = malloc(sizeof(store_key));
+         struct agx_apple9_tilebuffer_key *saved_key = malloc(sizeof(store_key));
          void *fs = asahi_reload_fs(pctx, &store_key);
          if (!saved_key || !fs) {
             free(saved_key);
@@ -1121,40 +1039,6 @@ asahi_raw_resolve(struct pipe_context *pctx, const struct pipe_blit_info *info)
        (src_samples == 1 && dst_samples == 1) ||
        (src_samples > 1 && dst_samples > 1 && src_samples != dst_samples))
       return false;
-   if (util_format_is_depth_or_stencil(info->src.format) &&
-       util_format_is_depth_or_stencil(info->dst.format) &&
-       !(info->mask & ~PIPE_MASK_ZS)) {
-      /* u_transfer_helper stores both Z24 and Z32F API formats as Z32F.
-       * Compare physical planes before rejecting an API format conversion. */
-      for (unsigned plane = 0; plane < 2; ++plane) {
-         if (!(info->mask & (plane ? PIPE_MASK_S : PIPE_MASK_Z)))
-            continue;
-         struct agx_resource *sp = plane && s->separate_stencil ? s->separate_stencil : s;
-         struct agx_resource *dp = plane && d->separate_stencil ? d->separate_stencil : d;
-         if (sp->layout.format != dp->layout.format)
-            return false;
-      }
-      bool ok = true;
-      for (unsigned plane = 0; plane < 2; ++plane) {
-         if (!(info->mask & (plane ? PIPE_MASK_S : PIPE_MASK_Z)))
-            continue;
-         struct agx_resource *sp = plane && s->separate_stencil ? s->separate_stencil : s;
-         struct agx_resource *dp = plane && d->separate_stencil ? d->separate_stencil : d;
-         struct pipe_blit_info raw = *info;
-         raw.src.resource = &sp->base;
-         raw.dst.resource = &dp->base;
-         unsigned bytes = util_format_get_blocksize(sp->layout.format);
-         if (bytes != util_format_get_blocksize(dp->layout.format) ||
-             (bytes != 1 && bytes != 2 && bytes != 4))
-            return false;
-         raw.src.format = raw.dst.format = bytes == 1 ? PIPE_FORMAT_R8_UINT :
-            bytes == 2 ? PIPE_FORMAT_R16_UINT : PIPE_FORMAT_R32_UINT;
-         raw.mask = util_format_get_mask(raw.src.format);
-         raw.sample0_only = false;
-         ok &= asahi_raw_resolve(pctx, &raw);
-      }
-      return ok;
-   }
    if ((info->src.format != info->dst.format && !swap_rb) ||
        (!agx_apple9_color_is_wide(info->src.format) &&
         !agx_apple9_color_is_packed(info->src.format) &&
@@ -1542,6 +1426,11 @@ agx_resource_copy_region(struct pipe_context *pctx, struct pipe_resource *dst,
                                       src_box->width) :
                     asahi_copy_texture(pctx, dst, dst_level, dstx, dsty, dstz,
                                        src, src_level, src_box))
+         return;
+      if ((agx_resource(src)->layout.compressed ||
+           agx_resource(dst)->layout.compressed) &&
+          try_copy_via_blit(pctx, dst, dst_level, dstx, dsty, dstz, src,
+                            src_level, src_box))
          return;
       util_resource_copy_region(pctx, dst, dst_level, dstx, dsty, dstz, src,
                                  src_level, src_box);

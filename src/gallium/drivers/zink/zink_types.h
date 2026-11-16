@@ -37,6 +37,7 @@
 #include "pipe/p_state.h"
 
 #include "pipebuffer/pb_cache.h"
+#include "util/cnd_monotonic.h"
 #include "util/pb_slab.h"
 
 #include "util/blob.h"
@@ -264,6 +265,7 @@ enum zink_debug {
    ZINK_DEBUG_NOGENERAL = (1<<22),
    ZINK_DEBUG_RPSTORES = (1<<23),
    ZINK_DEBUG_PERFINFO = (1<<24),
+   ZINK_DEBUG_NOD24 = (1<<25),
 };
 
 enum zink_pv_emulation_primitive {
@@ -280,7 +282,11 @@ struct tc_unflushed_batch_token;
 /* an async fence created for tc */
 struct zink_tc_fence {
    struct pipe_reference reference;
-   /* enables distinction between tc fence submission and vk queue submission */
+   /* the batch state's usage.submit_count from before the submit of the batch this fence belongs to:
+    * - diff == 0: the batch has not been submitted yet (or the submit failed if fence->submitted)
+    * - diff == 1: the batch has been submitted (or a failed submit was reset if !fence->submitted)
+    * - diff > 1: the batch state has been reset
+    */
    uint32_t submit_count;
    /* when the tc fence is signaled for use */
    struct util_queue_fence ready;
@@ -591,10 +597,13 @@ struct zink_batch_usage {
     /* this is a monotonic int used to disambiguate internal fences from their tc fence references AND
      * to disambiguate zink_bo usage when batches are reused
      *
-     * it increments on batch submit and batch reset, meaning that a diff<=1 means matching usage
+     * it increments once when the batch is successfully submitted and once when a submitted batch state
+     * is reset, meaning that a diff<=1 means matching usage
+     *
+     * it is written under mtx, and the submit increment happens together with setting fence.submitted
      */
    uint32_t submit_count;
-   cnd_t flush;
+   struct u_cnd_monotonic flush;
    mtx_t mtx;
    bool unflushed;
 };
@@ -979,6 +988,10 @@ struct zink_gfx_push_constant {
    uint32_t line_stipple_pattern;
    float viewport_scale[2];
    float line_width;
+   /* only present when maxPushConstantsSize allows it, see
+    * zink_gfx_push_constant_size(); must stay last
+    */
+   uint32_t poly_stipple[32];
 };
 
 /* The order of the enums MUST match the order of the zink_gfx_push_constant
@@ -993,6 +1006,7 @@ enum zink_gfx_push_constant_member {
    ZINK_GFX_PUSHCONST_LINE_STIPPLE_PATTERN,
    ZINK_GFX_PUSHCONST_VIEWPORT_SCALE,
    ZINK_GFX_PUSHCONST_LINE_WIDTH,
+   ZINK_GFX_PUSHCONST_POLY_STIPPLE,
    ZINK_GFX_PUSHCONST_MAX
 };
 
@@ -1231,6 +1245,8 @@ struct zink_resource_object {
    bool transfer_dst;
    bool render_target;
    bool is_buffer;
+   /* the resource was destroyed while batches still referenced this */
+   bool zombie;
    bool exportable;
    bool exportable_dmabuf;
 
@@ -1450,6 +1466,11 @@ struct zink_screen {
 
    uint64_t total_video_mem;
    uint64_t clamp_video_mem;
+   uint64_t zombie_bytes_limit;
+   /* bytes of objects whose resource was destroyed while batches still
+    * referenced them (atomic)
+    */
+   int64_t zombie_bytes;
    uint64_t total_mem;
    uint64_t mapped_vram;
 
@@ -1470,6 +1491,7 @@ struct zink_screen {
 
    bool optimal_keys;
    bool have_full_ds3;
+   bool have_poly_stipple_emulation;
    bool have_X8_D24_UNORM_PACK32;
    bool have_D24_UNORM_S8_UINT;
    bool have_D32_SFLOAT_S8_UINT;
@@ -1756,6 +1778,11 @@ struct zink_context {
    struct zink_batch_state *last_free_batch_state; //for appending
    bool oom_flush;
    bool oom_stall;
+   /* zombie_bytes after the last out-of-memory stall: only growth from here
+    * triggers the next one, so zombies of other contexts can't cause a stall
+    * on every flush
+    */
+   int64_t oom_zombie_floor;
    bool track_renderpasses;
    bool no_reorder;
    struct zink_batch_state *bs;
@@ -1870,6 +1897,7 @@ struct zink_context {
       };
       float tess_levels[6];
    };
+   uint32_t poly_stipple[32];
 
    struct zink_vk_query *curr_xfb_queries[PIPE_MAX_VERTEX_STREAMS];
    struct zink_shader *null_fs;
@@ -1879,6 +1907,13 @@ struct zink_context {
    struct list_head suspended_queries;
    struct list_head primitives_generated_queries;
    struct zink_query *vertices_query;
+   /* Graphics statistics queries share one Vulkan pipeline statistics query,
+    * since only one may be active at a time.
+    */
+   struct list_head stats_queries; /* the queries counting into it */
+   struct zink_vk_query *curr_stats_query;
+   unsigned curr_stats_work_count; /* ctx->work_count when it began */
+   unsigned live_stats[PIPE_STAT_QUERY_COUNT]; /* begun and not ended, per index */
    bool disable_fs;
    bool disable_color_writes;
    bool was_line_loop;

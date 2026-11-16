@@ -340,6 +340,8 @@ static inline struct zink_vs_key_base *
 zink_set_last_vertex_key(struct zink_context *ctx)
 {
    ctx->last_vertex_stage_dirty = true;
+   /* the next draw selects the variant of the last vertex stage again */
+   zink_update_dirty_gfx_stages(ctx, BITFIELD_BIT(ctx->last_vertex_stage ? ctx->last_vertex_stage->info.stage : MESA_SHADER_VERTEX));
    return zink_screen(ctx->base.screen)->optimal_keys ?
           &ctx->gfx_pipeline_state.shader_keys_optimal.key.vs_base :
           &ctx->gfx_pipeline_state.shader_keys.last_vertex.key.vs_base;
@@ -364,6 +366,17 @@ zink_set_fs_point_coord_key(struct zink_context *ctx)
       zink_set_fs_base_key(ctx)->coord_replace_bits = coord_replace_bits;
       zink_set_fs_base_key(ctx)->point_coord_yinvert = point_coord_yinvert;
    }
+}
+
+/* GL polygon stipple only applies to filled polygons */
+static inline void
+zink_set_fs_poly_stipple_key(struct zink_context *ctx)
+{
+   bool poly_stipple = zink_screen(ctx->base.screen)->have_poly_stipple_emulation &&
+                       ctx->rast_state->base.poly_stipple_enable &&
+                       ctx->gfx_pipeline_state.rast_prim == MESA_PRIM_TRIANGLES;
+   if (zink_get_fs_base_key(ctx)->poly_stipple != poly_stipple)
+      zink_set_fs_base_key(ctx)->poly_stipple = poly_stipple;
 }
 
 void

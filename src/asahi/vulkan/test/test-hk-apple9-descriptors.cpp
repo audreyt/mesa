@@ -3,14 +3,16 @@
  * SPDX-License-Identifier: MIT
  */
 #include <gtest/gtest.h>
+#include <array>
 #include <cstdlib>
 #include <set>
 #include <string>
 #include <unordered_set>
 #include <vector>
 
-#include "hk_apple9.h"
-#include "hk_apple9_root.h"
+#include "hk-apple9-test.h"
+#include "asahi/lib/agx_apple9.h"
+#include "asahi/lib/agx_apple9_layout.h"
 #include "asahi/genxml/agx_pack.h"
 #include "hk_descriptor_set_layout.h"
 #include "nir_builder.h"
@@ -36,38 +38,14 @@ TEST(Apple9Descriptors, LinearTextureDepthDoesNotAliasStride)
          cfg.depth = 4;
       }
       AGX_TEXTURE_pack(reinterpret_cast<uint32_t *>(&descriptor), &cfg);
-      struct AGX_TEXTURE decoded;
-      ASSERT_TRUE(hk_apple9_decode_texture(&descriptor, &decoded));
-      EXPECT_EQ(decoded.depth, linear ? 1u : 4u);
-      if (linear) {
-         EXPECT_EQ(decoded.stride, 5744u);
-      }
+      std::array<uint8_t, AGX_APPLE9_TEXTURE_TABLE_STRIDE> translated, direct;
+      ASSERT_TRUE(agx_apple9_translate_texture(translated.data(), &descriptor));
+      ASSERT_TRUE(agx_apple9_pack_texture(direct.data(), &cfg));
+      EXPECT_EQ(translated, direct);
    }
 }
 
-static const char legacy_golden[] = R"(shader: MESA_SHADER_COMPUTE
-name: legacy_descriptor_golden
-internal: true
-workgroup_size: 1, 1, 1
-max_subgroup_size: 128
-min_subgroup_size: 1
-decl_function main () (entrypoint)
-
-impl main {
-    block b0:   // preds:
-    32     %4 = load_const (0x00000000)
-    32    %11 = load_const (0x00000000 = 0.000000)
-    32     %5 = @load_ssbo (%11 (0x0), %4 (0x0)) (access=none, align_mul=4, align_offset=0, offset_shift=0)
-    32     %7 = load_const (0x00000004)
-    32    %12 = load_const (0x00000000 = 0.000000)
-                @store_ssbo (%5, %12 (0x0), %7 (0x4)) (wrmask=x, access=none, align_mul=4, align_offset=0, offset_shift=0)
-                // succs: b1
-    block b1:
-}
-
-)";
-
-TEST(Apple9Descriptors, LegacyConstantSelection)
+TEST(Apple9Descriptors, ConstantSelectionReadsTheLiveDescriptor)
 {
    auto *layout = static_cast<hk_descriptor_set_layout *>(
       calloc(1, sizeof(hk_descriptor_set_layout) +
@@ -78,30 +56,60 @@ TEST(Apple9Descriptors, LegacyConstantSelection)
    layout->binding[0].stride = 16;
    vk_descriptor_set_layout *sets[] = {&layout->vk};
    nir_builder b = nir_builder_init_simple_shader(
-      MESA_SHADER_COMPUTE, &agx_nir_options, "legacy_descriptor_golden");
+      MESA_SHADER_COMPUTE, &agx_nir_options, "constant_descriptor_selection");
    nir_def *idx = nir_vulkan_resource_index(
-      &b, 2, 32, nir_imm_int(&b, 2), .desc_set = 0, .binding = 0,
+      &b, 4, 32, nir_imm_int(&b, 2), .desc_set = 0, .binding = 0,
       .desc_type = nir_descriptor_type_storage_buffer);
    nir_def *desc = nir_load_vulkan_descriptor(
-      &b, 2, 32, idx, .desc_type = nir_descriptor_type_storage_buffer);
-   nir_def *value = nir_load_ssbo(
-      &b, 1, 32, nir_channel(&b, desc, 0), nir_imm_int(&b, 0),
-      .align_mul = 4);
-   nir_store_ssbo(&b, value, nir_channel(&b, desc, 0), nir_imm_int(&b, 4),
-                  .write_mask = 1, .align_mul = 4);
-   hk_apple9_shader_mapping mapping = {};
-   const char *reason = nullptr;
-   ASSERT_TRUE(hk_nir_lower_apple9_descriptors(
-      b.shader, 1, sets, &mapping, &reason)) << (reason ? reason : "");
+      &b, 4, 32, idx, .desc_type = nir_descriptor_type_storage_buffer);
+   auto *ptr = nir_build_deref_cast(&b, desc, nir_var_mem_ssbo,
+                                   glsl_uint_type(), 4);
+   nir_def *value = nir_load_deref(&b, ptr);
+   nir_store_deref(&b, nir_build_deref_ptr_as_array(&b, ptr, nir_imm_int(&b, 1)),
+                   value, 1);
+   hk_apple9_test_lower_descriptors(
+      b.shader, &vk_robustness_disabled, 1, sets);
+   nir_lower_explicit_io(b.shader, nir_var_mem_ssbo,
+                        nir_address_format_64bit_global_32bit_offset);
+   ASSERT_TRUE(hk_apple9_test_prepare_native_nir(b.shader));
+   /* Supply set zero through the actual native root UBO adapter. */
+   nir_foreach_block(block, b.impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         auto *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_load_ubo)
+            continue;
+         ASSERT_EQ(nir_src_as_uint(intr->src[0]), 0u);
+         ASSERT_EQ(nir_src_as_uint(intr->src[1]), 8u);
+         b.cursor = nir_before_instr(instr);
+         nir_def_replace(&intr->def, nir_imm_int64(&b, 0x4000));
+      }
+   }
    nir_opt_constant_folding(b.shader);
    nir_opt_dce(b.shader);
-   EXPECT_EQ(mapping.ssbo_count, 1);
-   EXPECT_EQ(mapping.ssbo[0].element, 2u);
-   char *text = nir_shader_as_str(b.shader, nullptr);
-   EXPECT_STREQ(text, legacy_golden);
-   if (getenv("N4_CAPTURE_LEGACY"))
-      printf("N4_GOLDEN_BEGIN\n%sN4_GOLDEN_END\n", text);
-   ralloc_free(text);
+   unsigned descriptors = 0;
+   nir_foreach_block(block, b.impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         auto *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_load_global_constant &&
+             intr->intrinsic != nir_intrinsic_load_global_constant_offset)
+            continue;
+         ++descriptors;
+         ASSERT_TRUE(nir_src_is_const(intr->src[0]));
+         uint64_t address = nir_src_as_uint(intr->src[0]);
+         if (intr->intrinsic == nir_intrinsic_load_global_constant_offset) {
+            ASSERT_TRUE(nir_src_is_const(intr->src[1]));
+            address += nir_src_as_uint(intr->src[1]);
+         }
+         EXPECT_EQ(address, 0x4020u);
+         EXPECT_EQ(intr->def.bit_size * intr->def.num_components, 128u);
+      }
+   }
+   EXPECT_EQ(descriptors, 1u);
+   nir_validate_shader(b.shader, "live constant descriptor selection");
    ralloc_free(b.shader);
    free(layout);
 }
@@ -172,6 +180,13 @@ protected:
          free(layout);
    }
 
+   void storage_layout(VkDescriptorType type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+   {
+      layouts[0]->binding[0] = {
+         type, 0, 1, 0, hk_apple9_test_get_storage_layout().stride, 0, nullptr};
+      layouts[0]->binding[1].offset = layouts[0]->binding[0].stride;
+   }
+
    nir_deref_instr *buffer(unsigned set, unsigned binding, bool reindex = true)
    {
       bool ssbo = layouts[set]->binding[binding].type ==
@@ -215,24 +230,8 @@ protected:
             VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT;
       }
       nir_validate_shader(b.shader, "before buffer descriptors");
-      hk_nir_lower_buffer_descriptors(b.shader, &rs, 2, sets);
-      hk_apple9_shader_mapping mapping = {};
-      const char *reason = nullptr;
-      ASSERT_TRUE(hk_nir_lower_apple9_textures(
-         b.shader, 2, sets, &mapping, &reason)) << (reason ? reason : "");
-      EXPECT_EQ(mapping.ubo_count, 0);
-      EXPECT_EQ(mapping.ssbo_count, 0);
-      EXPECT_FALSE(mapping.descriptor_snapshot);
-      nir_lower_explicit_io(b.shader, nir_var_mem_global,
-                           nir_address_format_64bit_global);
-      auto format = robust ? nir_address_format_64bit_bounded_global
-                           : nir_address_format_64bit_global_32bit_offset;
-      nir_lower_explicit_io(b.shader, nir_var_mem_ssbo, format);
-      nir_lower_explicit_io(b.shader, nir_var_mem_ubo, format);
-      nir_opt_constant_folding(b.shader);
-      nir_opt_copy_prop(b.shader);
-      hk_nir_lower_global_constant_offsets(b.shader, false);
-      hk_nir_lower_apple9_root(b.shader);
+      hk_apple9_test_lower_nir(b.shader, &rs, 2, sets);
+      ASSERT_TRUE(hk_apple9_test_prepare_native_nir(b.shader));
       nir_opt_constant_folding(b.shader);
       nir_opt_copy_prop(b.shader);
       nir_opt_dce(b.shader);
@@ -266,15 +265,13 @@ protected:
             EXPECT_NE(intr->intrinsic, nir_intrinsic_load_root_agx);
             EXPECT_NE(intr->intrinsic, nir_intrinsic_load_descriptor_set_agx);
             if (intr->intrinsic == nir_intrinsic_load_ubo) {
-               EXPECT_EQ(nir_src_as_uint(intr->src[0]), HK_APPLE9_ROOT_BINDING);
-               EXPECT_EQ(nir_src_as_uint(intr->src[1]), 0u);
-               EXPECT_EQ(intr->def.bit_size, 64);
+               EXPECT_EQ(nir_src_as_uint(intr->src[0]), 0u);
                roots.push_back(&intr->def);
             }
          }
       }
       ASSERT_FALSE(roots.empty());
-      unsigned globals = 0;
+      unsigned stores = 0;
       nir_foreach_block(block, b.impl) {
          nir_foreach_instr(instr, block) {
             if (instr->type != nir_instr_type_intrinsic)
@@ -282,7 +279,9 @@ protected:
             auto *intr = nir_instr_as_intrinsic(instr);
             bool store = intr->intrinsic == nir_intrinsic_store_global;
             if (!store && intr->intrinsic != nir_intrinsic_load_global &&
-                intr->intrinsic != nir_intrinsic_load_global_constant)
+                intr->intrinsic != nir_intrinsic_load_global_constant &&
+                intr->intrinsic != nir_intrinsic_load_global_constant_offset &&
+                intr->intrinsic != nir_intrinsic_load_global_constant_bounded)
                continue;
             nir_def *addr = intr->src[store ? 1 : 0].ssa;
             EXPECT_EQ(addr->bit_size, 64);
@@ -290,10 +289,10 @@ protected:
             for (auto *root : roots)
                rooted |= depends_on(addr, root);
             EXPECT_TRUE(rooted);
-            ++globals;
+            stores += store;
          }
       }
-      EXPECT_GE(globals, 8u);
+      EXPECT_EQ(stores, 1u);
    }
 };
 
@@ -306,14 +305,14 @@ TEST_F(RootDescriptors, TwoSetsUnboundedGlobals)
    EXPECT_EQ(alu_count(nir_op_bcsel), 0u);
 }
 
-TEST_F(RootDescriptors, LegacyRootLoadsKeepRangeAndAlignment)
+TEST_F(RootDescriptors, RootLoadsKeepEffectiveRangeAndAlignment)
 {
    nir_def *resource = nir_vulkan_resource_index(
-      &b, 2, 32, nir_imm_int(&b, 0), .desc_set = 0, .binding = 1,
+      &b, 4, 32, nir_imm_int(&b, 0), .desc_set = 0, .binding = 1,
       .desc_type = nir_descriptor_type_storage_buffer);
    nir_def *descriptor = nir_load_vulkan_descriptor(
-      &b, 2, 32, resource, .desc_type = nir_descriptor_type_storage_buffer);
-   nir_def *binding = nir_channel(&b, descriptor, 0);
+      &b, 4, 32, resource, .desc_type = nir_descriptor_type_storage_buffer);
+   nir_def *binding = descriptor;
    nir_def *push = nir_load_push_constant(
       &b, 1, 32, nir_imm_int(&b, 0), .base = 0, .range = 16,
       .align_mul = 256, .align_offset = 0);
@@ -321,16 +320,11 @@ TEST_F(RootDescriptors, LegacyRootLoadsKeepRangeAndAlignment)
    nir_def *size = nir_get_ssbo_size(&b, 32, binding);
    nir_store_ssbo(&b, nir_iadd(&b, push, nir_iadd(&b, group, size)),
                   binding, nir_imm_int(&b, 0), .write_mask = 1, .align_mul = 4);
-   hk_apple9_shader_mapping mapping = {};
-   const char *reason = nullptr;
-   ASSERT_TRUE(hk_nir_lower_apple9_descriptors(
-      b.shader, 2, sets, &mapping, &reason)) << (reason ? reason : "");
-   nir_opt_constant_folding(b.shader);
-   nir_opt_dce(b.shader);
-   std::set<unsigned> ranges;
-   unsigned loads = 0;
+   ASSERT_NO_FATAL_FAILURE(lower(false));
+   std::set<unsigned> widths;
+   std::set<unsigned> root_offsets;
    nir_foreach_block(block, b.impl) {
-      nir_foreach_instr(instr, block) {
+      nir_foreach_instr_safe(instr, block) {
          if (instr->type != nir_instr_type_intrinsic)
             continue;
          auto *intr = nir_instr_as_intrinsic(instr);
@@ -342,13 +336,32 @@ TEST_F(RootDescriptors, LegacyRootLoadsKeepRangeAndAlignment)
          EXPECT_EQ(nir_intrinsic_range_base(intr), address);
          EXPECT_EQ(nir_intrinsic_align_offset(intr),
                    address & (nir_intrinsic_align_mul(intr) - 1));
-         ranges.insert(nir_intrinsic_range(intr));
-         ++loads;
+         EXPECT_EQ(nir_intrinsic_range(intr), 8u);
+         b.cursor = nir_before_instr(instr);
+         nir_def_replace(&intr->def,
+            nir_imm_int64(&b, address == 0 ? 0x1080 : 0x2000));
+         root_offsets.insert(address);
       }
    }
-   EXPECT_EQ(loads, 3u);
-   EXPECT_EQ(ranges, (std::set<unsigned>{4, 12, 16}));
-   nir_validate_shader(b.shader, "legacy root metadata");
+   EXPECT_EQ(root_offsets, (std::set<unsigned>{0, 8}));
+   nir_opt_constant_folding(b.shader);
+   nir_opt_dce(b.shader);
+   nir_foreach_block(block, b.impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         auto *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_load_global_constant)
+            continue;
+         ASSERT_TRUE(nir_src_is_const(intr->src[0]));
+         unsigned align = nir_intrinsic_align_mul(intr);
+         EXPECT_EQ(nir_src_as_uint(intr->src[0]) & (align - 1),
+                   nir_intrinsic_align_offset(intr));
+         widths.insert(intr->def.num_components * intr->def.bit_size / 8);
+      }
+   }
+   EXPECT_EQ(widths, (std::set<unsigned>{4, 12, 16}));
+   nir_validate_shader(b.shader, "root field metadata");
 }
 
 TEST_F(RootDescriptors, RobustBoundsAndArrayClamps)
@@ -356,9 +369,9 @@ TEST_F(RootDescriptors, RobustBoundsAndArrayClamps)
    shader();
    lower(true);
    check_root();
-   EXPECT_GE(alu_count(nir_op_umin), 4u);
    EXPECT_GE(alu_count(nir_op_bcsel), 4u);
-   unsigned fixed_clamps = 0, runtime_clamps = 0;
+   std::vector<nir_def *> fixed_clamps;
+   unsigned runtime_clamps = 0;
    nir_foreach_block(block, b.impl) {
       nir_foreach_instr(instr, block) {
          if (instr->type != nir_instr_type_alu)
@@ -367,15 +380,33 @@ TEST_F(RootDescriptors, RobustBoundsAndArrayClamps)
          if (alu->op != nir_op_umin || !nir_src_is_const(alu->src[1].src))
             continue;
          unsigned bound = nir_src_as_uint(alu->src[1].src);
-         if (bound == 3)
-            ++fixed_clamps;
+         if (bound == 3) {
+            EXPECT_TRUE(depends_on(alu->src[0].src.ssa, index));
+            fixed_clamps.push_back(&alu->def);
+         }
          if (bound == 299) {
             EXPECT_TRUE(depends_on(alu->src[0].src.ssa, index));
             ++runtime_clamps;
          }
       }
    }
-   EXPECT_EQ(fixed_clamps, 2u); /* UBO[4] and dynamic SSBO[4] */
+   unsigned fixed_descriptors = 0;
+   nir_foreach_block(block, b.impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         auto *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_load_global_constant ||
+             intr->def.bit_size * intr->def.num_components != 128)
+            continue;
+         bool clamped = false;
+         for (auto *clamp : fixed_clamps)
+            clamped |= depends_on(intr->src[0].ssa, clamp);
+         fixed_descriptors += clamped;
+      }
+   }
+   /* CSE may share the clamp, but both descriptor addresses must use it. */
+   EXPECT_EQ(fixed_descriptors, 2u); /* UBO[4] and dynamic SSBO[4] */
    EXPECT_EQ(runtime_clamps, 1u); /* runtime SSBO, not a 64-slot table */
 }
 
@@ -398,7 +429,7 @@ TEST_F(RootDescriptors, RuntimeArray300RemainsDynamic)
    EXPECT_GE(dynamic_addresses, 2u);
 }
 
-TEST_F(RootDescriptors, ActualDriverLoweringCompiles)
+TEST_F(RootDescriptors, NativeCompilerAcceptsLiveRootDescriptorGraph)
 {
    shader();
    lower(true);
@@ -413,15 +444,14 @@ TEST_F(RootDescriptors, ActualDriverLoweringCompiles)
    EXPECT_GT(compiled.info.binary_size, 0u);
    EXPECT_NE(compiled.binary, nullptr);
    ASSERT_EQ(profile.resource_binding_count, 1);
-   EXPECT_EQ(profile.resource_binding[0], HK_APPLE9_ROOT_BINDING);
+   EXPECT_EQ(profile.resource_binding[0], 0u);
    EXPECT_EQ(profile.resource_kind[0], AGX_APPLE9_COMPUTE_RESOURCE_UBO);
    free(compiled.binary);
 }
 
 TEST_F(RootDescriptors, R32ImageStoreCompilesWithoutArtificialBufferOutput)
 {
-   layouts[0]->binding[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-   layouts[0]->binding[0].stride = 48;
+   storage_layout();
    nir_variable *var = nir_variable_create(
       b.shader, nir_var_image,
       glsl_image_type(GLSL_SAMPLER_DIM_2D, false, GLSL_TYPE_UINT),
@@ -451,8 +481,7 @@ TEST_F(RootDescriptors, R32ImageStoreCompilesWithoutArtificialBufferOutput)
 
 TEST_F(RootDescriptors, R32ImageLoadCompilesSuccessfully)
 {
-   layouts[0]->binding[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-   layouts[0]->binding[0].stride = 48;
+   storage_layout();
    nir_variable *var = nir_variable_create(
       b.shader, nir_var_image,
       glsl_image_type(GLSL_SAMPLER_DIM_2D, false, GLSL_TYPE_UINT),
@@ -470,7 +499,6 @@ TEST_F(RootDescriptors, R32ImageLoadCompilesSuccessfully)
       .dest_type = nir_type_uint32);
    /* Use the loaded value in an SSBO store so the compiler doesn't DCE it */
    layouts[0]->binding[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-   layouts[0]->binding[1].offset = 48;
    layouts[0]->binding[1].stride = 16;
    nir_store_ssbo(&b, nir_channel(&b, loaded, 0), nir_imm_int(&b, 1),
                   nir_imm_int(&b, 0), .write_mask = 1, .align_mul = 4);
@@ -486,8 +514,7 @@ TEST_F(RootDescriptors, R32ImageLoadCompilesSuccessfully)
 
 TEST_F(RootDescriptors, Image1DArrayChecksLayerForLoadsAndStores)
 {
-   layouts[0]->binding[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-   layouts[0]->binding[0].stride = 48;
+   storage_layout();
    nir_variable *var = nir_variable_create(
       b.shader, nir_var_image,
       glsl_image_type(GLSL_SAMPLER_DIM_1D, true, GLSL_TYPE_UINT), "array_image");
@@ -507,31 +534,69 @@ TEST_F(RootDescriptors, Image1DArrayChecksLayerForLoadsAndStores)
       .format = PIPE_FORMAT_R32_UINT, .access = ACCESS_NON_WRITEABLE,
       .dest_type = nir_type_uint32);
    layouts[0]->binding[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-   layouts[0]->binding[1].offset = 48;
    layouts[0]->binding[1].stride = 16;
    nir_store_ssbo(&b, nir_channel(&b, loaded, 0), nir_imm_int(&b, 1),
                   nir_imm_int(&b, 0), .write_mask = 1, .align_mul = 4);
    ASSERT_NO_FATAL_FAILURE(lower(false));
-   unsigned layer_guards = 0;
+   std::vector<nir_def *> layer_guards;
    nir_foreach_block(block, b.impl) {
       nir_foreach_instr(instr, block) {
          if (instr->type != nir_instr_type_alu)
             continue;
          auto *alu = nir_instr_as_alu(instr);
-         if (alu->op != nir_op_ult || alu->def.num_components != 2)
+         if (alu->op != nir_op_ult || alu->def.num_components != 1 ||
+             nir_src_is_const(alu->src[1].src))
             continue;
          nir_scalar layer = nir_scalar_resolved(
-            alu->src[0].src.ssa, alu->src[0].swizzle[1]);
-         layer_guards += layer.def == index && layer.comp == 0;
+            alu->src[0].src.ssa, alu->src[0].swizzle[0]);
+         if (layer.def == index && layer.comp == 0)
+            layer_guards.push_back(&alu->def);
       }
    }
-   EXPECT_GE(layer_guards, 2u);
+   unsigned reads = 0, writes = 0;
+   nir_foreach_block(block, b.impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         auto *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_load_global)
+            ++reads;
+         else if (intr->intrinsic == nir_intrinsic_store_global)
+            ++writes;
+         else
+            continue;
+         bool guarded = false;
+         for (auto *node = &block->cf_node; node->parent; node = node->parent) {
+            if (node->parent->type != nir_cf_node_if)
+               continue;
+            auto *nif = nir_cf_node_as_if(node->parent);
+            auto *first = node;
+            while (nir_cf_node_prev(first))
+               first = nir_cf_node_prev(first);
+            if (first != &nir_if_first_then_block(nif)->cf_node)
+               continue;
+            nir_def *condition = nif->condition.ssa;
+            for (auto *guard : layer_guards) {
+               guarded |= condition == guard;
+               auto *condition_instr = nir_def_instr(condition);
+               if (condition_instr->type != nir_instr_type_alu)
+                  continue;
+               auto *alu = nir_instr_as_alu(condition_instr);
+               if (alu->op == nir_op_iand)
+                  guarded |= alu->src[0].src.ssa == guard ||
+                             alu->src[1].src.ssa == guard;
+            }
+         }
+         EXPECT_TRUE(guarded);
+      }
+   }
+   EXPECT_EQ(reads, 1u);
+   EXPECT_EQ(writes, 1u);
 }
 
 TEST_F(RootDescriptors, R32TexelBufferLoadCompiles)
 {
-   layouts[0]->binding[0].type = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
-   layouts[0]->binding[0].stride = 48;
+   storage_layout(VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER);
    nir_variable *var = nir_variable_create(
       b.shader, nir_var_image,
       glsl_image_type(GLSL_SAMPLER_DIM_BUF, false, GLSL_TYPE_UINT), "buffer_image");
@@ -544,7 +609,6 @@ TEST_F(RootDescriptors, R32TexelBufferLoadCompiles)
       .image_dim = GLSL_SAMPLER_DIM_BUF, .format = PIPE_FORMAT_R32_UINT,
       .access = ACCESS_NON_WRITEABLE, .dest_type = nir_type_uint32);
    layouts[0]->binding[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-   layouts[0]->binding[1].offset = 48;
    layouts[0]->binding[1].stride = 16;
    nir_store_ssbo(&b, nir_channel(&b, loaded, 0), nir_imm_int(&b, 1),
                   nir_imm_int(&b, 0), .write_mask = 1, .align_mul = 4);
@@ -559,8 +623,7 @@ TEST_F(RootDescriptors, R32TexelBufferLoadCompiles)
 
 TEST_F(RootDescriptors, FormatlessStoreUsesDescriptorFormatAndTexelStride)
 {
-   layouts[0]->binding[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-   layouts[0]->binding[0].stride = 48;
+   storage_layout();
    nir_variable *var = nir_variable_create(
       b.shader, nir_var_image,
       glsl_image_type(GLSL_SAMPLER_DIM_2D, false, GLSL_TYPE_UINT),
@@ -578,45 +641,68 @@ TEST_F(RootDescriptors, FormatlessStoreUsesDescriptorFormatAndTexelStride)
       .src_type = nir_type_uint32);
 
    ASSERT_NO_FATAL_FAILURE(lower(false));
-   std::vector<nir_def *> descriptor_words;
-   std::vector<nir_def *> addresses;
+   const auto layout = hk_apple9_test_get_storage_layout();
+   const uint64_t set_address = 0x2000;
+   nir_shader *probe = nir_shader_clone(b.shader, b.shader);
+   nir_builder inspect = nir_builder_create(nir_shader_get_entrypoint(probe));
+   nir_foreach_block(block, inspect.impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         auto *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_load_ubo)
+            continue;
+         ASSERT_TRUE(nir_src_is_const(intr->src[0]));
+         ASSERT_TRUE(nir_src_is_const(intr->src[1]));
+         ASSERT_EQ(nir_src_as_uint(intr->src[0]), 0u);
+         ASSERT_EQ(nir_src_as_uint(intr->src[1]), 8u);
+         inspect.cursor = nir_before_instr(instr);
+         nir_def_replace(&intr->def, nir_imm_int64(&inspect, set_address));
+      }
+   }
+   nir_opt_constant_folding(probe);
+   nir_def *texel_size = nullptr, *components = nullptr, *encoding = nullptr;
+   std::vector<nir_intrinsic_instr *> stores;
    bool wide_store = false;
-   nir_foreach_block(block, b.impl) {
+   nir_foreach_block(block, inspect.impl) {
       nir_foreach_instr(instr, block) {
          if (instr->type != nir_instr_type_intrinsic)
             continue;
          auto *intr = nir_instr_as_intrinsic(instr);
          if (intr->intrinsic == nir_intrinsic_load_global_constant &&
-             intr->def.bit_size == 32) {
-            nir_instr *address = nir_def_instr(intr->src[0].ssa);
-            if (address->type == nir_instr_type_intrinsic) {
-               auto *root = nir_instr_as_intrinsic(address);
-               if (root->intrinsic == nir_intrinsic_load_ubo &&
-                   nir_src_is_const(root->src[0]) &&
-                   nir_src_as_uint(root->src[0]) == HK_APPLE9_ROOT_BINDING &&
-                   nir_src_is_const(root->src[1]) &&
-                   /* The root self-pointer precedes the descriptor sets. */
-                   nir_src_as_uint(root->src[1]) == sizeof(uint64_t))
-                  descriptor_words.push_back(&intr->def);
-            }
+             intr->def.bit_size == 32 &&
+             nir_src_is_const(intr->src[0])) {
+            uint64_t offset = nir_src_as_uint(intr->src[0]) - set_address;
+            if (offset == layout.texel_size_offset)
+               texel_size = &intr->def;
+            if (offset == layout.components_offset)
+               components = &intr->def;
+            if (offset == layout.store_encode_offset)
+               encoding = &intr->def;
          }
          /* Exclude assertion/printf stores emitted by the layout helper. */
          if (intr->intrinsic == nir_intrinsic_store_global &&
              (nir_intrinsic_access(intr) & ACCESS_NON_READABLE)) {
-            addresses.push_back(intr->src[1].ssa);
+            stores.push_back(intr);
             wide_store |= intr->src[0].ssa->bit_size == 32;
          }
       }
    }
-   ASSERT_FALSE(descriptor_words.empty());
-   ASSERT_FALSE(addresses.empty());
+   ASSERT_NE(texel_size, nullptr);
+   ASSERT_NE(components, nullptr);
+   ASSERT_NE(encoding, nullptr);
+   ASSERT_FALSE(stores.empty());
    EXPECT_TRUE(wide_store);
-   bool runtime_stride = false;
-   for (auto *address : addresses) {
-      for (auto *word : descriptor_words)
-         runtime_stride |= depends_on(address, word);
+   for (auto *store : stores) {
+      EXPECT_TRUE(depends_on(store->src[1].ssa, texel_size));
+      EXPECT_TRUE(depends_on(store->src[0].ssa, components));
    }
-   EXPECT_TRUE(runtime_stride);
+   bool runtime_encoding = false;
+   nir_foreach_block(block, inspect.impl) {
+      if (auto *nif = nir_block_get_following_if(block))
+         runtime_encoding |= depends_on(nif->condition.ssa, encoding);
+   }
+   EXPECT_TRUE(runtime_encoding);
    agx_shader_part compiled = {};
    agx_apple9_compute_profile profile = {};
    const char *reason = nullptr;
@@ -629,8 +715,7 @@ TEST_F(RootDescriptors, FormatlessStoreUsesDescriptorFormatAndTexelStride)
 
 TEST_F(RootDescriptors, FormatlessTexelBufferStoreCompiles)
 {
-   layouts[0]->binding[0].type = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
-   layouts[0]->binding[0].stride = 48;
+   storage_layout(VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER);
    nir_variable *var = nir_variable_create(
       b.shader, nir_var_image,
       glsl_image_type(GLSL_SAMPLER_DIM_BUF, false, GLSL_TYPE_UINT),
@@ -657,8 +742,7 @@ TEST_F(RootDescriptors, FormatlessTexelBufferStoreCompiles)
 
 TEST_F(RootDescriptors, ImageSizeCompilesSuccessfully)
 {
-   layouts[0]->binding[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-   layouts[0]->binding[0].stride = 48;
+   storage_layout();
    nir_variable *var = nir_variable_create(
       b.shader, nir_var_image,
       glsl_image_type(GLSL_SAMPLER_DIM_2D, false, GLSL_TYPE_UINT),
@@ -673,7 +757,6 @@ TEST_F(RootDescriptors, ImageSizeCompilesSuccessfully)
       .format = PIPE_FORMAT_R32_UINT);
    /* Use the size in an SSBO store */
    layouts[0]->binding[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-   layouts[0]->binding[1].offset = 48;
    layouts[0]->binding[1].stride = 16;
    nir_store_ssbo(&b, nir_channel(&b, size, 0), nir_imm_int(&b, 1),
                   nir_imm_int(&b, 0), .write_mask = 1, .align_mul = 4);
@@ -689,8 +772,7 @@ TEST_F(RootDescriptors, ImageSizeCompilesSuccessfully)
 
 TEST_F(RootDescriptors, RGBA32ImageStoreCompilesSuccessfully)
 {
-   layouts[0]->binding[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-   layouts[0]->binding[0].stride = 48;
+   storage_layout();
    nir_variable *var = nir_variable_create(
       b.shader, nir_var_image,
       glsl_image_type(GLSL_SAMPLER_DIM_2D, false, GLSL_TYPE_UINT),
@@ -721,7 +803,8 @@ TEST_F(RootDescriptors, RGBA32ImageStoreCompilesSuccessfully)
 TEST_F(RootDescriptors, TextureDerefsKeepConstantSelection)
 {
    layouts[0]->binding[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-   layouts[0]->binding[0].stride = 64;
+   /* Native combined records have one 128-byte image and sampler part. */
+   layouts[0]->binding[0].stride = 256;
    nir_variable *var = nir_variable_create(
       b.shader, nir_var_uniform,
       glsl_sampler_type(GLSL_SAMPLER_DIM_2D, false, false, GLSL_TYPE_FLOAT),
@@ -743,27 +826,30 @@ TEST_F(RootDescriptors, TextureDerefsKeepConstantSelection)
    tex->src[2].src = nir_src_for_ssa(deref);
    nir_def_init(&tex->instr, &tex->def, 4, 32);
    nir_builder_instr_insert(&b, &tex->instr);
-   hk_nir_lower_buffer_descriptors(b.shader, &rs, 2, sets);
-   EXPECT_GE(nir_tex_instr_src_index(tex, nir_tex_src_texture_deref), 0);
-   EXPECT_GE(nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref), 0);
-   hk_apple9_shader_mapping mapping = {};
-   const char *reason = nullptr;
-   ASSERT_TRUE(hk_nir_lower_apple9_textures(
-      b.shader, 2, sets, &mapping, &reason)) << (reason ? reason : "");
+   ASSERT_TRUE(hk_apple9_test_lower_descriptors(b.shader, &rs, 2, sets));
+   nir_opt_constant_folding(b.shader);
    EXPECT_EQ(nir_tex_instr_src_index(tex, nir_tex_src_texture_deref), -1);
    EXPECT_EQ(nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref), -1);
    EXPECT_EQ(tex->texture_index, 0u);
    EXPECT_EQ(tex->sampler_index, 0u);
-   EXPECT_EQ(mapping.texture_count, 1);
-   EXPECT_EQ(mapping.sampler_count, 1);
-   EXPECT_EQ(mapping.ubo_count, 0);
-   EXPECT_EQ(mapping.ssbo_count, 0);
+   int texture = nir_tex_instr_src_index(tex, nir_tex_src_texture_handle);
+   int sampler = nir_tex_instr_src_index(tex, nir_tex_src_sampler_handle);
+   ASSERT_GE(texture, 0);
+   ASSERT_GE(sampler, 0);
+   auto *image = nir_src_as_intrinsic(tex->src[texture].src);
+   auto *sample = nir_src_as_intrinsic(tex->src[sampler].src);
+   ASSERT_EQ(image->intrinsic, nir_intrinsic_bindless_image_agx);
+   ASSERT_EQ(sample->intrinsic, nir_intrinsic_bindless_sampler_agx);
+   EXPECT_EQ(nir_intrinsic_desc_set(image), 0u);
+   EXPECT_EQ(nir_intrinsic_desc_set(sample), 0u);
+   EXPECT_EQ(nir_src_as_uint(image->src[0]), 0u);
+   EXPECT_EQ(nir_src_as_uint(sample->src[0]), 128u);
 }
 
 TEST_F(RootDescriptors, UniformTexelBufferUsesNativeTextureTable)
 {
    layouts[0]->binding[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
-   layouts[0]->binding[0].stride = 32;
+   layouts[0]->binding[0].stride = 128;
    nir_variable *var = nir_variable_create(
       b.shader, nir_var_uniform,
       glsl_sampler_type(GLSL_SAMPLER_DIM_BUF, false, false, GLSL_TYPE_FLOAT),
@@ -783,15 +869,15 @@ TEST_F(RootDescriptors, UniformTexelBufferUsesNativeTextureTable)
    nir_def_init(&tex->instr, &tex->def, 4, 32);
    nir_builder_instr_insert(&b, &tex->instr);
 
-   hk_nir_lower_buffer_descriptors(b.shader, &rs, 2, sets);
-   hk_apple9_shader_mapping mapping = {};
-   const char *reason = nullptr;
-   ASSERT_TRUE(hk_nir_lower_apple9_textures(
-      b.shader, 2, sets, &mapping, &reason)) << (reason ? reason : "");
+   ASSERT_TRUE(hk_apple9_test_lower_descriptors(b.shader, &rs, 2, sets));
+   nir_opt_constant_folding(b.shader);
 
    EXPECT_EQ(nir_tex_instr_src_index(tex, nir_tex_src_texture_deref), -1);
-   EXPECT_EQ(mapping.texture_count, 1);
-   EXPECT_EQ(mapping.textures[0].type, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER);
-   EXPECT_EQ(mapping.textures[0].set, 0u);
-   EXPECT_EQ(mapping.sampler_count, 0);
+   int texture = nir_tex_instr_src_index(tex, nir_tex_src_texture_handle);
+   ASSERT_GE(texture, 0);
+   auto *handle = nir_src_as_intrinsic(tex->src[texture].src);
+   EXPECT_EQ(handle->intrinsic, nir_intrinsic_bindless_image_agx);
+   EXPECT_EQ(nir_intrinsic_desc_set(handle), 0u);
+   EXPECT_EQ(nir_src_as_uint(handle->src[0]), 0u);
+   EXPECT_EQ(nir_tex_instr_src_index(tex, nir_tex_src_sampler_handle), -1);
 }

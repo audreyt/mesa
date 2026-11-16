@@ -31,8 +31,8 @@ agx_translate_index_size(uint8_t size_B)
    return __builtin_ctz(size_B);
 }
 
-static inline unsigned
-agx_indices_to_B(unsigned x, enum agx_index_size size)
+static inline uint64_t
+agx_indices_to_B(uint64_t x, enum agx_index_size size)
 {
    return x << size;
 }
@@ -180,11 +180,11 @@ agx_draw_indexed_indirect(uint64_t ptr, uint64_t buf, uint32_t range_B,
 static inline unsigned
 agx_draw_index_range_B(struct agx_draw d)
 {
-   uint range_B = d.index_buffer_range_B;
-   if (!agx_is_indirect(d.b))
-      range_B -= agx_indices_to_B(d.start, d.index_size);
-
-   return range_B;
+   uint64_t offset_B =
+      agx_is_indirect(d.b) ? 0 : agx_indices_to_B(d.start, d.index_size);
+   return offset_B < d.index_buffer_range_B
+             ? d.index_buffer_range_B - offset_B
+             : 0;
 }
 
 static inline unsigned
@@ -209,7 +209,8 @@ agx_draw_index_buffer(struct agx_draw d)
 static bool
 agx_direct_draw_overreads_indices(struct agx_draw d)
 {
-   uint32_t range_B = agx_indices_to_B(d.start + d.b.count[0], d.index_size);
+   uint64_t range_B =
+      agx_indices_to_B((uint64_t)d.start + d.b.count[0], d.index_size);
    return range_B > d.index_buffer_range_B;
 }
 
@@ -220,6 +221,8 @@ enum agx_chip {
    AGX_CHIP_G14X,
    AGX_CHIP_G16G,
    AGX_CHIP_G17P,
+   /* Append to retain existing chip values in precompiled inputs. */
+   AGX_CHIP_G16C,
 };
 
 static inline GLOBAL uint32_t *

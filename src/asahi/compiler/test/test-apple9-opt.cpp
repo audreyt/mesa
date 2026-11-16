@@ -5,6 +5,7 @@
 #include "agx_compile_apple9.h"
 #include "compiler/nir/nir_builder.h"
 #include <gtest/gtest.h>
+#include <vector>
 
 class Apple9Optimization : public ::testing::Test {
 protected:
@@ -81,6 +82,82 @@ TEST(Apple9Compiler, TextureChannelSelectionReachesPackedNativeResults)
    }
 }
 
+/* Source rewrites keep a valid use analysis equal to a rebuild: chains stay
+ * in (position, source) order, including when a use moves between sources of
+ * one instruction. */
+TEST_F(Apple9Optimization, SetSourceMatchesRebuiltUses)
+{
+   auto a = imm(1), b = imm(2), c = imm(3);
+   auto x = add(a, b), y = add(b, a), z = add(a, a);
+   ASSERT_TRUE(agx_apple9_analyze_uses(&p));
+   auto ins = [&](uint32_t v) {
+      return const_cast<agx_apple9_vir_instr *>(agx_apple9_definition(&p, v));
+   };
+   auto X = ins(x), Y = ins(y), Z = ins(z);
+   auto chains = [&]() {
+      std::vector<std::vector<std::pair<const void *, unsigned>>> out;
+      for (uint32_t v = 0; v < p.value_count; ++v) {
+         out.emplace_back();
+         for (auto *u = agx_apple9_uses(&p, v); u; u = u->next)
+            out.back().emplace_back(u->instruction, u->source);
+      }
+      return out;
+   };
+   agx_apple9_vir_set_source(&p, Z, 1, c);
+   agx_apple9_vir_set_source(&p, X, 0, c);
+   /* A commutative swap, as fold_half_sources performs it. */
+   agx_apple9_vir_set_source(&p, Y, 0, Y->src[1]);
+   agx_apple9_vir_set_source(&p, Y, 1, b);
+   agx_apple9_vir_set_source(&p, X, 1, a);
+   auto incremental = chains();
+   agx_apple9_invalidate_uses(&p);
+   ASSERT_TRUE(agx_apple9_analyze_uses(&p));
+   EXPECT_EQ(incremental, chains());
+   EXPECT_EQ(Y->src[0], a);
+   EXPECT_EQ(Y->src[1], b);
+}
+
+/* A clone has the original's key, owns its instructions and blocks, and
+ * redirects internal pointers into itself; a changed field changes the key. */
+TEST_F(Apple9Optimization, CloneKeepsKeyAndOwnsPointers)
+{
+   auto a = imm(1), b = imm(2);
+   auto x = add(a, b);
+   auto *second = agx_apple9_block_create(&p);
+   agx_apple9_block_begin(&p, second);
+   auto y = add(x, a);
+   p.output = y;
+   agx_apple9_vir_reindex(&p);
+   p.instructions[2]->completion_consumer = p.instructions[3];
+
+   agx_apple9_vir_program c;
+   ASSERT_TRUE(agx_apple9_vir_clone(&c, &p));
+   struct util_dynarray kp, kc;
+   util_dynarray_init(&kp, NULL);
+   util_dynarray_init(&kc, NULL);
+   ASSERT_TRUE(agx_apple9_vir_key(&p, &kp));
+   ASSERT_TRUE(agx_apple9_vir_key(&c, &kc));
+   EXPECT_EQ(kp.size, kc.size);
+   EXPECT_EQ(memcmp(kp.data, kc.data, kp.size), 0);
+
+   ASSERT_EQ(c.instruction_count, p.instruction_count);
+   for (unsigned i = 0; i < p.instruction_count; ++i) {
+      EXPECT_NE(c.instructions[i], p.instructions[i]);
+      EXPECT_EQ(agx_apple9_instr_block(c.instructions[i])->program, &c);
+   }
+   EXPECT_EQ(c.instructions[2]->completion_consumer, c.instructions[3]);
+   EXPECT_EQ(c.blocks->next, c.last_block);
+   EXPECT_EQ(agx_apple9_instr_block(c.instructions[3]), c.last_block);
+
+   c.instructions[3]->immediate ^= 1;
+   util_dynarray_clear(&kc);
+   ASSERT_TRUE(agx_apple9_vir_key(&c, &kc));
+   EXPECT_TRUE(kp.size != kc.size || memcmp(kp.data, kc.data, kp.size));
+   util_dynarray_fini(&kp);
+   util_dynarray_fini(&kc);
+   agx_apple9_vir_finish(&c);
+}
+
 TEST_F(Apple9Optimization, FoldsWrappingArithmeticAndArithmeticRightShift)
 {
    auto sum = add(imm(0xffffffff), imm(2));
@@ -94,6 +171,31 @@ TEST_F(Apple9Optimization, FoldsWrappingArithmeticAndArithmeticRightShift)
    EXPECT_EQ(agx_apple9_definition(&p, shift)->immediate, 0xffffffffu);
    EXPECT_EQ(agx_apple9_definition(&p, result)->op, AGX_APPLE9_VIR_IMM);
    EXPECT_EQ(agx_apple9_definition(&p, result)->immediate, 0u);
+}
+
+TEST_F(Apple9Optimization, RepeatedOperandSelectionKeepsUniformAddends)
+{
+   /* dEQP-VK.glsl.switch.switch_in_switch_uniform_*: the second operand
+    * selection pass saw iadd(uniform, -1) with a single constant register
+    * source and folded it to -1, dropping the uniform addend. */
+   auto zero = imm(0);
+   auto uniform = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR_UNIFORM,
+      AGX_APPLE9_ENC_LOGIC_UNIFORM, &zero, 1, 4);
+   p.output = add(uniform, imm(0xffffffff));
+   struct agx_apple9_uniform_constants constants = {};
+   constants.base = 10;
+   constants.count = 1;
+   constants.values[0] = 2;
+   ASSERT_TRUE(agx_apple9_optimize_vir_with_constants(&p, &constants));
+   ASSERT_TRUE(agx_apple9_analyze_uses(&p));
+   /* The -1 addend is subtracted as a literal. */
+   const auto *A = agx_apple9_definition(&p, p.output);
+   EXPECT_EQ(A->op, AGX_APPLE9_VIR_ISUB);
+   EXPECT_EQ(A->alu_src_uniform_mask, 1);
+   EXPECT_EQ(A->alu_src_value[0], 4u);
+   EXPECT_EQ(A->alu_src_immediate_mask, 2);
+   EXPECT_EQ(A->alu_src_value[1], 1u);
+   EXPECT_EQ(A->nr_srcs, 0);
 }
 
 TEST_F(Apple9Optimization, UniformAndImmediateOperandsLeaveOnlyGprUses)
@@ -128,6 +230,64 @@ TEST_F(Apple9Optimization, UniformAndImmediateOperandsLeaveOnlyGprUses)
    nir_builder nir = nir_builder_init_simple_shader(
       MESA_SHADER_COMPUTE, &agx_nir_options, "inline_sources");
    ASSERT_TRUE(agx_apple9_allocate_publications(&p, &reason)) << reason;
+   ASSERT_TRUE(agx_apple9_allocate_shared(&p, nir.shader, &reason)) << reason;
+   ASSERT_TRUE(agx_apple9_validate_vir_allocation(&p, &reason)) << reason;
+   ralloc_free(nir.shader);
+}
+
+TEST(Apple9Packer, SelectFourUniformOperandsMatchT8132Probe)
+{
+   agx_apple9_vir_instr I = {};
+   I.op = AGX_APPLE9_VIR_SELECT;
+   I.encoding = AGX_APPLE9_ENC_SELECT_GPR_WIDE;
+   I.dest = 0;
+   I.dest_components = 1;
+   I.immediate = AGX_APPLE9_SELECT_ULT;
+   I.alu_src_uniform_mask = 15;
+   for (unsigned s = 0; s < 4; ++s)
+      I.alu_src_value[s] = 240 + s;
+   const uint8_t phys[] = {40};
+   const uint8_t expected[] = {0x82,0x61,0x9f,0x63,0xe2,0x64,0x85,0x07,0xe0,0x66};
+   agx_apple9_packed_instruction packed;
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_apple9_pack_vir_instruction(&I, phys, &packed, &reason)) << reason;
+   ASSERT_EQ(packed.length, sizeof(expected));
+   EXPECT_EQ(memcmp(packed.bytes, expected, sizeof(expected)), 0);
+   I.alu_src_value[3] = 256;
+   EXPECT_FALSE(agx_apple9_pack_vir_instruction(&I, phys, &packed, &reason));
+}
+
+TEST_F(Apple9Optimization, SelectUniformOperandsDoNotOccupyGprs)
+{
+   auto zero = imm(0);
+   uint32_t src[4];
+   for (unsigned s = 0; s < 4; ++s)
+      src[s] = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR_UNIFORM,
+         AGX_APPLE9_ENC_LOGIC_UNIFORM, &zero, 1, 240 + s);
+   auto first = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_SELECT,
+      AGX_APPLE9_ENC_SELECT_GPR_WIDE, src, 4, AGX_APPLE9_SELECT_ULT);
+   src[3] = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR_UNIFORM,
+      AGX_APPLE9_ENC_LOGIC_UNIFORM, &zero, 1, 255);
+   auto second = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_SELECT,
+      AGX_APPLE9_ENC_SELECT_GPR_WIDE, src, 4, AGX_APPLE9_SELECT_ULT);
+   p.output = add(first, second);
+   ASSERT_TRUE(agx_apple9_optimize_vir(&p));
+   const auto *A = agx_apple9_definition(&p, first);
+   const auto *B = agx_apple9_definition(&p, second);
+   ASSERT_NE(A, nullptr);
+   ASSERT_NE(B, nullptr);
+   EXPECT_EQ(A->nr_srcs, 0u);
+   EXPECT_EQ(B->nr_srcs, 0u);
+   EXPECT_EQ(A->alu_src_uniform_mask, 15u);
+   EXPECT_EQ(B->alu_src_uniform_mask, 15u);
+   EXPECT_EQ(A->alu_src_value[3], 243u);
+   EXPECT_EQ(B->alu_src_value[3], 255u);
+   /* Source 3 participates in expression identity as well as packing. */
+   EXPECT_NE(agx_apple9_definition(&p, p.output)->src[0],
+             agx_apple9_definition(&p, p.output)->src[1]);
+   const char *reason = nullptr;
+   nir_builder nir = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "select_uniform_sources");
    ASSERT_TRUE(agx_apple9_allocate_shared(&p, nir.shader, &reason)) << reason;
    ASSERT_TRUE(agx_apple9_validate_vir_allocation(&p, &reason)) << reason;
    ralloc_free(nir.shader);
@@ -734,7 +894,7 @@ TEST(Apple9Compiler, OversizePreambleFallsBackToOrdinaryMain)
    auto u = nir_load_ubo(&b, 3, 32, nir_imm_int(&b, 7), nir_imm_int(&b, 0),
       .align_mul = 16, .range = 16);
    auto x = nir_channel(&b, u, 0), y = nir_channel(&b, u, 1), z = nir_channel(&b, u, 2);
-   for (unsigned i = 0; i < AGX_APPLE9_MAX_PREAMBLE_BYTES / 4 + 1; ++i)
+   for (unsigned i = 0; i < AGX_APPLE9_MAX_COMPUTE_PREAMBLE_BYTES / 4 + 1; ++i)
       x = nir_ffma(&b, x, y, z);
    auto gid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
    nir_store_ssbo(&b, nir_ixor(&b, x, gid), nir_imm_int(&b, 0),
@@ -745,7 +905,7 @@ TEST(Apple9Compiler, OversizePreambleFallsBackToOrdinaryMain)
    ASSERT_TRUE(agx_compile_apple9_tiny(b.shader, &compiled, &profile, &reason)) << reason;
    EXPECT_EQ(compiled.info.apple9_preamble_size, 0u);
    EXPECT_EQ(profile.preamble_size, 0u);
-   EXPECT_GT(compiled.info.main_size, AGX_APPLE9_MAX_PREAMBLE_BYTES);
+   EXPECT_GT(compiled.info.main_size, AGX_APPLE9_MAX_COMPUTE_PREAMBLE_BYTES);
    free(compiled.binary);
    ralloc_free(b.shader);
 }
@@ -819,4 +979,423 @@ TEST(Apple9Compiler, IntegerPreambleStoresFuseWithoutAllocatingUniformGprs)
       ralloc_free(b.shader);
       agx_apple9_vir_finish(&p);
    }
+}
+
+TEST(Apple9Packer, UniformPredicateSourcesMatchT8132Probes)
+{
+   const uint8_t phys[] = {45};
+   for (bool extended : {false, true}) {
+      agx_apple9_vir_instr I = {};
+      I.op = AGX_APPLE9_VIR_PREDICATE_COMPARE;
+      I.encoding = extended ? AGX_APPLE9_ENC_PREDICATE_COMPARE_EXTENDED
+                            : AGX_APPLE9_ENC_PREDICATE_COMPARE_SHORT;
+      I.dest = AGX_APPLE9_VREG_INVALID;
+      I.nr_srcs = 1;
+      I.src[0] = 0;
+      I.immediate = extended ? unsigned(AGX_APPLE9_PREDICATE_EXT_FEQ)
+                             : unsigned(AGX_APPLE9_PREDICATE_ULT);
+      I.alu_src_uniform_mask = 2;
+      I.alu_src_value[1] = 240;
+      const uint8_t short_bytes[] = {0x0a,0x5b,0x3a,0x61,0x05,0x06};
+      const uint8_t long_bytes[] = {0x0a,0x5b,0x3b,0x61,0x06,0,0,0x06,0,0};
+      agx_apple9_packed_instruction packed;
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&I, phys, &packed, &reason)) << reason;
+      EXPECT_EQ(packed.length, extended ? 10u : 6u);
+      EXPECT_EQ(memcmp(packed.bytes, extended ? long_bytes : short_bytes, packed.length), 0);
+   }
+}
+
+TEST_F(Apple9Optimization, PredicateUniformSourcesFoldWithoutAResult)
+{
+   auto zero = imm(0);
+   auto u = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR_UNIFORM,
+      AGX_APPLE9_ENC_LOGIC_UNIFORM, &zero, 1, 240);
+   auto input = agx_apple9_vir_input(&p, 45);
+   uint32_t src[] = {input, u};
+   ASSERT_TRUE(agx_apple9_vir_emit_side_effect(&p, AGX_APPLE9_VIR_PREDICATE_COMPARE,
+      AGX_APPLE9_ENC_PREDICATE_COMPARE_SHORT, src, 2, AGX_APPLE9_PREDICATE_ULT));
+   auto *predicate = p.instructions[p.instruction_count - 1];
+   p.output = zero;
+   ASSERT_TRUE(agx_apple9_optimize_vir(&p));
+   EXPECT_EQ(predicate->nr_srcs, 1u);
+   EXPECT_EQ(predicate->src[0], input);
+   EXPECT_EQ(predicate->alu_src_uniform_mask, 2u);
+   EXPECT_EQ(predicate->alu_src_value[1], 240u);
+}
+
+TEST(Apple9Packer, UniformShiftsMatchT8132Probes)
+{
+   const struct {
+      agx_apple9_vir_opcode op;
+      agx_apple9_encoding encoding;
+      unsigned slot, variable, gpr;
+      uint8_t bytes[12];
+      unsigned size;
+   } cases[] = {
+      {AGX_APPLE9_VIR_ISHR, AGX_APPLE9_ENC_SHIFT_EXTENDED, 0, 0, 42, {0xa7,0x01,0x54,0x50,0x02,0xc0,0x17,0x78,0x42,0x00}, 10},
+      {AGX_APPLE9_VIR_ISHR, AGX_APPLE9_ENC_SHIFT_ARITH_REGISTER, 0, 1, 42, {0xa7,0x01,0x54,0x50,0x02,0xc0,0x53,0xd9,0xc2,0x00}, 10},
+      {AGX_APPLE9_VIR_ISHR, AGX_APPLE9_ENC_SHIFT_ARITH_REGISTER, 1, 1, 45, {0xa7,0x01,0x54,0x50,0x02,0xb4,0x80,0xdf,0x62,0x00}, 10},
+      {AGX_APPLE9_VIR_USHR, AGX_APPLE9_ENC_SHIFT_LOGICAL_IMMEDIATE, 0, 0, 42, {0xa7,0x00,0x54,0x50,0x02,0xc0,0x17,0x00,0xf0,0x11,0x00,0x00}, 12},
+      {AGX_APPLE9_VIR_USHR, AGX_APPLE9_ENC_SHIFT_LOGICAL_REGISTER, 0, 1, 42, {0xa7,0x00,0x54,0x50,0x02,0xc0,0x53,0x01,0xf0,0x13,0x04,0x00}, 12},
+      {AGX_APPLE9_VIR_USHR, AGX_APPLE9_ENC_SHIFT_LOGICAL_REGISTER, 1, 1, 45, {0xa7,0x00,0x54,0x50,0x02,0xb4,0x80,0x07,0xf0,0x13,0x01,0x00}, 12},
+      {AGX_APPLE9_VIR_ISHL, AGX_APPLE9_ENC_SHIFT_LOGICAL_IMMEDIATE, 0, 0, 42, {0x27,0x00,0x54,0x50,0x02,0xc0,0x17,0x00,0xf0,0x11,0x00,0x00}, 12},
+      {AGX_APPLE9_VIR_ISHL, AGX_APPLE9_ENC_SHIFT_LOGICAL_REGISTER, 0, 1, 42, {0x27,0x00,0x54,0x50,0x02,0xc0,0x53,0x01,0xf0,0x13,0x04,0x00}, 12},
+      {AGX_APPLE9_VIR_ISHL, AGX_APPLE9_ENC_SHIFT_LOGICAL_REGISTER, 1, 1, 45, {0x27,0x00,0x54,0x50,0x02,0xb4,0x80,0x07,0xf0,0x13,0x01,0x00}, 12},
+   };
+   for (const auto &c : cases) {
+      agx_apple9_vir_instr I = {};
+      I.op = c.op; I.encoding = c.encoding; I.dest = 0; I.dest_components = 1;
+      I.nr_srcs = c.variable; I.src[0] = 1;
+      I.immediate = c.variable ? 0 : 5;
+      I.alu_src_uniform_mask = 1u << c.slot;
+      I.alu_src_value[c.slot] = 240;
+      const uint8_t phys[] = {40, (uint8_t)c.gpr};
+      agx_apple9_packed_instruction packed;
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&I, phys, &packed, &reason)) << reason;
+      EXPECT_EQ(packed.length, c.size);
+      EXPECT_EQ(memcmp(packed.bytes, c.bytes, c.size), 0);
+   }
+}
+
+TEST_F(Apple9Optimization, UniformShiftAmountPreservesRegisterForm)
+{
+   auto zero = imm(0);
+   auto amount = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR_UNIFORM,
+      AGX_APPLE9_ENC_LOGIC_UNIFORM, &zero, 1, 240);
+   auto input = agx_apple9_vir_input(&p, 45);
+   uint32_t src[] = {input, amount};
+   p.output = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_USHR,
+      AGX_APPLE9_ENC_SHIFT_LOGICAL_REGISTER, src, 2, 0);
+   ASSERT_TRUE(agx_apple9_optimize_vir(&p));
+   const auto *I = agx_apple9_definition(&p, p.output);
+   ASSERT_NE(I, nullptr);
+   EXPECT_EQ(I->nr_srcs, 1u);
+   EXPECT_EQ(I->alu_src_uniform_mask, 2u);
+   EXPECT_EQ(I->encoding, AGX_APPLE9_ENC_SHIFT_LOGICAL_REGISTER);
+}
+
+TEST(Apple9Packer, UniformConversionsMatchT8132Probes)
+{
+   const struct {
+      agx_apple9_vir_opcode op;
+      agx_apple9_encoding encoding;
+      uint8_t bytes[10];
+      unsigned size;
+   } cases[] = {
+      {AGX_APPLE9_VIR_I2F32, AGX_APPLE9_ENC_SINT_TO_FLOAT, {0xa7,0x07,0x54,0x50,0x03,0xc0,0xaf,0x40}, 8},
+      {AGX_APPLE9_VIR_U2F32, AGX_APPLE9_ENC_UINT_TO_FLOAT, {0xa7,0x07,0x54,0x50,0x03,0xc0,0xaf,0x00}, 8},
+      {AGX_APPLE9_VIR_F2I32, AGX_APPLE9_ENC_FLOAT_TO_SINT, {0x27,0x07,0x54,0x50,0x03,0xc0,0xb7,0x40,0x03,0x00}, 10},
+      {AGX_APPLE9_VIR_F2U32, AGX_APPLE9_ENC_FLOAT_TO_UINT, {0x27,0x07,0x54,0x50,0x03,0xc0,0xb7,0x00,0x02,0x00}, 10},
+   };
+   for (const auto &c : cases) {
+      agx_apple9_vir_instr I = {};
+      I.op = c.op; I.encoding = c.encoding; I.dest = 0; I.dest_components = 1;
+      I.alu_src_uniform_mask = 1; I.alu_src_value[0] = 240;
+      const uint8_t phys[] = {40};
+      agx_apple9_packed_instruction packed;
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&I, phys, &packed, &reason)) << reason;
+      EXPECT_EQ(packed.length, c.size);
+      EXPECT_EQ(memcmp(packed.bytes, c.bytes, c.size), 0);
+      I.alu_src_value[0] = 256;
+      EXPECT_FALSE(agx_apple9_pack_vir_instruction(&I, phys, &packed, &reason));
+   }
+}
+
+TEST_F(Apple9Optimization, UniformConversionRemovesGprImport)
+{
+   auto zero = imm(0);
+   auto input = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR_UNIFORM,
+      AGX_APPLE9_ENC_LOGIC_UNIFORM, &zero, 1, 240);
+   p.output = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_U2F32,
+      AGX_APPLE9_ENC_UINT_TO_FLOAT, &input, 1, 0);
+   ASSERT_TRUE(agx_apple9_optimize_vir(&p));
+   const auto *I = agx_apple9_definition(&p, p.output);
+   ASSERT_NE(I, nullptr);
+   EXPECT_EQ(I->nr_srcs, 0u);
+   EXPECT_EQ(I->alu_src_uniform_mask, 1u);
+   EXPECT_EQ(I->alu_src_value[0], 240u);
+}
+TEST(Apple9Packer, UniformBitUnaryMatchT8132Probes)
+{
+   const struct {
+      agx_apple9_vir_opcode op;
+      agx_apple9_encoding encoding;
+      uint8_t bytes[10];
+      unsigned size;
+   } cases[] = {
+      {AGX_APPLE9_VIR_BIT_COUNT, AGX_APPLE9_ENC_BIT_UNARY, {0x27,0x05,0x54,0x50,0x03,0xc0,0xdf,0x00}, 8},
+      {AGX_APPLE9_VIR_BIT_REVERSE, AGX_APPLE9_ENC_BIT_UNARY, {0xa7,0x04,0x54,0x50,0x02,0xc0,0x5f,0x00}, 8},
+      {AGX_APPLE9_VIR_UFIND_MSB, AGX_APPLE9_ENC_BIT_UNARY, {0xa7,0x05,0x54,0x50,0x02,0xc0,0x5f,0x00}, 8},
+   };
+   for (const auto &c : cases) {
+      agx_apple9_vir_instr I = {};
+      I.op = c.op; I.encoding = c.encoding; I.dest = 0; I.dest_components = 1;
+      I.alu_src_uniform_mask = 1; I.alu_src_value[0] = 240;
+      const uint8_t phys[] = {40};
+      agx_apple9_packed_instruction packed;
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&I, phys, &packed, &reason)) << reason;
+      EXPECT_EQ(packed.length, c.size);
+      EXPECT_EQ(memcmp(packed.bytes, c.bytes, c.size), 0);
+      I.alu_src_value[0] = 256;
+      EXPECT_FALSE(agx_apple9_pack_vir_instruction(&I, phys, &packed, &reason));
+   }
+}
+
+TEST_F(Apple9Optimization, UniformBitUnaryRemovesGprImport)
+{
+   auto zero = imm(0);
+   auto input = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR_UNIFORM,
+      AGX_APPLE9_ENC_LOGIC_UNIFORM, &zero, 1, 240);
+   p.output = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_BIT_REVERSE,
+      AGX_APPLE9_ENC_BIT_UNARY, &input, 1, 0);
+   ASSERT_TRUE(agx_apple9_optimize_vir(&p));
+   const auto *I = agx_apple9_definition(&p, p.output);
+   ASSERT_NE(I, nullptr);
+   EXPECT_EQ(I->nr_srcs, 0u);
+   EXPECT_EQ(I->alu_src_uniform_mask, 1u);
+   EXPECT_EQ(I->alu_src_value[0], 240u);
+}
+TEST(Apple9Packer, UniformFloatSpecialMatchT8132Probes)
+{
+   const struct {
+      agx_apple9_vir_opcode op;
+      agx_apple9_encoding encoding;
+      uint8_t bytes[10];
+      unsigned size;
+   } cases[] = {
+      {AGX_APPLE9_VIR_FFLOOR, AGX_APPLE9_ENC_FLOAT_SPECIAL_UNIFORM, {0x2f,0x00,0x54,0x50,0x02,0xc0,0xb3,0x00,0x02,0x00}, 10},
+      {AGX_APPLE9_VIR_FCEIL, AGX_APPLE9_ENC_FLOAT_SPECIAL_UNIFORM, {0x2f,0x00,0x54,0x50,0x02,0xc0,0xb3,0x00,0x04,0x00}, 10},
+      {AGX_APPLE9_VIR_FTRUNC, AGX_APPLE9_ENC_FLOAT_SPECIAL_UNIFORM, {0x2f,0x00,0x54,0x50,0x02,0xc0,0xb3,0x00,0x06,0x00}, 10},
+      {AGX_APPLE9_VIR_FROUND_EVEN, AGX_APPLE9_ENC_FLOAT_SPECIAL_UNIFORM, {0x2f,0x00,0x54,0x50,0x02,0xc0,0xb3,0x00,0x00,0x00}, 10},
+      {AGX_APPLE9_VIR_FRSQ, AGX_APPLE9_ENC_FLOAT_SPECIAL_UNIFORM, {0xaf,0x01,0x54,0x50,0x02,0xc0,0xb3,0x00,0x00,0x00}, 10},
+      {AGX_APPLE9_VIR_FEXP2, AGX_APPLE9_ENC_FLOAT_SPECIAL_UNIFORM, {0xaf,0x02,0x54,0x50,0x02,0xc0,0xb3,0x00,0x00,0x00}, 10},
+      {AGX_APPLE9_VIR_FLOG2, AGX_APPLE9_ENC_FLOAT_SPECIAL_UNIFORM, {0x2f,0x02,0x54,0x50,0x02,0xc0,0xb3,0x00,0x00,0x00}, 10},
+   };
+   for (const auto &c : cases) {
+      agx_apple9_vir_instr I = {};
+      I.op = c.op; I.encoding = c.encoding; I.dest = 0; I.dest_components = 1;
+      I.immediate = 2; I.alu_src_uniform_mask = 1; I.alu_src_value[0] = 240;
+      const uint8_t phys[] = {40};
+      agx_apple9_packed_instruction packed;
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&I, phys, &packed, &reason)) << reason;
+      EXPECT_EQ(packed.length, c.size);
+      EXPECT_EQ(memcmp(packed.bytes, c.bytes, c.size), 0);
+      I.alu_src_value[0] = 256;
+      EXPECT_FALSE(agx_apple9_pack_vir_instruction(&I, phys, &packed, &reason));
+   }
+}
+
+TEST_F(Apple9Optimization, UniformFloatSpecialRemovesGprImport)
+{
+   auto zero = imm(0);
+   auto input = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR_UNIFORM,
+      AGX_APPLE9_ENC_LOGIC_UNIFORM, &zero, 1, 240);
+   p.output = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FLOG2,
+      AGX_APPLE9_ENC_FLOAT_SPECIAL, &input, 1, 2);
+   ASSERT_TRUE(agx_apple9_optimize_vir(&p));
+   const auto *I = agx_apple9_definition(&p, p.output);
+   ASSERT_NE(I, nullptr);
+   EXPECT_EQ(I->encoding, AGX_APPLE9_ENC_FLOAT_SPECIAL_UNIFORM);
+   EXPECT_EQ(I->nr_srcs, 0u);
+   EXPECT_EQ(I->alu_src_uniform_mask, 1u);
+   EXPECT_EQ(I->alu_src_value[0], 240u);
+}
+
+TEST_F(Apple9Optimization, ReciprocalDoesNotFoldUnvalidatedUniformSource)
+{
+   auto zero = imm(0);
+   auto input = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR_UNIFORM,
+      AGX_APPLE9_ENC_LOGIC_UNIFORM, &zero, 1, 240);
+   p.output = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FRCP,
+      AGX_APPLE9_ENC_FLOAT_SPECIAL, &input, 1, 2);
+   ASSERT_TRUE(agx_apple9_optimize_vir(&p));
+   const auto *I = agx_apple9_definition(&p, p.output);
+   ASSERT_NE(I, nullptr);
+   EXPECT_EQ(I->nr_srcs, 1u);
+   EXPECT_EQ(I->alu_src_uniform_mask, 0u);
+   EXPECT_EQ(I->encoding, AGX_APPLE9_ENC_FLOAT_SPECIAL);
+
+   agx_apple9_vir_instr invalid = *I;
+   invalid.encoding = AGX_APPLE9_ENC_FLOAT_SPECIAL_UNIFORM;
+   invalid.nr_srcs = 0; invalid.dest = 0;
+   invalid.alu_src_uniform_mask = 1; invalid.alu_src_value[0] = 240;
+   uint8_t phys[] = {40};
+   agx_apple9_packed_instruction packed;
+   const char *reason = nullptr;
+   EXPECT_FALSE(agx_apple9_pack_vir_instruction(&invalid, phys, &packed, &reason));
+}
+
+
+TEST_F(Apple9Optimization, ImmutableUniformImportsFoldAcrossBlocksAndMasks)
+{
+   auto zero = imm(0);
+   auto uniform = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR_UNIFORM,
+      AGX_APPLE9_ENC_LOGIC_UNIFORM, &zero, 1, 240);
+   auto input = agx_apple9_vir_input(&p, 4);
+   ASSERT_TRUE(agx_apple9_vir_emit_side_effect(&p, AGX_APPLE9_VIR_EXEC_MASK_ELSE,
+      AGX_APPLE9_ENC_EXEC_MASK_ELSE, nullptr, 0, 0));
+   auto after_mask = add(input, uniform);
+   agx_apple9_block_begin(&p, agx_apple9_block_create(&p));
+   auto after_block = add(input, uniform);
+   p.output = add(after_mask, after_block);
+   ASSERT_TRUE(agx_apple9_optimize_vir(&p));
+   for (auto value : {after_mask, after_block}) {
+      const auto *I = agx_apple9_definition(&p, value);
+      ASSERT_NE(I, nullptr);
+      EXPECT_EQ(I->nr_srcs, 1u);
+      EXPECT_EQ(I->alu_src_uniform_mask, 2u);
+      EXPECT_EQ(I->alu_src_value[1], 240u);
+   }
+   /* Register expressions remain scoped to their original active lanes. */
+   EXPECT_EQ(agx_apple9_definition(&p, p.output)->src[0], after_mask);
+   EXPECT_EQ(agx_apple9_definition(&p, p.output)->src[1], after_block);
+}
+
+TEST_F(Apple9Optimization, MutableUniformWindowKeepsCrossBlockImportsInGprs)
+{
+   auto zero = imm(0);
+   auto uniform = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR_UNIFORM,
+      AGX_APPLE9_ENC_LOGIC_UNIFORM, &zero, 1, 240);
+   auto input = agx_apple9_vir_input(&p, 4);
+   agx_apple9_block_begin(&p, agx_apple9_block_create(&p));
+   p.output = add(input, uniform);
+   /* A later write can reach earlier blocks through a loop backedge. */
+   ASSERT_TRUE(agx_apple9_vir_emit_side_effect(&p, AGX_APPLE9_VIR_STORE_UNIFORM,
+      AGX_APPLE9_ENC_STORE_UNIFORM, &input, 1, 240));
+   ASSERT_TRUE(agx_apple9_optimize_vir(&p));
+   const auto *I = agx_apple9_definition(&p, p.output);
+   ASSERT_NE(I, nullptr);
+   EXPECT_EQ(I->nr_srcs, 2u);
+   EXPECT_EQ(I->alu_src_uniform_mask, 0u);
+}
+
+TEST_F(Apple9Optimization, SelectXorSwapsComplementaryArmsAndKeepsOtherUses)
+{
+   for (uint32_t mask : {1u, 0xffffffffu}) {
+      for (bool uniform_compare : {false, true}) {
+         agx_apple9_vir_finish(&p);
+         agx_apple9_vir_init(&p);
+         auto input = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_GET_GLOBAL_ID,
+            AGX_APPLE9_ENC_GET_SR, nullptr, 0, 0);
+         auto zero = imm(0), one = imm(mask);
+         auto compare = uniform_compare ? agx_apple9_vir_emit(&p,
+            AGX_APPLE9_VIR_IOR_UNIFORM, AGX_APPLE9_ENC_LOGIC_UNIFORM,
+            &zero, 1, 241) : imm(17);
+         uint32_t selected[] = {input, compare, one, zero};
+         auto original = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_SELECT,
+            AGX_APPLE9_ENC_SELECT_GPR_WIDE, selected, 4, AGX_APPLE9_SELECT_ULT);
+         uint32_t inverted[] = {one, original};
+         auto result = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IXOR,
+            AGX_APPLE9_ENC_LOGIC_EXTENDED, inverted, 2, 0);
+         p.output = add(original, result);
+         ASSERT_TRUE(agx_apple9_optimize_vir(&p));
+         ASSERT_TRUE(agx_apple9_analyze_uses(&p));
+         auto S = agx_apple9_definition(&p, original);
+         auto R = agx_apple9_definition(&p, result);
+         ASSERT_EQ(S->op, AGX_APPLE9_VIR_SELECT);
+         ASSERT_EQ(R->op, AGX_APPLE9_VIR_SELECT);
+         EXPECT_EQ(R->alu_src_uniform_mask, uniform_compare ? 2u : 0u);
+         if (uniform_compare) EXPECT_EQ(R->alu_src_value[1], 241u);
+         EXPECT_EQ(R->src[0], input);
+         /* An arm is an 8-bit literal or one of the last GPR sources. */
+         auto arm = [&](const agx_apple9_vir_instr *I, unsigned k) {
+            unsigned literals = I->alu_src_immediate_mask & 0xc;
+            if (literals & (4u << k))
+               return I->alu_src_value[2 + k];
+            unsigned r = I->nr_srcs - (2 - util_bitcount(literals));
+            if (k && !(literals & 4))
+               ++r;
+            auto D = agx_apple9_definition(&p, I->src[r]);
+            EXPECT_EQ(D->op, AGX_APPLE9_VIR_IMM);
+            return D->immediate;
+         };
+         for (unsigned x : {0u, 16u, 17u, 18u, 0xffffffffu}) {
+            unsigned branch = x < 17 ? 0 : 1;
+            EXPECT_EQ(arm(R, branch), arm(S, branch) ^ mask);
+            EXPECT_EQ(arm(S, branch), branch ? 0u : mask);
+         }
+      }
+   }
+}
+
+TEST_F(Apple9Optimization, MinMaxCommutesOnlyNonzeroLiteralsIntoOperandB)
+{
+   /* G16 min/max returns operand B for zeros of opposite sign, so a zero
+    * literal written as operand A must not move to B (hardware probe:
+    * max(+0, -0) is -0). Other literals tie only with equal bits. */
+   for (uint32_t literal : {0x00000000u, 0x80000000u, 0x3f800000u}) {
+      agx_apple9_vir_finish(&p);
+      agx_apple9_vir_init(&p);
+      auto input = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_GET_GLOBAL_ID,
+         AGX_APPLE9_ENC_GET_SR, nullptr, 0, 0);
+      uint32_t sources[] = {imm(literal), input};
+      p.output = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FMAX,
+         AGX_APPLE9_ENC_MINMAX_COMPACT, sources, 2, 0);
+      ASSERT_TRUE(agx_apple9_optimize_vir(&p));
+      const auto *I = agx_apple9_definition(&p, p.output);
+      ASSERT_EQ(I->op, AGX_APPLE9_VIR_FMAX);
+      if (literal & 0x7fffffffu) {
+         EXPECT_EQ(I->alu_src_immediate_mask, 2u);
+         EXPECT_EQ(I->alu_src_value[1], literal);
+         ASSERT_EQ(I->nr_srcs, 1u);
+         EXPECT_EQ(I->src[0], input);
+      } else {
+         EXPECT_EQ(I->alu_src_immediate_mask, 0u);
+         ASSERT_EQ(I->nr_srcs, 2u);
+         EXPECT_EQ(I->src[1], input);
+      }
+   }
+}
+
+TEST_F(Apple9Optimization, CompareLiteralKeepsEqualitySelectsSymmetric)
+{
+   /* Integer equality is ILT with the equality bit; IGT with the bit is not
+    * equality. A constant operand A of an equality select moves to B with
+    * the condition unchanged (dEQP-VK.subgroups.builtin_mask_var.
+    * framebuffer.subgroupeqmask_geometry failed when it became IGT). An
+    * ordered relation with the bit does not commute. */
+   for (uint32_t condition : {(uint32_t)(AGX_APPLE9_SELECT_ILT | AGX_APPLE9_SELECT_EQUALITY),
+                              (uint32_t)(AGX_APPLE9_SELECT_FGT | AGX_APPLE9_SELECT_EQUALITY)}) {
+      agx_apple9_vir_finish(&p);
+      agx_apple9_vir_init(&p);
+      auto input = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_GET_GLOBAL_ID,
+         AGX_APPLE9_ENC_GET_SR, nullptr, 0, 0);
+      auto other = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_GET_GLOBAL_ID,
+         AGX_APPLE9_ENC_GET_SR, nullptr, 0, 1);
+      uint32_t sources[] = {imm(5), input, input, other};
+      p.output = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_SELECT,
+         AGX_APPLE9_ENC_SELECT_GPR_WIDE, sources, 4, condition);
+      ASSERT_TRUE(agx_apple9_optimize_vir(&p));
+      const auto *S = agx_apple9_definition(&p, p.output);
+      ASSERT_EQ(S->op, AGX_APPLE9_VIR_SELECT);
+      if ((condition & 0xff) == AGX_APPLE9_SELECT_ILT) {
+         EXPECT_EQ(S->immediate, condition);
+         EXPECT_EQ(S->alu_src_immediate_mask & 2, 2u);
+         EXPECT_EQ(S->alu_src_value[1], 5u);
+         EXPECT_EQ(S->src[0], input);
+      } else {
+         EXPECT_EQ(S->immediate, condition);
+         EXPECT_EQ(S->alu_src_immediate_mask & 3, 0u);
+      }
+   }
+}
+
+TEST_F(Apple9Optimization, SelectXorKeepsNoncomplementaryArms)
+{
+   auto input = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_GET_GLOBAL_ID,
+      AGX_APPLE9_ENC_GET_SR, nullptr, 0, 0);
+   uint32_t selected[] = {input, imm(17), imm(0), imm(3)};
+   auto original = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_SELECT,
+      AGX_APPLE9_ENC_SELECT_GPR_WIDE, selected, 4, AGX_APPLE9_SELECT_ULT);
+   uint32_t inverted[] = {original, imm(1)};
+   p.output = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IXOR,
+      AGX_APPLE9_ENC_LOGIC_EXTENDED, inverted, 2, 0);
+   ASSERT_TRUE(agx_apple9_optimize_vir(&p));
+   ASSERT_TRUE(agx_apple9_analyze_uses(&p));
+   EXPECT_EQ(agx_apple9_definition(&p, p.output)->op, AGX_APPLE9_VIR_IXOR);
 }

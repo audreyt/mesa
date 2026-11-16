@@ -4,6 +4,8 @@
  */
 
 #include "agx_tilebuffer.h"
+#include "agx_apple9.h"
+#include "asahi/compiler/agx_compile_apple9.h"
 #include <assert.h>
 #include "util/format/u_format.h"
 #include "layout.h"
@@ -105,6 +107,24 @@ agx_build_tilebuffer_layout(const enum pipe_format *formats, uint8_t nr_cbufs,
    tib.tile_size = agx_select_tile_size(tib.sample_size_B * nr_samples);
 
    agx_tilebuffer_pack_usc(&tib);
+   return tib;
+}
+
+struct agx_tilebuffer_layout
+agx_apple9_build_tilebuffer_layout(const enum pipe_format *formats,
+                                  uint8_t count, uint8_t samples, bool layered)
+{
+   struct agx_tilebuffer_layout tib =
+      agx_build_tilebuffer_layout(formats, count, samples, layered);
+   unsigned bytes = 0;
+   for (unsigned rt = 0; rt < count; ++rt) {
+      tib._offset_B[rt] = bytes;
+      bytes += 4 * agx_apple9_color_words(formats[rt]);
+      tib.spilled[rt] = false;
+   }
+   tib.sample_size_B =
+      ALIGN_POT(agx_apple9_tile_sample_bytes(bytes, samples), 8);
+   tib.tile_size = samples == 4 ? 32 * 16 : 32 * 32;
    return tib;
 }
 

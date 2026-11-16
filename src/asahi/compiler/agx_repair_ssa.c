@@ -11,12 +11,18 @@
  * https://link.springer.com/content/pdf/10.1007/978-3-642-37051-9_6.pdf
  */
 
+#include "asahi/debug.h"
+#include "util/u_debug.h"
 #include "util/hash_table.h"
 #include "util/ralloc.h"
 #include "util/u_dynarray.h"
 #include "agx_builder.h"
 #include "agx_compiler.h"
 #include "agx_opcodes.h"
+
+/* Coalescing noninterfering spill homes is the default; AGX_SPILL_COALESCE=0
+ * restores one home per spilled variable. */
+DEBUG_GET_ONCE_BOOL_OPTION(agx_spill_coalesce, "AGX_SPILL_COALESCE", true)
 
 struct repair_block {
    /* For a loop header, whether phis operands have been added */
@@ -37,6 +43,9 @@ struct repair_ctx {
 
    /* Information on blocks indexed in source order */
    struct repair_block *blocks;
+
+   struct hash_table_u64 *homes;
+   bool audit;
 };
 
 static inline struct repair_block *
@@ -50,6 +59,12 @@ record_write(struct repair_ctx *ctx, agx_block *block, unsigned node,
              agx_index val)
 {
    assert(node < ctx->n);
+   if (ctx->homes && val.memory)
+      _mesa_hash_table_u64_insert(ctx->homes, val.value,
+                                  (void *)(uintptr_t)(node + 1));
+   if (ctx->audit)
+      fprintf(stderr, "RA_AUDIT_HOME node=%u ssa=%u mem=%u block=%u\n",
+              node, val.value, val.memory, block->index);
    struct hash_table_u64 *defs = repair_block(ctx, block)->defs;
    _mesa_hash_table_u64_insert(defs, node,
                                ralloc_memdup(defs, &val, sizeof(val)));
@@ -162,76 +177,137 @@ seal_loop_headers(struct repair_ctx *ctx, struct agx_block *exit)
    }
 }
 
+struct trivial_phi_use {
+   agx_instr *I;
+   unsigned s;
+   struct trivial_phi_use *next;
+};
+
+/*
+ * Remove phis whose normal sources are all one value or the phi itself,
+ * replacing their uses. Removing a phi only makes other phis more trivial, so
+ * the result does not depend on the order: track each value's uses and
+ * revisit just the phis whose sources changed, rather than sweeping the whole
+ * shader once per round.
+ *
+ * Only optimize trivial phis with normal sources. It is possible to optimize
+ * something like `phi #0, #0` but...
+ *
+ * 1. It would inadvently propagate constants which may be invalid. Copyprop
+ * knows the rules for this, but we don't here.
+ *
+ * 2. These trivial phis should be optimized at the NIR level. This pass is
+ * just to clean up spilling.
+ *
+ * So skip them for correctness in case NIR misses something (which can happen
+ * depending on pass order).
+ */
 static void
 agx_opt_trivial_phi(agx_context *ctx)
 {
-   agx_index *remap = calloc(ctx->alloc, sizeof(*remap));
-   for (;;) {
-      bool progress = false;
-      memset(remap, 0, ctx->alloc * sizeof(*remap));
+   unsigned nr_uses = 0;
+   agx_foreach_instr_global(ctx, I) {
+      agx_foreach_ssa_src(I, s)
+         ++nr_uses;
+   }
 
-      agx_foreach_block(ctx, block) {
-         agx_foreach_phi_in_block_safe(block, phi) {
-            agx_index same = agx_null();
-            bool all_same = true;
+   struct trivial_phi_use *pool = malloc(MAX2(nr_uses, 1) * sizeof(*pool));
+   struct trivial_phi_use **uses = calloc(ctx->alloc, sizeof(*uses));
+   BITSET_WORD *candidate = BITSET_CALLOC(ctx->alloc);
+   BITSET_WORD *removed = BITSET_CALLOC(ctx->alloc);
+   struct util_dynarray worklist;
+   util_dynarray_init(&worklist, NULL);
 
-            agx_foreach_src(phi, s) {
-               /* Only optimize trivial phis with normal sources. It is possible
-                * to optimize something like `phi #0, #0` but...
-                *
-                * 1. It would inadvently propagate constants which may be
-                * invalid. Copyprop knows the rules for this, but we don't here.
-                *
-                * 2. These trivial phis should be optimized at the NIR level.
-                * This pass is just to clean up spilling.
-                *
-                * So skip them for correctness in case NIR misses something
-                * (which can happen depending on pass order).
-                *
-                * ---
-                *
-                * TODO: Handle cycles faster.
-                */
-               if (phi->src[s].type != AGX_INDEX_NORMAL ||
-                   agx_is_null(remap[phi->src[s].value])) {
-                  all_same = false;
-                  break;
-               }
-
-               /* Same value or self-reference */
-               if (agx_is_equiv(phi->src[s], same) ||
-                   agx_is_equiv(phi->src[s], phi->dest[0]))
-                  continue;
-
-               if (!agx_is_null(same)) {
-                  all_same = false;
-                  break;
-               }
-
-               same = phi->src[s];
-            }
-
-            if (all_same) {
-               remap[phi->dest[0].value] = same;
-               agx_remove_instruction(phi);
-               progress = true;
-            }
-         }
-      }
-
-      if (!progress)
-         break;
-
-      agx_foreach_instr_global(ctx, I) {
-         agx_foreach_ssa_src(I, s) {
-            if (!agx_is_null(remap[I->src[s].value])) {
-               agx_replace_src(I, s, remap[I->src[s].value]);
-            }
-         }
+   nr_uses = 0;
+   agx_foreach_instr_global(ctx, I) {
+      agx_foreach_ssa_src(I, s) {
+         pool[nr_uses] = (struct trivial_phi_use){
+            .I = I,
+            .s = s,
+            .next = uses[I->src[s].value],
+         };
+         uses[I->src[s].value] = &pool[nr_uses++];
       }
    }
 
-   free(remap);
+   /* Only phis at the start of their block take part. Visit them in program
+    * order first.
+    */
+   agx_foreach_block_rev(ctx, block) {
+      agx_foreach_phi_in_block(block, phi) {
+         BITSET_SET(candidate, phi->dest[0].value);
+      }
+   }
+   agx_foreach_block_rev(ctx, block) {
+      agx_foreach_instr_in_block_rev(block, phi) {
+         if (phi->op == AGX_OPCODE_PHI &&
+             BITSET_TEST(candidate, phi->dest[0].value))
+            util_dynarray_append(&worklist, phi);
+      }
+   }
+
+   while (util_dynarray_num_elements(&worklist, agx_instr *)) {
+      agx_instr *phi = util_dynarray_pop(&worklist, agx_instr *);
+      unsigned dest = phi->dest[0].value;
+      if (BITSET_TEST(removed, dest))
+         continue;
+
+      agx_index same = agx_null();
+      bool all_same = true;
+
+      agx_foreach_src(phi, s) {
+         if (phi->src[s].type != AGX_INDEX_NORMAL) {
+            all_same = false;
+            break;
+         }
+
+         /* Same value or self-reference */
+         if (agx_is_equiv(phi->src[s], same) ||
+             agx_is_equiv(phi->src[s], phi->dest[0]))
+            continue;
+
+         if (!agx_is_null(same)) {
+            all_same = false;
+            break;
+         }
+
+         same = phi->src[s];
+      }
+
+      if (!all_same)
+         continue;
+
+      BITSET_SET(removed, dest);
+      agx_remove_instruction(phi);
+
+      /* A phi of only itself has no value to forward */
+      if (agx_is_null(same))
+         continue;
+
+      struct trivial_phi_use *last = NULL;
+      for (struct trivial_phi_use *u = uses[dest]; u; u = u->next) {
+         assert(u->I->src[u->s].value == dest);
+         agx_replace_src(u->I, u->s, same);
+         last = u;
+
+         if (u->I->op == AGX_OPCODE_PHI &&
+             BITSET_TEST(candidate, u->I->dest[0].value) &&
+             !BITSET_TEST(removed, u->I->dest[0].value))
+            util_dynarray_append(&worklist, u->I);
+      }
+
+      if (last) {
+         last->next = uses[same.value];
+         uses[same.value] = uses[dest];
+         uses[dest] = NULL;
+      }
+   }
+
+   util_dynarray_fini(&worklist);
+   free(removed);
+   free(candidate);
+   free(uses);
+   free(pool);
 }
 
 void
@@ -246,12 +322,35 @@ agx_repair_ssa(agx_context *ctx)
    }
 
    unsigned n = ctx->alloc;
+   const bool audit = agx_apple9_debug_enabled(AGX_A9_DBG_RA_AUDIT);
+   struct hash_table_u64 *homes = debug_get_option_agx_spill_coalesce()
+      ? _mesa_hash_table_u64_create(blocks) : NULL;
+
+   /* Spilling breaks SSA only for the variables it reloads or
+    * rematerializes, which now have several definitions. A variable with one
+    * definition is still in SSA form: reading it through the reconstruction
+    * below only builds trivial phis that are removed again. Repair just the
+    * redefined variables, which the final reindex makes indistinguishable.
+    */
+   BITSET_WORD *defined = rzalloc_array(blocks, BITSET_WORD, BITSET_WORDS(n));
+   BITSET_WORD *redefined = rzalloc_array(blocks, BITSET_WORD, BITSET_WORDS(n));
+   agx_foreach_instr_global(ctx, I) {
+      agx_foreach_ssa_dest(I, d) {
+         unsigned v = I->dest[d].value;
+         assert(v < n);
+         if (BITSET_TEST(defined, v))
+            BITSET_SET(redefined, v);
+         BITSET_SET(defined, v);
+      }
+   }
 
    agx_foreach_block(ctx, block) {
       struct repair_ctx rctx = {
          .shader = ctx,
          .n = n,
          .blocks = blocks,
+         .homes = homes,
+         .audit = audit,
       };
 
       agx_foreach_instr_in_block(block, I) {
@@ -259,7 +358,8 @@ agx_repair_ssa(agx_context *ctx)
          if (I->op != AGX_OPCODE_PHI) {
             agx_foreach_ssa_src(I, s) {
                assert(I->src[s].value < n);
-               agx_replace_src(I, s, resolve_read(&rctx, block, I->src[s]));
+               if (BITSET_TEST(redefined, I->src[s].value))
+                  agx_replace_src(I, s, resolve_read(&rctx, block, I->src[s]));
             }
          }
 
@@ -269,6 +369,13 @@ agx_repair_ssa(agx_context *ctx)
             /* Skip phis that we just created when processing loops */
             if (handle >= n) {
                assert(I->op == AGX_OPCODE_PHI);
+               continue;
+            }
+
+            if (!BITSET_TEST(redefined, handle)) {
+               if (homes && I->dest[d].memory)
+                  _mesa_hash_table_u64_insert(homes, handle,
+                                              (void *)(uintptr_t)(handle + 1));
                continue;
             }
 
@@ -311,11 +418,15 @@ agx_repair_ssa(agx_context *ctx)
                *util_dynarray_element(&block->predecessors, agx_block *, s);
 
             assert(phi->src[s].value < n);
+            if (!BITSET_TEST(redefined, phi->src[s].value))
+               continue;
 
             struct repair_ctx rctx = {
                .shader = ctx,
                .n = n,
                .blocks = blocks,
+               .homes = homes,
+               .audit = audit,
             };
 
             agx_replace_src(phi, s,
@@ -324,8 +435,29 @@ agx_repair_ssa(agx_context *ctx)
       }
    }
 
-   ralloc_free(blocks);
-
    agx_opt_trivial_phi(ctx);
+   ralloc_free(ctx->spill_home);
+   ctx->spill_home = NULL;
+   ctx->spill_home_count = 0;
+   if (homes) {
+      ctx->spill_home = rzalloc_array(ctx, unsigned, ctx->alloc);
+      ctx->spill_home_count = ctx->alloc;
+      agx_foreach_instr_global(ctx, I) {
+         agx_foreach_ssa_dest(I, d) {
+            if (I->dest[d].memory)
+               ctx->spill_home[I->dest[d].value] = (uintptr_t)
+                  _mesa_hash_table_u64_search(homes, I->dest[d].value);
+         }
+      }
+   }
+   ralloc_free(blocks);
+   if (audit) {
+      unsigned next = 0;
+      agx_foreach_instr_global(ctx, I) {
+         agx_foreach_ssa_dest(I, d)
+            fprintf(stderr, "RA_AUDIT_REINDEX old=%u new=%u\n",
+                    I->dest[d].value, next++);
+      }
+   }
    agx_reindex_ssa(ctx);
 }

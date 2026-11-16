@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <time.h>
 #include "util/list.h"
+#include "agx_shader_body.h"
 
 struct agx_device;
 
@@ -52,12 +53,20 @@ enum agx_va_flags {
 
    /* Within the Apple9 render-context aperture, outside kernel storage. */
    AGX_VA_CONTEXT = (1 << 2),
+
+   /* Capture-replay range: the top of the main or USC heap, which no other
+    * allocation uses, so a captured address is still free at replay whatever
+    * the driver allocated first. Combined with AGX_VA_FIXED on replay. */
+   AGX_VA_REPLAY = (1 << 3),
 };
 
 struct agx_va {
    enum agx_va_flags flags;
    uint64_t addr;
    uint64_t size_B;
+
+   /* Entry in agx_device::va_quarantine while retired (see agx_va_retire). */
+   struct list_head link;
 };
 
 struct agx_ptr {
@@ -112,12 +121,15 @@ struct agx_bo {
    /* Current writer, if any (queue in upper 32 bits, syncobj in lower 32 bits) */
    uint64_t writer;
 
-   /* Immutable Apple9 entry in the device's compact USC arena. Its lifetime
-    * follows this BO, including references held by submitted batches. */
-   uint32_t apple9_entry_offset;
+   /* Entry identity for callers that store one Apple9 body in this BO. */
+   struct agx_shader_body apple9_body;
 
    /* Update atomically */
    int32_t refcnt;
+
+   /* Awaiting close on bo_cache.retired. An import can reclaim a shared BO
+    * until the reaper removes its handle from bo_map. */
+   bool retired;
 
    /* For debugging */
    const char *label;
@@ -145,13 +157,27 @@ struct agx_bo *agx_bo_create(struct agx_device *dev, size_t size,
                              unsigned align, enum agx_bo_flags flags,
                              const char *label);
 
+/* As agx_bo_create, with extra VA flags (AGX_VA_REPLAY, AGX_VA_FIXED) and a
+ * fixed address. Such BOs bypass the BO cache in both directions. */
+struct agx_bo *agx_bo_create_va(struct agx_device *dev, size_t size,
+                                unsigned align, enum agx_bo_flags flags,
+                                enum agx_va_flags va_flags, uint64_t fixed_va,
+                                const char *label);
+
 void agx_bo_reference(struct agx_bo *bo);
 void agx_bo_unreference(struct agx_device *dev, struct agx_bo *bo);
 struct agx_bo *agx_bo_import(struct agx_device *dev, int fd);
 int agx_bo_export(struct agx_device *dev, struct agx_bo *bo);
 void agx_bo_make_shared(struct agx_device *dev, struct agx_bo *bo);
 
+/* Queue an unreferenced, uncached BO for close; does not wait for the kernel. */
 void agx_bo_free(struct agx_device *dev, struct agx_bo *bo);
+void agx_bo_cache_init(struct agx_device *dev);
+bool agx_bo_cache_start(struct agx_device *dev);
+void agx_bo_cache_finish(struct agx_device *dev);
+/* Allocation-failure recovery only. Device teardown also drains the reaper. */
+void agx_bo_cache_wait(struct agx_device *dev);
+void agx_bo_reclaim(struct agx_device *dev, struct agx_bo *bo);
 struct agx_bo *agx_bo_cache_fetch(struct agx_device *dev, size_t size,
                                   size_t align, uint32_t flags,
                                   const bool dontwait);

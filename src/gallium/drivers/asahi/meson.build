@@ -4,7 +4,6 @@
 files_asahi = files(
   'driinfo_asahi.h',
   'agx_batch.c',
-  'agx_apple9.c',
   'agx_blit.c',
   'agx_disk_cache.c',
   'agx_fence.c',
@@ -31,28 +30,3 @@ driver_asahi = declare_dependency(
   compile_args : '-DGALLIUM_ASAHI',
   link_with : [libasahi, libasahiwinsys, libasahi_compiler, libasahi_lib, libasahi_layout, libasahi_decode]
 )
-
-if with_tests
-  test(
-    'agx_apple9_launcher_tests',
-    executable(
-      'agx_apple9_launcher_tests',
-      files('test/test-apple9-launch.cpp', '../../../asahi/lib/agx_apple9_launch.c'),
-      include_directories : [inc_src],
-      dependencies : [idep_gtest],
-    ),
-    suite : ['asahi'],
-    protocol : 'gtest',
-  )
-  test(
-    'agx_apple9_geometry_tests',
-    executable(
-      'agx_apple9_geometry_tests',
-      files('test/test-apple9-geometry.cpp', '../../../asahi/lib/agx_apple9_geometry.c'),
-      include_directories : [inc_include, inc_src],
-      dependencies : [idep_gtest, idep_nir],
-    ),
-    suite : ['asahi'],
-    protocol : 'gtest',
-  )
-endif

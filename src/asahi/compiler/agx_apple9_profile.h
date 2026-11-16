@@ -23,7 +23,7 @@ enum agx_apple9_compute_abi {
 };
 
 /* Validated direct descriptor selection capacity, independent of API slots. */
-#define AGX_APPLE9_GRAPHICS_MAX_TEXTURES 16
+#define AGX_APPLE9_GRAPHICS_MAX_TEXTURES 32
 /* Sixteen API samplers plus the private nearest texel-fetch sampler. */
 #define AGX_APPLE9_GRAPHICS_MAX_SAMPLERS 17
 
@@ -33,7 +33,30 @@ enum agx_apple9_compute_abi {
  * complete four-word blocks in the argument window. Preamble results start
  * after that padded window and extend through the last uniform word. */
 #define AGX_APPLE9_GRAPHICS_ROOT_WORDS 12
-#define AGX_APPLE9_MAX_PREAMBLE_BYTES 8192
+
+/* Native task/mesh ABI extends the six graphics pointer roots. Local
+ * selectors address pairs of uniform words; payload names its first word.
+ * The existing groups/shared roots remain owned by the graphics ABI. */
+#define AGX_APPLE9_MESH_ABI_VERSION     8
+#define AGX_APPLE9_MESH_OUTPUT_ROOT     6
+#define AGX_APPLE9_MESH_GRID_ROOT       7
+#define AGX_APPLE9_MESH_PAYLOAD_UNIFORM 16
+#define AGX_APPLE9_MESH_DRAW_UNIFORM    18
+#define AGX_APPLE9_MESH_ARGUMENT_WORDS  20
+/* Compiler/driver policy bounds on preamble code, not hardware limits: the
+ * launch record branches to the preamble and carries no size field, and
+ * 8-16 KiB graphics and compute preambles ran correctly on G16. Compute
+ * preambles run once per workgroup on its critical path, so compute keeps the
+ * smaller bound until a larger one is shown to pay for its latency. */
+#define AGX_APPLE9_MAX_GRAPHICS_PREAMBLE_BYTES 16384
+#define AGX_APPLE9_MAX_COMPUTE_PREAMBLE_BYTES 8192
+
+static inline unsigned
+agx_apple9_max_preamble_bytes(bool compute)
+{
+   return compute ? AGX_APPLE9_MAX_COMPUTE_PREAMBLE_BYTES
+                  : AGX_APPLE9_MAX_GRAPHICS_PREAMBLE_BYTES;
+}
 
 #define AGX_APPLE9_COMPUTE_DIRECT_MAX_RESOURCES 18
 #define AGX_APPLE9_COMPUTE_MAX_RESOURCES 32
@@ -42,33 +65,9 @@ enum agx_apple9_compute_abi {
 #define AGX_APPLE9_COMPUTE_SHARED_ARGUMENT 4
 /* Conservative per-invocation limit exercised on T8132 in all three stages. */
 #define AGX_APPLE9_MAX_SCRATCH_BYTES 32768
-/* Largest power of two whose byte count fits the allocation word after << 2. */
-#define AGX_APPLE9_MAX_THREADGROUP_MEMORY_BYTES 8192
+/* Workgroup memory, as Metal's threadgroup memory limit on M4. */
+#define AGX_APPLE9_MAX_SHARED_BYTES 32768
 #define AGX_APPLE9_COMPUTE_VISIBLE_ARGUMENT_BASE 1
-
-/* Experimental, separately gated threadgroup-allocation state. Production
- * defaults are {AGX_APPLE9_MAX_THREADGROUP_MEMORY_BYTES, PRODUCTION} and only
- * change when agx_apple9_experiments_set() is called. The advertised device
- * limit never follows this state. */
-enum {
-   AGX_APPLE9_TG_ENC_PRODUCTION = 0,
-   AGX_APPLE9_TG_ENC_WIDE32 = 1,
-};
-
-struct agx_apple9_experiments {
-   uint32_t threadgroup_memory_ceiling; /* 8192 production */
-   uint8_t threadgroup_encoding;
-};
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-/* Value snapshot of the process-wide state; safe against concurrent set. */
-struct agx_apple9_experiments agx_apple9_experiments_get(void);
-void agx_apple9_experiments_set(const struct agx_apple9_experiments *);
-#ifdef __cplusplus
-}
-#endif
 /* The threadgroup address space is selected by a tagged argument root. */
 #define AGX_APPLE9_COMPUTE_SHARED_ROOT UINT64_C(0x80000000)
 

@@ -41,6 +41,8 @@
 struct hk_device_memory;
 struct hk_physical_device;
 
+bool hk_apple9_storage_format_supported(VkFormat format);
+
 static VkFormatFeatureFlags2
 hk_get_image_plane_format_features(struct hk_physical_device *pdev,
                                    VkFormat vk_format, VkImageTiling tiling);
@@ -54,15 +56,54 @@ struct hk_image_plane {
    uint64_t addr;
    struct agx_va *va;
 
-   /* For host image copy */
+   /* Host image copy. On 32-bit, binding records the backing storage but
+    * leaves CPU VA available until an individual copy needs a mapping.
+    * The BO is owned by the bound VkDeviceMemory.
+    */
+   struct agx_bo *bo;
+   uint64_t offset_B;
    void *map;
-   uint32_t rem;
+
+   /* With an explicit DRM format modifier layout, the plane sits at this
+    * offset within its memory binding. Otherwise planes are consecutive.
+    */
+   bool has_explicit_offset;
+   uint64_t explicit_offset_B;
 
    /* If the image has sparse residency, its residency is tracked in this
     * secondary page table. Otherwise, this map is NULL.
     */
    struct agx_bo *sparse_map;
+
+   /* Apple9 has no texture residency mode. Its sparse-resident planes instead
+    * have a struct hk_apple9_residency table, which shaders consult.
+    */
+   struct agx_bo *apple9_residency;
 };
+
+/* Pages of level L of a layer begin at level[L].page, in raster order of
+ * (1 << shift_x) x (1 << shift_y) texel tiles, tiles_per_row to a row. Mip
+ * tail levels have no tiles_per_row; any page of the tail stands for it.
+ */
+struct hk_apple9_residency_level {
+   uint32_t page;
+   uint16_t tiles_per_row;
+   uint8_t shift_x, shift_y;
+};
+
+struct hk_apple9_residency {
+   uint32_t layer_pages;
+   uint32_t pages;
+   uint32_t pad[2];
+   struct hk_apple9_residency_level level[AIL_MAX_MIP_LEVELS];
+   /* One byte per page of each layer in turn, nonzero if bound. */
+   uint8_t resident[];
+};
+static_assert(sizeof(struct hk_apple9_residency) == 144,
+              "Apple9 residency header is packed");
+
+void hk_apple9_residency_init(struct hk_apple9_residency *r,
+                              const struct ail_layout *layout);
 
 struct hk_image {
    struct vk_image vk;
@@ -75,9 +116,25 @@ struct hk_image {
 
    uint8_t plane_count;
    struct hk_image_plane planes[3];
+
+   /* Virtio resource id of bound implicit-sync (WSI) memory, or 0. */
+   uint32_t implicit_sync_res;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_image, vk.base, VkImage, VK_OBJECT_TYPE_IMAGE)
+
+/* Opaque capture data of an image: the addresses of each sparse plane and of
+ * its residency table, which descriptors embed. Zero where not replayable. */
+struct hk_image_plane_capture_data {
+   uint64_t va, residency;
+};
+
+struct hk_image_capture_data {
+   struct hk_image_plane_capture_data planes[3];
+};
+
+/* Image views have no capture data of their own. */
+#define HK_IMAGE_VIEW_CAPTURE_DATA_SIZE 4
 
 static inline uint64_t
 hk_image_plane_base_address(const struct hk_image_plane *plane)

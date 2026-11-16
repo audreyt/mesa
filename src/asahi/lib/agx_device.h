@@ -4,6 +4,8 @@
  */
 
 #pragma once
+#include "agx_apple9_layout.h"
+#include "agx_native_mesh.h"
 
 #include <stdint.h>
 #include <xf86drm.h>
@@ -14,6 +16,7 @@
 #include "util/timespec.h"
 #include "util/u_dynarray.h"
 #include "util/u_printf.h"
+#include "util/u_thread.h"
 #include "util/vma.h"
 #include "agx_bo.h"
 #include "agx_apple9_layout.h"
@@ -75,10 +78,14 @@ struct agx_submit_virt {
 
 typedef struct {
    struct agx_bo *(*bo_alloc)(struct agx_device *dev, size_t size, size_t align,
-                              enum agx_bo_flags flags);
+                              enum agx_bo_flags flags,
+                              enum agx_va_flags va_flags, uint64_t fixed_va);
    int (*bo_bind)(struct agx_device *dev, struct drm_asahi_gem_bind_op *ops,
                   uint32_t count);
-   void (*bo_mmap)(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr);
+   /* Map the first size bytes of a BO, at fixed_addr unless NULL. Returns
+    * NULL on failure. */
+   void *(*bo_mmap)(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr,
+                    size_t size);
    ssize_t (*get_params)(struct agx_device *dev, void *buf, size_t size);
    int (*submit)(struct agx_device *dev, struct drm_asahi_submit *submit,
                  struct agx_submit_virt *virt);
@@ -119,6 +126,18 @@ struct agx_device {
    /* Device handle */
    int fd;
 
+   /* Set the expected class hash before opening the device. Qualification is
+    * sampled around this VM's creation and never upgraded later. */
+   const char *native_mesh_classes;
+
+   /* Opened only to query the device (a Vulkan physical device): no shader
+    * entries are allocated, so their 8 MiB arena is not created. */
+   bool probe_only;
+   bool native_mesh_qualified;
+   /* The VM's latched asahi_native_blocks profile; qualified only together
+    * with native_mesh_qualified, at the same generation. */
+   struct agx_native_blocks_support native_blocks;
+
    /* VM handle */
    uint32_t vm_id;
 
@@ -131,7 +150,29 @@ struct agx_device {
    struct util_vma_heap main_heap;
    struct util_vma_heap usc_heap;
    struct util_vma_heap context_heap;
+   /* Capture-replay ranges at the top of the main and USC heaps, reserved
+    * (non-empty) only if capture_replay is set before agx_open_device. */
+   bool capture_replay;
+   struct util_vma_heap replay_heap, replay_usc_heap;
    uint64_t guard_size;
+
+   /* VAs freed after a GEM close, kept out of their heap for a while: FIFO,
+    * with a byte cap per heap (main, USC, context, replay, replay USC; the
+    * replay caps are 0). Protected by vma_lock. See agx_va_retire.
+    */
+   struct {
+      struct list_head list;
+      uint64_t bytes[5], cap[5];
+      /* Statistics (AGX_VA_QUARANTINE_STATS prints them at teardown):
+       * retired VAs, the largest total quarantined, and releases by cause.
+       */
+      uint64_t retired, high_water_B;
+      uint64_t released_cap, released_exhaustion, released_fixed;
+      /* Bytes taken from each heap (live plus quarantined), its high water,
+       * and the context heap's size, for the same report.
+       */
+      uint64_t heap_used_B[5], heap_high_water_B[5], context_size_B;
+   } va_quarantine;
 
    /* To emulate sparse-resident buffers, we map buffers in both the bottom half
     * and top half of the address space. sparse_ro_offset controls the
@@ -149,28 +190,56 @@ struct agx_device {
    struct agx_bo *zero_bo, *scratch_bo;
 
    /* One stable, GPU-read-only entry arena shared by graphics and compute.
-    * Suballocations follow the lifetime of the immutable shader body BOs. */
-   struct agx_bo *apple9_entries;
-   void *apple9_entry_map;
+    * Suballocations follow the lifetime of immutable shader bodies. The arena
+    * is a fixed VA range at shader_base, backed from the start in
+    * AGX_APPLE9_ENTRY_CHUNK_SIZE chunks as entries reach them: an application
+    * with a few thousand shaders uses one chunk of the 8 MiB. The CPU writes
+    * entries through agx_apple9_entry_write, chunk by chunk. */
+   struct agx_va *apple9_entry_va;
+   struct agx_bo *apple9_entry_chunks[AGX_APPLE9_ENTRY_CHUNKS];
    struct util_vma_heap apple9_entry_heap;
    simple_mtx_t apple9_entry_lock;
+   /* Bodies holding an entry, least recently pinned first. */
+   struct list_head apple9_entry_lru;
+   /* Optional: pin a shader body for the lifetime of the recording that
+    * allocator belongs to, with apple9_entry_lock held. Returns false if the
+    * body cannot be pinned. Without it, entries are never evicted.
+    */
+   bool (*apple9_pin_entry)(void *allocator, struct agx_shader_body *body);
 
    struct renderonly *ro;
 
    pthread_mutex_t bo_map_lock;
+   pthread_cond_t bo_map_cond;
+   /* The reaper has removed this shared handle from bo_map and is closing it.
+    * An import that still gets the old handle must retry after the close.
+    * Ordinary allocation and imports of other handles do not wait for it.
+    * Protected by bo_map_lock. There is only one reaper per device.
+    */
+   uint32_t bo_closing_handle;
    struct util_sparse_array bo_map;
    uint32_t max_handle;
 
    struct {
-      simple_mtx_t lock;
+      pthread_mutex_t lock;
+      pthread_cond_t cond;
+      thrd_t thread;
+      bool started, stop, busy, forked;
+      /* Protected by the global reaper device-list lock. */
+      struct list_head device_link;
+
+      /* Unreferenced BOs that cannot be reused, including explicit trims.
+       * Uses bucket_link. Protected by lock, like the reuse cache below.
+       */
+      struct list_head retired;
 
       /* List containing all cached BOs sorted in LRU (Least Recently Used)
        * order so we can quickly evict BOs that are more than 1 second old.
        */
       struct list_head lru;
 
-      /* The BO cache is a set of buckets with power-of-two sizes.  Each bucket
-       * is a linked list of free panfrost_bo objects.
+      /* The BO cache is a set of buckets with power-of-two sizes. Each bucket
+       * is a linked list of free agx_bo objects.
        */
       struct list_head buckets[NR_BO_CACHE_BUCKETS];
 
@@ -198,6 +267,14 @@ struct agx_device {
 
    struct u_printf_ctx printf;
 };
+
+/* Native Apple9 launch and resource encoding, independent of cluster count. */
+static inline bool
+agx_is_apple9(const struct agx_device *dev)
+{
+   return dev->chip == AGX_CHIP_G16G || dev->chip == AGX_CHIP_G16C ||
+          dev->chip == AGX_CHIP_G17P;
+}
 
 static inline bool
 agx_apple9_direct_render_enabled(const struct agx_device *dev)
@@ -227,24 +304,43 @@ agx_rw_addr_to_ro(struct agx_device *dev, uint64_t addr)
 }
 
 void agx_bo_note_cpu_write(struct agx_bo *bo, uint64_t offset, uint64_t size);
+
+/* Back the shader entry arena up to end_B, with apple9_entry_lock held (or
+ * while opening the device). Returns false if a chunk cannot be allocated. */
+bool agx_apple9_entry_back(struct agx_device *dev, uint32_t end_B);
+/* Write size bytes at offset in the backed shader entry arena. */
+void agx_apple9_entry_write(struct agx_device *dev, uint32_t offset,
+                            const void *data, uint32_t size);
 bool agx_bo_sync_cpu_read(struct agx_bo *bo);
 
+/* A separate mapping of the first size bytes of a BO, at fixed_addr unless
+ * NULL, owned and unmapped by the caller. API memory maps use this so that
+ * their size and lifetime are independent of the driver's mapping below, which
+ * covers the whole BO, possibly larger than requested when it came from the BO
+ * cache, and survives the BO's return to the cache.
+ */
+/* Exclude a new BO CPU mapping from fork children, see agx_device.c. */
+void agx_bo_mapping_dontfork(void *map, size_t size);
+
 static inline void *
-agx_bo_map_placed(struct agx_bo *bo, void *fixed_addr)
+agx_bo_map_range(struct agx_bo *bo, void *fixed_addr, size_t size)
 {
    /* An ordinary map can escape and be written after any submission. */
    if (bo->shim_cpu_epoch)
       *bo->shim_cpu_epoch = 0;
-   if (!bo->_map)
-      bo->dev->ops.bo_mmap(bo->dev, bo, fixed_addr);
 
-   return bo->_map;
+   return bo->dev->ops.bo_mmap(bo->dev, bo, fixed_addr, size);
 }
 
 static inline void *
 agx_bo_map(struct agx_bo *bo)
 {
-   return agx_bo_map_placed(bo, NULL);
+   if (bo->shim_cpu_epoch)
+      *bo->shim_cpu_epoch = 0;
+   if (!bo->_map)
+      bo->_map = bo->dev->ops.bo_mmap(bo->dev, bo, NULL, bo->size);
+
+   return bo->_map;
 }
 
 static inline bool
@@ -278,6 +374,7 @@ uint32_t agx_create_command_queue(struct agx_device *dev,
 int agx_destroy_command_queue(struct agx_device *dev, uint32_t queue_id);
 
 int agx_import_sync_file(struct agx_device *dev, struct agx_bo *bo, int fd);
+int agx_syncobj_error(struct agx_device *dev, uint32_t syncobj);
 int agx_export_sync_file(struct agx_device *dev, struct agx_bo *bo);
 
 void agx_debug_fault(struct agx_device *dev, uint64_t addr);
@@ -301,6 +398,10 @@ struct agx_va *agx_va_alloc(struct agx_device *dev, uint64_t size_B,
                             uint64_t align_B, enum agx_va_flags flags,
                             uint64_t fixed_va);
 void agx_va_free(struct agx_device *dev, struct agx_va *va, bool unbind);
+void agx_va_retire(struct agx_device *dev, struct agx_va *va);
+void agx_va_quarantine_init(struct agx_device *dev, uint64_t main_B,
+                            uint64_t usc_B, uint64_t context_B);
+void agx_va_quarantine_finish(struct agx_device *dev);
 
 static inline struct drm_asahi_cmd_header
 agx_cmd_header(bool compute, uint16_t barrier_vdm, uint16_t barrier_cdm)

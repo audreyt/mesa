@@ -5,13 +5,16 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "asahi/debug.h"
 #include "util/bitset.h"
 #include "util/hash_table.h"
 #include "util/ralloc.h"
 #include "util/sparse_bitset.h"
+#include "util/u_debug.h"
 #include "util/u_dynarray.h"
 #include "util/u_qsort.h"
 #include "agx_builder.h"
+#include "agx_apple9_ir.h"
 #include "agx_compiler.h"
 #include "agx_opcodes.h"
 
@@ -40,6 +43,62 @@ static dist_t
 dist_sum(dist_t A, dist_t B)
 {
    return (A + B < A) ? DIST_INFINITY : (A + B);
+}
+
+/*
+ * Braun and Hack weight next-use distances that are only reached by leaving a
+ * loop with a large constant, so inside a loop a value used only after it
+ * looks far away. Without this, values the loop never touches compete with
+ * its working set, and the loop spills and reloads its own values on every
+ * iteration, often in a single branch arm, which makes the register state
+ * differ at the join and forces parallel copies there.
+ */
+#define LOOP_EXIT_DIST 100000
+
+/* Structured control flow places a loop's blocks contiguously in source
+ * order, from the header to its last back-edge predecessor. loop_end[h] is
+ * that predecessor's index for each loop header h, and 0 otherwise.
+ */
+static unsigned *
+compute_loop_ends(agx_context *ctx, void *memctx)
+{
+   unsigned *loop_end = rzalloc_array(memctx, unsigned, ctx->num_blocks);
+   agx_foreach_block(ctx, block) {
+      if (!block->loop_header)
+         continue;
+      agx_foreach_predecessor(block, pred) {
+         if ((*pred)->index >= block->index)
+            loop_end[block->index] = MAX2(loop_end[block->index], (*pred)->index);
+      }
+   }
+   return loop_end;
+}
+
+static bool
+loop_contains(const unsigned *loop_end, unsigned header, unsigned block)
+{
+   return header <= block && block <= loop_end[header];
+}
+
+/* Number of loops the edge pred -> succ leaves. */
+static unsigned
+loops_exited(agx_context *ctx, const unsigned *loop_end, agx_block *pred,
+             agx_block *succ)
+{
+   unsigned exits = 0;
+   for (unsigned h = 0; h <= pred->index && h < ctx->num_blocks; ++h) {
+      if (loop_end[h] && loop_contains(loop_end, h, pred->index) &&
+          !loop_contains(loop_end, h, succ->index))
+         ++exits;
+   }
+   return exits;
+}
+
+
+static bool
+spill_trace_loops(void)
+{
+   return agx_apple9_debug_enabled(AGX_A9_DBG_SPILL_LOOPS);
 }
 
 struct next_uses {
@@ -200,6 +259,16 @@ struct spill_ctx {
 
    /* If true, we cannot use scratch and must only rematerialize. */
    bool remat_only;
+
+   /* Loop spans (see compute_loop_ends). */
+   const unsigned *loop_end;
+
+   /* Zeroed per-variable scratch for compute_w_entry, which restores it. A
+    * fresh array per block would make each block cost O(n). */
+   unsigned *freq;
+
+   /* Per-variable scratch for listing a set's members. */
+   unsigned *members;
 };
 
 static inline struct spill_block *
@@ -288,17 +357,131 @@ can_remat(agx_instr *I)
    }
 }
 
+/* Rebuild short scalar expressions whose complete input graph consists of
+ * constants and immutable uniforms. No GPR input is kept live for this: every
+ * dependency is reconstructed at the use. Limit the total instruction count,
+ * including repeated dependencies, to avoid expanding large expression trees.
+ */
+static bool
+apple9_remat_alu(const agx_instr *I)
+{
+   if (I->op != AGX_OPCODE_APPLE9_PURE || !I->apple9 || I->nr_dests != 1 ||
+       I->dest[0].size != AGX_SIZE_32 || agx_channels(I->dest[0]) != 1 ||
+       !agx_apple9_instr_is_pure_alu(I->apple9))
+      return false;
+
+   switch (I->apple9->op) {
+   case AGX_APPLE9_VIR_IOR_UNIFORM:
+   case AGX_APPLE9_VIR_IADD:
+   case AGX_APPLE9_VIR_ISUB:
+   case AGX_APPLE9_VIR_IAND:
+   case AGX_APPLE9_VIR_IOR:
+   case AGX_APPLE9_VIR_IXOR:
+   case AGX_APPLE9_VIR_ISHR:
+   case AGX_APPLE9_VIR_USHR:
+   case AGX_APPLE9_VIR_ISHL:
+   case AGX_APPLE9_VIR_FADD:
+   case AGX_APPLE9_VIR_FSUB:
+   case AGX_APPLE9_VIR_FMUL:
+   case AGX_APPLE9_VIR_FADD_IMM:
+   case AGX_APPLE9_VIR_FMUL_IMM:
+   case AGX_APPLE9_VIR_SELECT:
+   case AGX_APPLE9_VIR_BIT_COUNT:
+   case AGX_APPLE9_VIR_BIT_REVERSE:
+   case AGX_APPLE9_VIR_UFIND_MSB:
+   case AGX_APPLE9_VIR_U2F32:
+   case AGX_APPLE9_VIR_I2F32:
+   case AGX_APPLE9_VIR_F2I32:
+   case AGX_APPLE9_VIR_F2U32:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static unsigned
+find_apple9_remat(agx_context *ctx, agx_instr **remat, void *memctx,
+                  unsigned max_extra)
+{
+   if (ctx->ra_target.disable_uniform_rematerialization)
+      return 0;
+   /* Preamble writes make uniforms mutable. Treat that entire shader part
+    * conservatively; the main shader's file is immutable. */
+   agx_foreach_instr_global(ctx, I) {
+      if ((I->op == AGX_OPCODE_APPLE9 || I->op == AGX_OPCODE_APPLE9_PURE) &&
+          I->apple9 && I->apple9->op == AGX_APPLE9_VIR_STORE_UNIFORM)
+         return 0;
+   }
+
+   uint8_t *cost = rzalloc_array(memctx, uint8_t, ctx->alloc);
+   unsigned *peak = rzalloc_array(memctx, unsigned, ctx->alloc);
+   agx_foreach_instr_global(ctx, I) {
+      if (I->op == AGX_OPCODE_MOV_IMM) {
+         cost[I->dest[0].value] = 1;
+         peak[I->dest[0].value] =
+            util_next_power_of_two(agx_index_size_16(I->dest[0]));
+      }
+   }
+
+   unsigned extra = 0;
+   bool progress;
+   do {
+      progress = false;
+      agx_foreach_instr_global(ctx, I) {
+         if (!apple9_remat_alu(I) || cost[I->dest[0].value])
+            continue;
+         unsigned total = 1, held = 0, demand = 0;
+         agx_foreach_src(I, s) {
+            if (I->src[s].type != AGX_INDEX_NORMAL ||
+                !cost[I->src[s].value]) {
+               total = 5;
+               break;
+            }
+            total += cost[I->src[s].value];
+            demand = MAX2(demand, held + peak[I->src[s].value]);
+            held += util_next_power_of_two(agx_index_size_16(I->src[s]));
+         }
+         if (total <= 4) {
+            unsigned width = agx_index_size_16(I->dest[0]);
+            demand = MAX2(demand, held + width);
+            if (demand - width > max_extra)
+               continue;
+            peak[I->dest[0].value] = demand;
+            extra = MAX2(extra, demand - width);
+            cost[I->dest[0].value] = total;
+            remat[I->dest[0].value] = I;
+            ctx->uniform_remat_used = true;
+            progress = true;
+         }
+      }
+   } while (progress);
+   return extra;
+}
+
 static agx_instr *
 remat_to(agx_builder *b, agx_index dst, struct spill_ctx *ctx, unsigned node)
 {
    agx_instr *I = ctx->remat[node];
-   assert(can_remat(I));
+   assert(can_remat(I) || apple9_remat_alu(I));
 
    switch (I->op) {
    case AGX_OPCODE_MOV_IMM:
       return agx_mov_imm_to(b, dst, I->imm);
    case AGX_OPCODE_GET_SR:
       return agx_get_sr_to(b, dst, I->sr);
+   case AGX_OPCODE_APPLE9_PURE: {
+      agx_instr *copy = agx_alloc_instr(b, I->op, 1, I->nr_srcs);
+      copy->dest[0] = dst;
+      copy->apple9 = I->apple9;
+      copy->reg_constraints = I->reg_constraints;
+      agx_foreach_src(I, s) {
+         agx_index tmp = agx_temp_like(b->shader, I->src[s]);
+         remat_to(b, tmp, ctx, I->src[s].value);
+         copy->src[s] = tmp;
+      }
+      agx_builder_insert(&b->cursor, copy);
+      return copy;
+   }
    default:
       UNREACHABLE("invalid remat");
    }
@@ -364,6 +547,21 @@ remove_W_if_present(struct spill_ctx *ctx, unsigned v)
 
    if (BITSET_TEST(ctx->W, v))
       remove_W(ctx, v);
+}
+
+/* The members of a set, in increasing order, as an exactly sized array. */
+static unsigned *
+bitset_members(struct spill_ctx *ctx, const BITSET_WORD *set, unsigned *count)
+{
+   unsigned n = 0;
+   int i;
+   BITSET_FOREACH_SET(i, set, ctx->n)
+      ctx->members[n++] = i;
+
+   unsigned *out = ralloc_array(ctx->memctx, unsigned, n);
+   memcpy(out, ctx->members, n * sizeof(*out));
+   *count = n;
+   return out;
 }
 
 struct candidate {
@@ -466,6 +664,16 @@ insert_coupling_code(struct spill_ctx *ctx, agx_block *pred, agx_block *succ)
    struct spill_block *sp = spill_block(ctx, pred);
    struct spill_block *ss = spill_block(ctx, succ);
 
+   /* These scratch sets are no longer needed by the per-block MIN pass.
+    * Index the predecessor state once; repeated linear membership scans and
+    * phi scans otherwise become quadratic at large control-flow joins. Both
+    * sets are empty here and are emptied again through the same lists on
+    * return, so an edge costs its sets' sizes rather than O(n). */
+   for (unsigned i = 0; i < sp->nS_exit; ++i)
+      BITSET_SET(ctx->S, sp->S_exit[i]);
+   for (unsigned i = 0; i < sp->nW_exit; ++i)
+      BITSET_SET(ctx->W, sp->W_exit[i]);
+
    agx_foreach_phi_in_block(succ, I) {
       if (!I->dest[0].memory)
          continue;
@@ -498,15 +706,7 @@ insert_coupling_code(struct spill_ctx *ctx, agx_block *pred, agx_block *succ)
          continue;
       }
 
-      bool spilled = false;
-      for (unsigned i = 0; i < sp->nS_exit; ++i) {
-         if (sp->S_exit[i] == I->src[s].value) {
-            spilled = true;
-            break;
-         }
-      }
-
-      if (!spilled) {
+      if (!BITSET_TEST(ctx->S, I->src[s].value)) {
          /* Spill the phi source. TODO: avoid redundant spills here */
          agx_builder b =
             agx_init_builder(ctx->shader, agx_after_block_logical(pred));
@@ -530,54 +730,35 @@ insert_coupling_code(struct spill_ctx *ctx, agx_block *pred, agx_block *succ)
    /* Anything assumed to be spilled at the start of succ must be spilled along
     * all edges.
     */
+   agx_foreach_phi_in_block(succ, phi)
+      BITSET_SET(ctx->S, chase_mem_index(phi->dest[0], ctx->spill_base));
+
    for (unsigned i = 0; i < ss->nS_entry; ++i) {
       unsigned v = ss->S_entry[i];
 
-      bool spilled = false;
-      for (unsigned j = 0; j < sp->nS_exit; ++j) {
-         if (sp->S_exit[j] == v) {
-            spilled = true;
-            break;
-         }
-      }
-
-      /* We handle spilling phi destinations separately */
-      agx_foreach_phi_in_block(succ, phi) {
-         if (chase_mem_index(phi->dest[0], ctx->spill_base) == v) {
-            spilled = true;
-            break;
-         }
-      }
-
-      if (spilled)
+      /* Phi destinations are handled separately. */
+      if (BITSET_TEST(ctx->S, v))
          continue;
 
       agx_builder b = agx_init_builder(ctx->shader, agx_along_edge(pred, succ));
       insert_spill(&b, ctx, v);
    }
 
+   /* Register phi destinations are also defined along the edge. Keep W as
+    * the original predecessor set for the final phi-source reloads below. */
+   for (unsigned i = 0; i < sp->nS_exit; ++i)
+      BITSET_CLEAR(ctx->S, sp->S_exit[i]);
+   agx_foreach_phi_in_block(succ, phi)
+      BITSET_CLEAR(ctx->S, chase_mem_index(phi->dest[0], ctx->spill_base));
+   agx_foreach_phi_in_block(succ, phi) {
+      if (phi->dest[0].value < ctx->n)
+         BITSET_SET(ctx->S, phi->dest[0].value);
+   }
+
    /* Variables in W at the start of succ must be defined along the edge. */
    for (unsigned i = 0; i < ss->nW_entry; ++i) {
       unsigned node = ss->W_entry[i];
-      bool defined = false;
-
-      /* Variables live at the end of the predecessor are live along the edge */
-      for (unsigned j = 0; j < sp->nW_exit; ++j) {
-         if (sp->W_exit[j] == node) {
-            defined = true;
-            break;
-         }
-      }
-
-      /* Phis are defined along the edge */
-      agx_foreach_phi_in_block(succ, phi) {
-         if (phi->dest[0].value == node) {
-            defined = true;
-            break;
-         }
-      }
-
-      if (defined)
+      if (BITSET_TEST(ctx->W, node) || BITSET_TEST(ctx->S, node))
          continue;
 
       /* Otherwise, inserting a reload defines the variable along the edge */
@@ -603,16 +784,8 @@ insert_coupling_code(struct spill_ctx *ctx, agx_block *pred, agx_block *succ)
          continue;
       }
 
-      bool live = false;
-      for (unsigned i = 0; i < sp->nW_exit; ++i) {
-         if (sp->W_exit[i] == I->src[s].value) {
-            live = true;
-            break;
-         }
-      }
-
-      /* Fill the phi source in the predecessor */
-      if (!live) {
+      /* Fill the phi source in the predecessor. */
+      if (!BITSET_TEST(ctx->W, I->src[s].value)) {
          agx_block *reload_block = agx_edge_to_block(pred, succ);
          insert_reload(ctx, reload_block, agx_along_edge(pred, succ),
                        I->src[s].value);
@@ -621,6 +794,13 @@ insert_coupling_code(struct spill_ctx *ctx, agx_block *pred, agx_block *succ)
       /* Leave as-is for the GPR version */
       assert(!I->src[s].memory);
    }
+
+   agx_foreach_phi_in_block(succ, phi) {
+      if (phi->dest[0].value < ctx->n)
+         BITSET_CLEAR(ctx->S, phi->dest[0].value);
+   }
+   for (unsigned i = 0; i < sp->nW_exit; ++i)
+      BITSET_CLEAR(ctx->W, sp->W_exit[i]);
 }
 
 /*
@@ -828,21 +1008,95 @@ min_algorithm(struct spill_ctx *ctx)
    BITSET_FOREACH_SET(i, ctx->W, ctx->n)
       sblock->W_exit[sblock->nW_exit++] = i;
 
-   unsigned nS = __bitset_count(ctx->S, BITSET_WORDS(ctx->n));
-   sblock->S_exit = ralloc_array(ctx->memctx, unsigned, nS);
-
-   BITSET_FOREACH_SET(i, ctx->S, ctx->n)
-      sblock->S_exit[sblock->nS_exit++] = i;
-
-   assert(nS == sblock->nS_exit);
+   sblock->S_exit = bitset_members(ctx, ctx->S, &sblock->nS_exit);
    util_dynarray_fini(&local_next_ip);
 }
 
+/* Highest register demand at any instruction of a block not yet processed by
+ * the spiller, in node_size units. Rematerializable values are evicted and
+ * recreated for free, so they only count at the instructions using them.
+ * Sources are late-kill, matching min_algorithm. Also records the values
+ * the block uses.
+ */
+static unsigned
+block_max_pressure(struct spill_ctx *ctx, agx_block *block, BITSET_WORD *live,
+                   BITSET_WORD *used)
+{
+   memset(live, 0, BITSET_BYTES(ctx->n));
+   unsigned pressure = 0;
+   U_SPARSE_BITSET_FOREACH_SET(&block->live_out, i) {
+      if (i < ctx->n && !ctx->remat[i]) {
+         BITSET_SET(live, i);
+         pressure += node_size(ctx, i);
+      }
+   }
+   unsigned max = pressure;
+   agx_foreach_instr_in_block_rev(block, I) {
+      if (I->op == AGX_OPCODE_PHI)
+         break;
+      unsigned defs = 0;
+      agx_foreach_ssa_dest(I, d) {
+         unsigned v = I->dest[d].value;
+         if (v >= ctx->n)
+            continue;
+         defs += node_size(ctx, v);
+         if (BITSET_TEST(live, v)) {
+            BITSET_CLEAR(live, v);
+            pressure -= node_size(ctx, v);
+         }
+      }
+      unsigned remat_srcs = 0;
+      agx_foreach_ssa_src(I, s) {
+         unsigned v = I->src[s].value;
+         if (v >= ctx->n)
+            continue;
+         BITSET_SET(used, v);
+         if (ctx->remat[v]) {
+            remat_srcs += node_size(ctx, v);
+         } else if (!BITSET_TEST(live, v)) {
+            BITSET_SET(live, v);
+            pressure += node_size(ctx, v);
+         }
+      }
+      max = MAX2(max, pressure + remat_srcs + defs);
+   }
+   return max;
+}
+
+/* Whether a live-in value of a loop header is in a register at the end of
+ * every forward predecessor, which have already been processed.
+ */
+static bool
+in_preheader_w_exit(struct spill_ctx *ctx, agx_block *header, unsigned node)
+{
+   /* The header's own phis are defined on the entry edge */
+   agx_foreach_phi_in_block(header, phi) {
+      if (phi->dest[0].value == node)
+         return true;
+   }
+
+   agx_foreach_predecessor(header, pred) {
+      if ((*pred)->index >= header->index)
+         continue;
+      struct spill_block *sp = spill_block(ctx, *pred);
+      bool found = false;
+      for (unsigned i = 0; i < sp->nW_exit && !found; ++i)
+         found = sp->W_exit[i] == node;
+      if (!found)
+         return false;
+   }
+   return true;
+}
+
 /*
- * TODO: Implement section 4.2 of the paper.
+ * Section 4.2 of the paper: at a loop header, keep the values used inside the
+ * loop in registers, nearest next use first. Values live through the loop but
+ * unused in it (next use beyond a loop exit) are kept only in registers the
+ * loop's own peak demand leaves free; otherwise they are spilled once, before
+ * the loop, instead of being evicted and reloaded on every iteration.
  *
- * For now, we implement the simpler heuristic in Hack's thesis: sort
- * the live-in set (+ destinations of phis) by next-use distance.
+ * Without loop handling, fall back to the heuristic in Hack's thesis: sort the
+ * live-in set (+ destinations of phis) by next-use distance.
  */
 static ATTRIBUTE_NOINLINE void
 compute_w_entry_loop_header(struct spill_ctx *ctx)
@@ -864,19 +1118,79 @@ compute_w_entry_loop_header(struct spill_ctx *ctx)
    /* Sort by next-use distance */
    util_qsort_r(candidates, j, sizeof(struct candidate), cmp_dist, ctx);
 
+   /* Values live through the loop but unused in it are live in every block
+    * of the loop, so registers left for them are k minus the loop's peak
+    * demand without them.
+    */
+   unsigned through_budget = ctx->k;
+   BITSET_WORD *used = NULL;
+   if (ctx->loop_end[block->index]) {
+      unsigned end = ctx->loop_end[block->index];
+      BITSET_WORD *live = malloc(BITSET_BYTES(ctx->n));
+      used = calloc(BITSET_WORDS(ctx->n), sizeof(BITSET_WORD));
+      unsigned peak = 0;
+      agx_foreach_block_from(ctx->shader, block, b) {
+         if (b->index > end)
+            break;
+         peak = MAX2(peak, block_max_pressure(ctx, b, live, used));
+         agx_foreach_phi_in_block(b, phi) {
+            agx_foreach_ssa_src(phi, s) {
+               agx_block *pred =
+                  *util_dynarray_element(&b->predecessors, agx_block *, s);
+               if (loop_contains(ctx->loop_end, block->index, pred->index) &&
+                   phi->src[s].value < ctx->n)
+                  BITSET_SET(used, phi->src[s].value);
+            }
+         }
+      }
+      free(live);
+      unsigned through = 0;
+      for (unsigned i = 0; i < j; ++i) {
+         unsigned v = candidates[i].node;
+         if (!BITSET_TEST(used, v) && !ctx->remat[v])
+            through += node_size(ctx, v);
+      }
+      unsigned own = peak > through ? peak - through : 0;
+      through_budget = own < ctx->k ? ctx->k - own : 0;
+      if (spill_trace_loops())
+         fprintf(stderr,
+                 "SPILL_LOOP header=%u end=%u k=%u live_in=%u peak=%u "
+                 "through=%u budget=%u\n",
+                 block->index, end, ctx->k, j, peak, through, through_budget);
+   }
+
    /* Take as much as we can */
+   unsigned through_taken = 0;
    for (unsigned i = 0; i < j; ++i) {
       unsigned node = candidates[i].node;
       unsigned comps = node_size(ctx, node);
+      bool through = used && !BITSET_TEST(used, node);
 
-      if ((ctx->nW + comps) <= ctx->k) {
+      /* Reloading a value before a loop that does not use it never pays:
+       * keep it only if the preheader still has it in a register, and only
+       * in registers the loop leaves free.
+       */
+      bool fits = (ctx->nW + comps) <= ctx->k;
+      if (through) {
+         fits &= through_taken + comps <= through_budget &&
+                 in_preheader_w_exit(ctx, block, node);
+      }
+
+      if (fits) {
          insert_W(ctx, node);
          sb->W_entry[sb->nW_entry++] = node;
+         if (through)
+            through_taken += comps;
       }
+      if (spill_trace_loops())
+         fprintf(stderr, "  %%%u size=%u dist=%u%s%s\n", node, comps,
+                 candidates[i].dist, through ? " through" : "",
+                 fits ? " W" : "");
    }
 
    assert(ctx->nW <= ctx->k);
    free(candidates);
+   free(used);
 }
 
 /*
@@ -899,7 +1213,7 @@ compute_w_entry(struct spill_ctx *ctx)
    }
 
    /* Usual blocks follow */
-   unsigned *freq = calloc(ctx->n, sizeof(unsigned));
+   unsigned *freq = ctx->freq;
 
    /* Record what's written at the end of each predecessor */
    agx_foreach_predecessor(ctx->block, P) {
@@ -911,8 +1225,8 @@ compute_w_entry(struct spill_ctx *ctx)
       }
    }
 
-   struct candidate *candidates = calloc(ctx->n, sizeof(struct candidate));
-   unsigned j = 0;
+   struct util_dynarray candidate_array;
+   util_dynarray_init(&candidate_array, NULL);
 
    /* Variables that are in all predecessors are assumed in W_entry. Phis and
     * variables in some predecessors are scored by next-use.
@@ -921,12 +1235,20 @@ compute_w_entry(struct spill_ctx *ctx)
       if (freq[i] == agx_num_predecessors(ctx->block)) {
          insert_W(ctx, i);
       } else if (freq[i]) {
-         candidates[j++] = (struct candidate){.node = i, .dist = dist};
+         util_dynarray_append(&candidate_array,
+                              ((struct candidate){.node = i, .dist = dist}));
       }
    }
 
+   agx_foreach_predecessor(ctx->block, P) {
+      struct spill_block *sp = spill_block(ctx, *P);
+
+      for (unsigned i = 0; i < sp->nW_exit; ++i)
+         freq[sp->W_exit[i]] = 0;
+   }
+
    agx_foreach_phi_in_block(ctx->block, I) {
-      bool all_found = true;
+      bool all_found = true, any_found = false;
 
       agx_foreach_predecessor(ctx->block, pred) {
          struct spill_block *sp = spill_block(ctx, *pred);
@@ -945,20 +1267,28 @@ compute_w_entry(struct spill_ctx *ctx)
          }
 
          all_found &= found;
+         any_found |= found;
       }
 
       /* Heuristic: if any phi source is spilled, spill the whole phi. This is
        * suboptimal, but it massively reduces pointless fill/spill chains with
-       * massive phi webs.
+       * massive phi webs. A target may instead keep a phi whose source some
+       * predecessor still holds; coupling code reloads it on the other edges.
        */
-      if (!all_found)
+      if (!(ctx->shader->ra_target.spill_partial_phi_sources ? any_found
+                                                              : all_found))
          continue;
 
-      candidates[j++] = (struct candidate){
-         .node = I->dest[0].value,
-         .dist = search_next_uses(&sb->next_use_in, I->dest[0].value),
-      };
+      util_dynarray_append(
+         &candidate_array,
+         ((struct candidate){
+            .node = I->dest[0].value,
+            .dist = search_next_uses(&sb->next_use_in, I->dest[0].value),
+         }));
    }
+
+   struct candidate *candidates = candidate_array.data;
+   unsigned j = util_dynarray_num_elements(&candidate_array, struct candidate);
 
    /* Sort by next-use distance */
    util_qsort_r(candidates, j, sizeof(struct candidate), cmp_dist, ctx);
@@ -976,8 +1306,7 @@ compute_w_entry(struct spill_ctx *ctx)
 
    assert(ctx->nW <= ctx->k && "invariant");
 
-   free(freq);
-   free(candidates);
+   util_dynarray_fini(&candidate_array);
 }
 
 /*
@@ -1009,19 +1338,19 @@ compute_s_entry(struct spill_ctx *ctx)
 
    /* Copy ctx->S to S_entry for later look-ups with coupling code */
    struct spill_block *sb = spill_block(ctx, ctx->block);
-   unsigned nS = __bitset_count(ctx->S, BITSET_WORDS(ctx->n));
-   sb->S_entry = ralloc_array(ctx->memctx, unsigned, nS);
+   sb->S_entry = bitset_members(ctx, ctx->S, &sb->nS_entry);
+}
 
-   int i;
-   BITSET_FOREACH_SET(i, ctx->S, ctx->n)
-      sb->S_entry[sb->nS_entry++] = i;
-
-   assert(sb->nS_entry == nS);
+static int
+cmp_unsigned(const void *a, const void *b)
+{
+   unsigned x = *(const unsigned *)a, y = *(const unsigned *)b;
+   return x < y ? -1 : x > y;
 }
 
 static ATTRIBUTE_NOINLINE void
 global_next_use_distances(agx_context *ctx, void *memctx,
-                          struct spill_block *blocks)
+                          struct spill_block *blocks, const unsigned *loop_end)
 {
    u_worklist worklist;
    u_worklist_init(&worklist, ctx->num_blocks, NULL);
@@ -1039,55 +1368,102 @@ global_next_use_distances(agx_context *ctx, void *memctx,
       agx_worklist_push_head(&worklist, block);
    }
 
-   /* Definitions that have been seen */
-   BITSET_WORD *defined =
-      malloc(BITSET_WORDS(ctx->alloc) * sizeof(BITSET_WORD));
+   /* A block's upward-exposed uses and its definitions do not change while
+    * the dataflow iterates, so gather them once: the uses in first-use order
+    * with their distance from the block entry, and the definitions in
+    * ascending order. Each visit then applies the same updates as a rescan,
+    * in the same order, without touching every variable of the shader.
+    */
+   struct block_facts {
+      unsigned *gen_node;
+      uint32_t *gen_dist;
+      unsigned *kill;
+      unsigned gen_count, kill_count;
+   } *facts = rzalloc_array(memctx, struct block_facts, ctx->num_blocks);
+   BITSET_WORD *defined = calloc(BITSET_WORDS(ctx->alloc), sizeof(BITSET_WORD));
+   BITSET_WORD *used = calloc(BITSET_WORDS(ctx->alloc), sizeof(BITSET_WORD));
+   struct util_dynarray gen_node, gen_dist, kill;
+   util_dynarray_init(&gen_node, NULL);
+   util_dynarray_init(&gen_dist, NULL);
+   util_dynarray_init(&kill, NULL);
 
-   struct next_uses dists;
-   init_next_uses(&dists, NULL);
-
-   /* Iterate the work list in reverse order since liveness is backwards */
-   while (!u_worklist_is_empty(&worklist)) {
-      agx_block *blk = agx_worklist_pop_head(&worklist);
-      struct spill_block *sb = &blocks[blk->index];
-
-      /* Definitions that have been seen */
-      memset(defined, 0, BITSET_WORDS(ctx->alloc) * sizeof(BITSET_WORD));
-
-      /* Initialize all distances to infinity */
-      clear_next_uses(&dists);
-
+   agx_foreach_block(ctx, blk) {
+      struct block_facts *f = &facts[blk->index];
+      util_dynarray_clear(&gen_node);
+      util_dynarray_clear(&gen_dist);
+      util_dynarray_clear(&kill);
       uint32_t cycle = 0;
 
-      /* Calculate dists. Phis are handled separately. */
       agx_foreach_instr_in_block(blk, I) {
          if (I->op == AGX_OPCODE_PHI) {
             cycle++;
             continue;
          }
 
-         /* Record first use before def. Phi sources are handled
-          * above, because they logically happen in the
-          * predecessor.
+         /* Record first use before def. Phi sources are handled when
+          * propagating, because they logically happen in the predecessor.
           */
          agx_foreach_ssa_src(I, s) {
-            if (BITSET_TEST(defined, I->src[s].value))
+            unsigned v = I->src[s].value;
+            assert(v < ctx->alloc);
+            if (BITSET_TEST(defined, v) || BITSET_TEST(used, v))
                continue;
-            if (search_next_uses(&dists, I->src[s].value) < DIST_INFINITY)
-               continue;
-
-            assert(I->src[s].value < ctx->alloc);
-            set_next_use(&dists, I->src[s].value, cycle);
+            BITSET_SET(used, v);
+            util_dynarray_append(&gen_node, v);
+            util_dynarray_append(&gen_dist, cycle);
          }
 
          /* Record defs */
          agx_foreach_ssa_dest(I, d) {
-            assert(I->dest[d].value < ctx->alloc);
-            BITSET_SET(defined, I->dest[d].value);
+            unsigned v = I->dest[d].value;
+            assert(v < ctx->alloc);
+            if (!BITSET_TEST(defined, v)) {
+               BITSET_SET(defined, v);
+               util_dynarray_append(&kill, v);
+            }
          }
 
          cycle += instr_cycles(I);
       }
+
+      f->gen_count = util_dynarray_num_elements(&gen_node, unsigned);
+      f->kill_count = util_dynarray_num_elements(&kill, unsigned);
+      f->gen_node = ralloc_array(memctx, unsigned, MAX2(f->gen_count, 1));
+      f->gen_dist = ralloc_array(memctx, uint32_t, MAX2(f->gen_count, 1));
+      f->kill = ralloc_array(memctx, unsigned, MAX2(f->kill_count, 1));
+      memcpy(f->gen_node, gen_node.data, f->gen_count * sizeof(unsigned));
+      memcpy(f->gen_dist, gen_dist.data, f->gen_count * sizeof(uint32_t));
+      memcpy(f->kill, kill.data, f->kill_count * sizeof(unsigned));
+      qsort(f->kill, f->kill_count, sizeof(unsigned), cmp_unsigned);
+
+      for (unsigned i = 0; i < f->gen_count; ++i)
+         BITSET_CLEAR(used, f->gen_node[i]);
+      for (unsigned i = 0; i < f->kill_count; ++i)
+         BITSET_CLEAR(defined, f->kill[i]);
+   }
+
+   free(defined);
+   free(used);
+   util_dynarray_fini(&gen_node);
+   util_dynarray_fini(&gen_dist);
+   util_dynarray_fini(&kill);
+
+   struct next_uses dists, far;
+   init_next_uses(&dists, NULL);
+   init_next_uses(&far, NULL);
+
+   /* Iterate the work list in reverse order since liveness is backwards */
+   while (!u_worklist_is_empty(&worklist)) {
+      agx_block *blk = agx_worklist_pop_head(&worklist);
+      struct spill_block *sb = &blocks[blk->index];
+      const struct block_facts *f = &facts[blk->index];
+
+      /* Initialize all distances to infinity */
+      clear_next_uses(&dists);
+
+      /* Calculate dists. Phis are handled separately. */
+      for (unsigned i = 0; i < f->gen_count; ++i)
+         set_next_use(&dists, f->gen_node[i], f->gen_dist[i]);
 
       /* Apply transfer function to get our entry state. */
       foreach_next_use(&sb->next_use_out, node, dist) {
@@ -1098,10 +1474,8 @@ global_next_use_distances(agx_context *ctx, void *memctx,
          set_next_use(&sb->next_use_in, node, dist);
       }
 
-      int i;
-      BITSET_FOREACH_SET(i, defined, ctx->alloc) {
-         set_next_use(&sb->next_use_in, i, DIST_INFINITY);
-      }
+      for (unsigned i = 0; i < f->kill_count; ++i)
+         set_next_use(&sb->next_use_in, f->kill[i], DIST_INFINITY);
 
       /* Propagate the live in of the successor (blk) to the live out of
        * predecessors.
@@ -1120,6 +1494,16 @@ global_next_use_distances(agx_context *ctx, void *memctx,
             set_next_use(&dists, I->dest[0].value, DIST_INFINITY);
          }
 
+         /* Uses reached only by leaving loops are far away inside them. */
+         unsigned exits = loops_exited(ctx, loop_end, *pred, blk);
+         if (exits) {
+            clear_next_uses(&far);
+            foreach_next_use(&dists, node, dist) {
+               set_next_use(&far, node, dist_sum(dist, exits * LOOP_EXIT_DIST));
+            }
+            copy_next_uses(&dists, &far);
+         }
+
          /* Make live the corresponding source */
          agx_foreach_phi_in_block(blk, I) {
             agx_index operand = I->src[agx_predecessor_index(blk, *pred)];
@@ -1133,9 +1517,9 @@ global_next_use_distances(agx_context *ctx, void *memctx,
       }
    }
 
-   free(defined);
    u_worklist_fini(&worklist);
    destroy_next_uses(&dists);
+   destroy_next_uses(&far);
 }
 
 static ATTRIBUTE_NOINLINE void
@@ -1162,13 +1546,78 @@ validate_next_use_info(UNUSED agx_context *ctx,
 #endif
 }
 
+/* A spilled loop-invariant SSA value has the same bits on every iteration.
+ * If it is already available at the unique preheader exit, write its scratch
+ * copy there once. Do not extend a register live range through the preheader:
+ * require either an existing scratch copy or membership in its exit W set.
+ * Loop-carried phis are excluded because their destination is not live-in.
+ */
+static void
+hoist_loop_invariant_spills(agx_context *ctx, unsigned n,
+                            const struct spill_block *blocks,
+                            const unsigned *loop_end)
+{
+   if (!ctx->ra_target.defer_spill_lowering)
+      return;
+
+   agx_foreach_block(ctx, header) {
+      unsigned end = loop_end[header->index];
+      if (!end)
+         continue;
+      agx_block *preheader = NULL;
+      unsigned entries = 0;
+      agx_foreach_predecessor(header, pred) {
+         if (!loop_contains(loop_end, header->index, (*pred)->index)) {
+            preheader = *pred;
+            ++entries;
+         }
+      }
+      if (entries != 1 || preheader->successors[1] ||
+          preheader->successors[0] != header)
+         continue;
+
+      BITSET_WORD *available = calloc(BITSET_WORDS(n), sizeof(BITSET_WORD));
+      BITSET_WORD *stored = calloc(BITSET_WORDS(n), sizeof(BITSET_WORD));
+      const struct spill_block *sb = &blocks[preheader->index];
+      for (unsigned i = 0; i < sb->nW_exit; ++i)
+         BITSET_SET(available, sb->W_exit[i]);
+      for (unsigned i = 0; i < sb->nS_exit; ++i)
+         BITSET_SET(stored, sb->S_exit[i]);
+
+      agx_foreach_block_from(ctx, header, block) {
+         if (block->index > end)
+            break;
+         agx_foreach_instr_in_block_safe(block, I) {
+            if (I->op != AGX_OPCODE_MOV || !I->dest[0].memory ||
+                I->src[0].memory || I->src[0].type != AGX_INDEX_NORMAL)
+               continue;
+            unsigned v = I->src[0].value;
+            if (v >= n || I->dest[0].value != n + v ||
+                !u_sparse_bitset_test(&header->live_in, v) ||
+                (!BITSET_TEST(available, v) && !BITSET_TEST(stored, v)))
+               continue;
+            if (!BITSET_TEST(stored, v)) {
+               agx_builder b = agx_init_builder(
+                  ctx, agx_after_block_logical(preheader));
+               agx_mov_to(&b, I->dest[0], I->src[0]);
+               BITSET_SET(stored, v);
+            }
+            agx_remove_instruction(I);
+         }
+      }
+      free(available);
+      free(stored);
+   }
+}
+
 void
 agx_spill(agx_context *ctx, unsigned k, bool remat_only)
 {
    void *memctx = ralloc_context(NULL);
 
    /* We need extra registers for memory-memory swaps */
-   k -= ctx->ra_target.reserved_registers
+   k -= (ctx->ra_target.reserved_registers ||
+         ctx->ra_target.spill_reserved_registers)
            ? MAX2(ctx->ra_target.reserved_registers,
                   remat_only ? 0 : ctx->ra_target.spill_reserved_registers)
            : (remat_only ? 2 : 8);
@@ -1192,23 +1641,51 @@ agx_spill(agx_context *ctx, unsigned k, bool remat_only)
       }
    }
 
+   /* Reconstructed sources overlap their result under late-kill accounting.
+    * Reserve their temporaries without making the remaining budget smaller
+    * than one instruction's simultaneous sources and destinations. In that
+    * case limit() could evict a current source, which cannot release its
+    * register until after the instruction. This matters for forced spilling
+    * where a vector load may already consume the entire available budget. */
+   unsigned minimum = 0;
+   agx_foreach_instr_global(ctx, I) {
+      if (I->op == AGX_OPCODE_PHI)
+         continue;
+      unsigned needed = 0;
+      agx_foreach_ssa_dest(I, d)
+         needed += util_next_power_of_two(agx_index_size_16(I->dest[d]));
+      agx_foreach_ssa_src(I, s) {
+         bool duplicate = false;
+         for (unsigned prev = 0; prev < s; ++prev)
+            duplicate |= agx_is_equiv(I->src[prev], I->src[s]);
+         if (!duplicate)
+            needed += util_next_power_of_two(agx_index_size_16(I->src[s]));
+      }
+      minimum = MAX2(minimum, needed);
+   }
+   k -= find_apple9_remat(ctx, remat, memctx,
+                          k > minimum ? k - minimum : 0);
+
    struct spill_block *blocks =
       rzalloc_array(memctx, struct spill_block, ctx->num_blocks);
 
    /* Step 1. Compute global next-use distances */
-   global_next_use_distances(ctx, memctx, blocks);
+   unsigned *loop_end = compute_loop_ends(ctx, memctx);
+   global_next_use_distances(ctx, memctx, blocks, loop_end);
    validate_next_use_info(ctx, blocks);
 
    /* Reserve a memory variable for every regular variable */
    unsigned n = ctx->alloc;
    ctx->alloc *= 2;
 
-   BITSET_WORD *W = ralloc_array(memctx, BITSET_WORD, BITSET_WORDS(n));
-   BITSET_WORD *S = ralloc_array(memctx, BITSET_WORD, BITSET_WORDS(n));
+   /* W and S start each block and each edge empty; their users empty them
+    * through the block's exit lists instead of clearing all n bits. */
+   BITSET_WORD *W = rzalloc_array(memctx, BITSET_WORD, BITSET_WORDS(n));
+   BITSET_WORD *S = rzalloc_array(memctx, BITSET_WORD, BITSET_WORDS(n));
+   unsigned *freq = rzalloc_array(memctx, unsigned, n);
+   unsigned *members = ralloc_array(memctx, unsigned, n);
 
    agx_foreach_block(ctx, block) {
-      memset(W, 0, BITSET_BYTES(n));
-      memset(S, 0, BITSET_BYTES(n));
 
       struct spill_ctx sctx = {
          .memctx = memctx,
@@ -1225,11 +1702,21 @@ agx_spill(agx_context *ctx, unsigned k, bool remat_only)
          .S = S,
          .spill_base = n,
          .remat_only = remat_only,
+         .loop_end = loop_end,
+         .freq = freq,
+         .members = members,
       };
 
       compute_w_entry(&sctx);
       compute_s_entry(&sctx);
       min_algorithm(&sctx);
+
+      /* W and S now hold exactly the exit sets. */
+      struct spill_block *sb = spill_block(&sctx, block);
+      for (unsigned i = 0; i < sb->nW_exit; ++i)
+         BITSET_CLEAR(W, sb->W_exit[i]);
+      for (unsigned i = 0; i < sb->nS_exit; ++i)
+         BITSET_CLEAR(S, sb->S_exit[i]);
    }
 
    /* Now that all blocks are processed separately, stitch it together */
@@ -1255,6 +1742,7 @@ agx_spill(agx_context *ctx, unsigned k, bool remat_only)
       }
    }
 
+   hoist_loop_invariant_spills(ctx, n, blocks, loop_end);
    ralloc_free(memctx);
 
    /* Spilling breaks SSA, so we need to repair before validating */
@@ -1263,4 +1751,10 @@ agx_spill(agx_context *ctx, unsigned k, bool remat_only)
 
    /* Remat can introduce dead code */
    agx_dce(ctx, false);
+
+   if (spill_trace_loops()) {
+      fprintf(stderr, "SPILL_RESULT_BEGIN\n");
+      agx_print_shader(ctx, stderr);
+      fprintf(stderr, "SPILL_RESULT_END\n");
+   }
 }

@@ -16,6 +16,7 @@
 #include "asahi/lib/agx_linker.h"
 #include "asahi/lib/agx_nir_lower_vbo.h"
 #include "asahi/lib/agx_scratch.h"
+#include "asahi/lib/agx_primitive_count.h"
 #include "asahi/lib/agx_tilebuffer.h"
 #include "asahi/lib/agx_uvs.h"
 #include "asahi/lib/pool.h"
@@ -139,6 +140,10 @@ struct PACKED agx_draw_uniforms {
 
    /* glPointSize value */
    float fixed_point_size;
+
+   /* Viewport 0 transform, for line stipple lengths in geometry shaders */
+   float viewport_scale[2];
+   float viewport_offset[2];
 
    /* Value of the multisample control register, containing sample positions in
     * each byte (x in low nibble, y in high nibble).
@@ -291,8 +296,12 @@ struct agx_uncompiled_shader {
 
    struct {
       uint64_t inputs_read;
+      uint64_t outputs_written;
       uint64_t inputs_flat_shaded;
       uint64_t inputs_linear_shaded;
+      /* Colors read without an interpolation qualifier, which follow the
+       * shade model. Includes the matching back colors. */
+      uint64_t inputs_shade_model_colors;
       uint8_t cull_distance_size;
       bool has_edgeflags;
       bool uses_draw_id;
@@ -303,7 +312,7 @@ struct agx_uncompiled_shader {
    } info;
 
    struct hash_table *variants;
-   struct agx_uncompiled_shader *passthrough_progs[MESA_PRIM_COUNT][3][2][2];
+   struct agx_uncompiled_shader *passthrough_progs[MESA_PRIM_COUNT][3][2][2][3];
    struct agx_uncompiled_shader *passthrough_tcs[32];
 
    /* agx_fast_link_key -> agx_linked_shader */
@@ -314,6 +323,8 @@ struct agx_uncompiled_shader {
    uint8_t xfb_buffers_written;
    bool has_xfb_info;
    bool is_xfb_passthrough;
+   /* Internal passthrough GS that also forwards line stipple state */
+   bool is_line_stipple_passthrough;
 
    enum mesa_prim gs_mode;
 
@@ -396,6 +407,10 @@ uint16_t agx_sampler_heap_add(struct agx_device *dev,
  */
 #define AGX_ENCODER_PADDING 0x800
 
+/* Initial encoder sizes. VDM streams grow by linking to continuations. */
+#define AGX_VDM_ENCODER_SIZE (16 * 1024)
+#define AGX_CDM_ENCODER_SIZE 0x80000
+
 struct agx_encoder {
    struct agx_bo *bo;
    uint8_t *current;
@@ -408,6 +423,7 @@ struct agx_batch {
    uint64_t seqnum;
    uint32_t syncobj;
    uint32_t draws;
+   uint8_t primitive_count; /* Saturated at AGX_PRIMITIVE_COUNT_UNKNOWN. */
 
    struct agx_tilebuffer_layout tilebuffer_layout;
 
@@ -419,6 +435,8 @@ struct agx_batch {
    uint32_t apple9_color_store_launch;
    /* Prepare background/EOT state without emitting a rasterized draw. */
    bool apple9_preparing_tile_helper;
+   /* Draws emitted into the VDM stream; tile helpers are not among them. */
+   unsigned apple9_vdm_draws;
 
    uint64_t uploaded_clear_color[PIPE_MAX_COLOR_BUFS];
    double clear_depth;
@@ -458,6 +476,10 @@ struct agx_batch {
       unsigned bit_count;
    } bo_list;
 
+   /* Total size of the distinct BOs the batch references. The batch keeps
+    * each alive until it retires, including BOs of deleted resources. */
+   uint64_t bo_bytes;
+
    /* If true, this batch contains a shader with a potentially incoherent write
     * (e.g. image_write), needing a barrier later to access.
     */
@@ -478,6 +500,10 @@ struct agx_batch {
 
    /* Attachment snapshot and immutable draw allocations live with the batch. */
    bool apple9_render_initialized;
+   /* Attachments the batch marked valid when its state was initialized
+    * (color targets 0-7, then depth, then separate stencil). A render that
+    * is never submitted restores them, see agx_batch_undo_render_writes. */
+   uint16_t attachments_were_valid;
    struct agx_pool apple9_context_pool;
    unsigned apple9_draw_count;
    struct agx_apple9_uniform_draw apple9_previous_draw;
@@ -552,12 +578,13 @@ struct asahi_fs_shader_key {
    uint8_t apple9_sprite_coord_enable;
    bool apple9_polygon_stipple;
    bool apple9_flatshade;
-   bool padding[3];
+   bool apple9_line_stipple;
+   bool padding[2];
    struct agx_apple9_varying_layout apple9_varyings;
    struct agx_apple9_blend apple9_blend[PIPE_MAX_COLOR_BUFS];
    struct agx_apple9_sampler_key apple9_samplers[32];
 };
-static_assert(sizeof(struct asahi_fs_shader_key) == 1740, "no holes");
+static_assert(sizeof(struct asahi_fs_shader_key) == 1804, "no holes");
 
 union asahi_shader_key {
    struct asahi_vs_shader_key vs;
@@ -644,6 +671,15 @@ struct agx_oq_heap;
 
 struct agx_context {
    struct pipe_context base;
+
+   /* Nesting of draw_vbo: tile helpers and driver blits draw from inside a
+    * draw, where the batch must not be split. */
+   unsigned draw_depth;
+
+   /* Treat clip Z as [0, W] for the next draws regardless of the bound
+    * rasterizer: Apple9 driver clears use it to store depth exactly. */
+   bool force_clip_halfz;
+
    struct agx_compiled_shader *vs, *fs, *gs, *tcs;
    struct {
       struct agx_linked_shader *vs, *fs;
@@ -684,6 +720,8 @@ struct agx_context {
    uint32_t queue_id, virt_ring_idx;
 
    struct agx_batch *batch;
+   /* Preserve uncertainty across recursive software draw lowering. */
+   bool unknown_primitive_count;
    struct agx_bo *timestamps;
    uint32_t timestamp_handle;
 
@@ -709,6 +747,11 @@ struct agx_context {
    bool apple9_xfb_flatshade_first;
    struct pipe_resource *apple9_xfb_target;
    struct primconvert_context *apple9_primconvert;
+
+   /* Apple9 in-place decompression: driver-internal stores to this resource
+    * use an uncompressed descriptor while the decompress pass is recorded.
+    */
+   struct agx_resource *apple9_uncompressed_store;
    void *apple9_xfb_fs;
    void *apple9_xfb_rasterizer;
    void *apple9_xfb_unroll[MESA_PRIM_COUNT][3][2];
@@ -751,7 +794,17 @@ struct agx_context {
    struct hash_table *generic_meta;
    struct agx_bg_eot_cache bg_eot;
 
+   /* Set when work of this context failed on the GPU (its fence completed
+    * with an error) or a submission was rejected (lost or banned queue).
+    * Reported through get_device_reset_status. */
    bool any_faults;
+   /* Reset status to report once any_faults is set: guilty if our own work
+    * failed, innocent if the kernel cancelled it as collateral of another
+    * client's hang (ECANCELED), unknown if it refused our submission. */
+   enum pipe_reset_status reset_status;
+   /* Created with PIPE_CONTEXT_LOSE_CONTEXT_ON_RESET: check each completed
+    * batch's fence error. Other contexts skip that per-batch query. */
+   bool check_fence_errors;
 
    uint32_t syncobj;
    uint32_t dummy_syncobj;
@@ -958,7 +1011,17 @@ struct agx_screen {
    struct u_rwlock destroy_lock;
 
    float heap_memory_percent;
+
+   /* Flush an open batch before a draw once its BOs exceed this. */
+   uint64_t batch_memory_budget;
+   bool dual_color_blend_by_location;
 };
+
+static inline bool
+agx_clip_halfz(const struct agx_context *ctx)
+{
+   return ctx->force_clip_halfz || (ctx->rast && ctx->rast->base.clip_halfz);
+}
 
 static inline struct agx_screen *
 agx_screen(struct pipe_screen *p)
@@ -1034,16 +1097,21 @@ agx_resource_valid(struct agx_resource *rsrc, int level)
 }
 
 static inline void *
-agx_map_texture_cpu(struct agx_resource *rsrc, unsigned level, unsigned z)
+agx_map_texture_cpu(struct agx_resource *rsrc, unsigned level, unsigned z,
+                    void *transient_map)
 {
    /* Only for synchronous tile/detile copies; this pointer must not escape.
     * Mark even reads conservatively. A revoked epoch must stay revoked. */
    struct agx_bo *bo = rsrc->bo;
    if (bo->shim_cpu_epoch && *bo->shim_cpu_epoch)
       ++*bo->shim_cpu_epoch;
-   if (!bo->_map)
-      bo->dev->ops.bo_mmap(bo->dev, bo, NULL);
-   return ((uint8_t *)bo->_map) +
+   void *map = transient_map;
+   if (!map) {
+      if (!bo->_map)
+         bo->_map = bo->dev->ops.bo_mmap(bo->dev, bo, NULL, bo->size);
+      map = bo->_map;
+   }
+   return ((uint8_t *)map) +
           ail_get_layer_level_B(&rsrc->layout, z, level);
 }
 
@@ -1070,9 +1138,15 @@ void agx_legalize_compression(struct agx_context *ctx,
 struct agx_transfer {
    struct pipe_transfer base;
    void *map;
+
+   /* A 32-bit transfer owns its CPU mapping. It must not keep resources
+    * mapped for their entire GPU lifetime or invalidate another transfer. */
+   void *bo_map;
+   size_t bo_map_size;
    struct {
       struct pipe_resource *rsrc;
       struct pipe_box box;
+      struct pipe_transfer *transfer;
    } staging;
 };
 
@@ -1147,6 +1221,7 @@ agx_batch_add_bo_internal(struct agx_batch *batch, struct agx_bo *bo)
     */
    agx_bo_reference(bo);
    BITSET_SET(batch->bo_list.set, bo->handle);
+   batch->bo_bytes += bo->size;
 }
 
 static inline void
@@ -1169,6 +1244,8 @@ void agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
 void agx_flush_batch(struct agx_context *ctx, struct agx_batch *batch);
 void agx_flush_batch_for_reason(struct agx_context *ctx,
                                 struct agx_batch *batch, const char *reason);
+void agx_flush_over_budget_batches(struct agx_context *ctx);
+
 void agx_flush_all(struct agx_context *ctx, const char *reason);
 void agx_flush_readers(struct agx_context *ctx, struct agx_resource *rsrc,
                        const char *reason);
@@ -1222,6 +1299,7 @@ struct agx_batch *agx_get_batch(struct agx_context *ctx);
 struct agx_batch *agx_get_compute_batch(struct agx_context *ctx);
 void agx_batch_reset(struct agx_context *ctx, struct agx_batch *batch);
 void agx_batch_discard(struct agx_context *ctx, struct agx_batch *batch);
+void agx_batch_undo_render_writes(struct agx_batch *batch);
 int agx_cleanup_batches(struct agx_context *ctx);
 
 void agx_batch_add_timestamp_query(struct agx_batch *batch,
@@ -1301,5 +1379,9 @@ agx_texture_buffer_size_el(enum pipe_format format, uint32_t size)
    return MIN2(AGX_TEXTURE_BUFFER_MAX_SIZE, size / blocksize);
 }
 
+void agx_apple9_decompress_inplace(struct agx_context *ctx,
+                                   struct agx_resource *rsrc,
+                                   struct pipe_surface *surf,
+                                   const char *reason);
 void agx_decompress_inplace(struct agx_batch *batch, struct pipe_surface *surf,
                             const char *reason);

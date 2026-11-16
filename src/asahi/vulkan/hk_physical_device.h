@@ -28,8 +28,23 @@ struct hk_memory_heap {
    VkMemoryHeapFlags flags;
 };
 
+/* Heap usage of the whole process, across instances, for memory budgets. */
+extern uint64_t hk_process_heap_used[VK_MAX_MEMORY_HEAPS];
+
 struct hk_physical_device {
    struct vk_physical_device vk;
+
+   /* Apple9 with hk_apple9_arrayed_2d_views (driconf, vkd3d-proton): sampled
+    * 1D/2D views are one-layer arrays and 2D textures are sampled as arrays
+    * (see pack_texture). */
+   bool apple9_layered_2d;
+   /* Apple9 with hk_apple9_d3d_mip_rounding (driconf, vkd3d-proton). */
+   bool apple9_d3d_mip_rounding;
+   /* Kill switch for the qualified native-index default, not research opt-ins. */
+   bool disable_native_index;
+   /* Kill switch for batched native blocks (asahi_native_blocks). */
+   bool disable_native_blocks;
+   bool disable_native_stages;
    dev_t render_dev;
    int master_fd;
 
@@ -45,6 +60,11 @@ struct hk_physical_device {
    VkMemoryType mem_types[3];
    uint8_t mem_heap_count;
    uint8_t mem_type_count;
+   /* G16 descriptor-buffer memory: shaders address descriptor records
+    * relative to the USC aperture, so this type allocates there (write-back,
+    * as descriptor pools). UINT8_MAX when absent. Only buffers with a
+    * descriptor-buffer usage may (and must) use it. */
+   uint8_t apple9_descriptor_mem_type;
    uint64_t sysmem;
 
    struct hk_queue_family queue_families[3];
@@ -63,6 +83,17 @@ static inline struct hk_instance *
 hk_physical_device_instance(struct hk_physical_device *pdev)
 {
    return (struct hk_instance *)pdev->vk.instance;
+}
+
+/* Memory types usable by images and by buffers without a descriptor-buffer
+ * usage. */
+static inline uint32_t
+hk_general_memory_types(const struct hk_physical_device *pdev)
+{
+   uint32_t types = BITFIELD_MASK(pdev->mem_type_count);
+   if (pdev->apple9_descriptor_mem_type != UINT8_MAX)
+      types &= ~BITFIELD_BIT(pdev->apple9_descriptor_mem_type);
+   return types;
 }
 
 VkResult hk_create_drm_physical_device(struct vk_instance *vk_instance,

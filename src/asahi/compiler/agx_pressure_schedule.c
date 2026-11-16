@@ -50,13 +50,14 @@ serialize(struct sched_node *a, struct sched_node **b)
    *b = a;
 }
 
+/* last_write is indexed by value and empty on entry and on return, so a block
+ * costs its own size rather than the shader's value count. */
 static struct dag *
-create_dag(agx_context *ctx, agx_block *block, void *memctx)
+create_dag(agx_context *ctx, agx_block *block, void *memctx,
+           struct sched_node **last_write)
 {
    struct dag *dag = dag_create(ctx);
 
-   struct sched_node **last_write =
-      calloc(ctx->alloc, sizeof(struct sched_node *));
    struct sched_node *coverage = NULL;
    struct sched_node *preload = NULL;
 
@@ -146,7 +147,13 @@ create_dag(agx_context *ctx, agx_block *block, void *memctx)
          add_dep(node, preload);
    }
 
-   free(last_write);
+   agx_foreach_instr_in_block(block, I) {
+      if (instr_after_logical_end(I))
+         break;
+
+      agx_foreach_ssa_dest(I, d)
+         last_write[I->dest[d].value] = NULL;
+   }
 
    return dag;
 }
@@ -247,8 +254,13 @@ choose_instr(struct sched_ctx *s)
          }
       }
 
+      /* Newly exposed producers are appended to the ready list. On a tie
+       * which increases pressure, follow the most recently exposed producer
+       * instead of opening another expression tree. Breadth-first expansion
+       * can keep an entire reduction level live despite equal local costs. */
       if (dependency > best_dependency ||
-          (dependency == best_dependency && delta < min_delta)) {
+          (dependency == best_dependency &&
+           (delta < min_delta || (delta == min_delta && delta > 0)))) {
          best = n;
          min_delta = delta;
          best_dependency = dependency;
@@ -303,7 +315,13 @@ pressure_schedule_block(agx_context *ctx, agx_block *block, struct sched_ctx *s)
    }
 
    /* Bail if it looks like it's worse */
-   if (max_pressure > orig_max_pressure ||
+   signed limit = orig_max_pressure +
+                  (ctx->schedule_delay ? (signed)ctx->schedule_pressure_slack : 0);
+   if (ctx->schedule_delay && max_pressure > limit)
+      ctx->schedule_rejected_increase =
+         MAX2(ctx->schedule_rejected_increase,
+              (unsigned)(max_pressure - orig_max_pressure));
+   if (max_pressure > limit ||
        (max_pressure == orig_max_pressure && !ctx->schedule_delay)) {
       free(schedule);
       return;
@@ -323,9 +341,14 @@ agx_pressure_schedule(agx_context *ctx)
 {
    agx_compute_liveness(ctx);
    void *memctx = ralloc_context(ctx);
+   struct sched_node **last_write =
+      rzalloc_array(memctx, struct sched_node *, ctx->alloc);
 
    agx_foreach_block(ctx, block) {
-      struct sched_ctx sctx = {.dag = create_dag(ctx, block, memctx), .ctx = ctx};
+      struct sched_ctx sctx = {
+         .dag = create_dag(ctx, block, memctx, last_write),
+         .ctx = ctx,
+      };
       u_sparse_bitset_init(&sctx.live, ctx->alloc, memctx);
 
       pressure_schedule_block(ctx, block, &sctx);

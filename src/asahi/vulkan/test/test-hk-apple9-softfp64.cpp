@@ -14,10 +14,7 @@
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_constant_expressions.h"
 
-/* hk_shader.h also includes C-only command-packing helpers. */
-struct vk_physical_device;
-extern "C" void hk_preprocess_nir_internal(struct vk_physical_device *,
-                                          nir_shader *);
+#include "hk-apple9-test.h"
 
 namespace {
 
@@ -97,7 +94,7 @@ TEST_P(Apple9MesaSoftFP64, LibraryLoweredNativeCompile)
    EXPECT_FALSE(hk_apple9_nir_uses_double(nir));
    /* Native Vulkan defers generic preprocessing until after this fallible
     * lowering, so unsupported fused operations cannot be split first. */
-   hk_preprocess_nir_internal(nullptr, nir);
+   hk_apple9_test_preprocess_nir(nir);
    nir_validate_shader(nir, "real library output before native compile");
 
    unsigned loads = 0, stores = 0, alu_count = 0;
@@ -266,7 +263,7 @@ protected:
       ASSERT_NE(nir_shader_get_function_for_name(
          cache.library, export_name), nullptr);
       ASSERT_FALSE(hk_apple9_nir_uses_double(nir));
-      hk_preprocess_nir_internal(nullptr, nir);
+      hk_apple9_test_preprocess_nir(nir);
       nir_validate_shader(nir, "production arithmetic before CPU execution");
       nir_index_ssa_defs(nir_shader_get_entrypoint(nir));
    }

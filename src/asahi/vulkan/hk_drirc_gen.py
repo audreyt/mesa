@@ -18,6 +18,15 @@ def declare_options():
     B = drirc_gen.DrircBool
 
     misc_options = [
+        B("hk_disable_native_stages", False,
+          "Disable qualified Apple9 native GS and TES execution",
+          c_name="disable_native_stages"),
+        B("hk_disable_native_index", False,
+          "Disable qualified Apple9 native mesh index publication",
+          c_name="disable_native_index"),
+        B("hk_disable_native_blocks", False,
+          "Disable batching qualified Apple9 native mesh draws into one render",
+          c_name="disable_native_blocks"),
         B("hk_disable_border_emulation", False,
           "Disable custom border colour emulation",
           c_name="disable_border_emulation"),
@@ -30,6 +39,21 @@ def declare_options():
         B("hk_enable_vertex_pipeline_stores_atomics", False,
           "Enable vertexPipelineStoresAndAtomics",
           c_name="enable_vertex_pipeline_stores_atomics"),
+        B("hk_apple9_arrayed_2d_views", False,
+          "Apple9: sample 1D/2D views as one-layer arrays, so 2D and array declarations can share views (breaks unnormalized coordinates)",
+          c_name="apple9_arrayed_2d_views"),
+        B("hk_variable_sample_locations", False,
+          "Apple9: report variableSampleLocations (sample position changes split the render)",
+          c_name="variable_sample_locations"),
+        B("hk_enable_pixel_interlock", False,
+          "Apple9: report fragmentShaderPixelInterlock (whole-microtile ordering under MSAA, several times slower with small primitives)",
+          c_name="enable_pixel_interlock"),
+        B("hk_apple9_d3d_mip_rounding", False,
+          "Apple9: round explicit-LOD nearest mip selection half up, as D3D does",
+          c_name="apple9_d3d_mip_rounding"),
+        B("hk_defaults_loaded", False,
+          "Set by 00-hk-defaults.conf, so the driver can report it missing",
+          c_name="defaults_loaded"),
     ]
 
     debug_options = []

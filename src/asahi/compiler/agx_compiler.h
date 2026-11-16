@@ -26,8 +26,9 @@ extern "C" {
 /* u0-u255 inclusive, as pairs of 16-bits */
 #define AGX_NUM_UNIFORMS (512)
 
-/* Semi-arbitrary limit for spill slot allocation */
-#define AGX_NUM_MODELED_REGS_LOG2 (11)
+/* Model up to 32 KiB of spills, in 16-bit slots. This also covers the full
+ * Apple9 private frame rather than imposing a smaller allocator-only limit. */
+#define AGX_NUM_MODELED_REGS_LOG2 (14)
 #define AGX_NUM_MODELED_REGS      (1 << AGX_NUM_MODELED_REGS_LOG2)
 
 /* Limit on number of sources for non-phi instructions */
@@ -93,7 +94,7 @@ typedef struct {
     */
    unsigned reg : AGX_NUM_MODELED_REGS_LOG2;
    bool has_reg     : 1;
-   unsigned padding : 6;
+   unsigned padding : 17 - AGX_NUM_MODELED_REGS_LOG2;
 } agx_index;
 static_assert(sizeof(agx_index) == 8, "packed");
 
@@ -349,6 +350,10 @@ struct agx_block;
 struct agx_reg_constraint {
    uint16_t min, max, align;
    bool clobber;
+
+   /* Destination only: the instruction reads its sources before writing, so
+    * the destination may occupy registers of sources that die here. */
+   bool reuse_killed;
 };
 
 /* Keep synced with hash_instr */
@@ -478,11 +483,14 @@ typedef struct agx_block {
    BITSET_DECLARE(reg_live_in, AGX_NUM_REGS);
    BITSET_DECLARE(reg_live_out, AGX_NUM_REGS);
 
-   /* For visited blocks during register assignment and live-out registers, the
-    * mapping of registers to SSA names at the end of the block. This is dense,
-    * unlike its inverse.
+   /* Live-out SSA names and their assigned registers, sorted by SSA name.
+    * A non-NULL array also marks blocks already visited by register assignment.
     */
-   uint32_t *reg_to_ssa_out[2];
+   struct {
+      uint32_t ssa;
+      uint32_t reg;
+   } *ssa_to_reg_out;
+   unsigned nr_ssa_to_reg_out;
 
    /* Is this block a loop header? If not, all of its predecessors precede it in
     * source order.
@@ -499,6 +507,8 @@ typedef struct agx_block {
 /* Target allocation limits, in the IR's 16-bit register units. Zero selects
  * the established Apple7/8 defaults. Instruction selection and spill lowering
  * remain target-specific; SSA spilling and register assignment are shared. */
+struct agx_context;
+
 struct agx_ra_target {
    unsigned max_registers;
    unsigned reserved_registers;
@@ -512,11 +522,26 @@ struct agx_ra_target {
     * model. Targets without measured breakpoints can retain real spilling
     * while declining this optional code-size/occupancy tradeoff. */
    bool disable_occupancy_rematerialization;
+   /* At a join, keep a phi in registers when any predecessor holds its
+    * source in a register; the others reload it on their edge. Otherwise a
+    * single evicted source spills the whole phi. */
+   bool spill_partial_phi_sources;
    bool cost_register_constraints;
+   bool disable_uniform_rematerialization;
+   /* Number of half-registers directly addressable by MOV_IMM, or zero when
+    * its destination range does not add a materialization cost. */
+   uint16_t mov_imm_registers;
+   /* Optional candidate-search bound, after spilling/SSA repair and before
+    * register assignment. False rejects this candidate without allocating it.
+    * A caller must retain a completed allocation when using this callback. */
+   bool (*within_spill_budget)(const struct agx_context *ctx, void *data);
+   void *spill_budget_data;
 };
 
-typedef struct {
+typedef struct agx_context {
    struct agx_ra_target ra_target;
+   /* Static diagnostic set when constrained register allocation fails. */
+   const char *ra_error;
    /* Opaque target instructions may refine the shared scheduling classes. */
    enum agx_schedule_class (*schedule_class)(const agx_instr *instruction);
    /* Optional target implicit-resource graph, replacing scheduling classes.
@@ -524,8 +549,16 @@ typedef struct {
     * Resource bit assignments belong to the target. */
    void (*schedule_resources)(const agx_instr *instruction,
                               uint32_t *reads, uint32_t *writes);
+   /* Set when uniform rematerialization marked at least one value. */
+   bool uniform_remat_used;
    /* Relative dependency separation in issue positions, not hardware cycles. */
    unsigned (*schedule_delay)(const agx_instr *instruction);
+   /* Half-registers a latency schedule may add to a block's peak pressure. */
+   unsigned schedule_pressure_slack;
+   /* Largest peak-pressure increase of a latency reorder that was rejected
+    * for exceeding the slack, so callers can tell whether more slack changes
+    * the schedule. */
+   unsigned schedule_rejected_increase;
    nir_shader *nir;
    mesa_shader_stage stage;
    bool is_preamble;
@@ -540,6 +573,11 @@ typedef struct {
 
    /* For creating temporaries */
    unsigned alloc;
+
+   /* Opt-in spill coalescing prototype: original repair variable + 1 for each
+    * memory SSA definition, zero for other values. Reindexed with SSA. */
+   unsigned *spill_home;
+   unsigned spill_home_count;
 
    /* Does the shader statically use scratch memory? */
    bool any_scratch;
@@ -1078,8 +1116,14 @@ void agx_dce(agx_context *ctx, bool partial);
 void agx_pressure_schedule(agx_context *ctx);
 void agx_spill(agx_context *ctx, unsigned k, bool remat_only);
 void agx_repair_ssa(agx_context *ctx);
+
+struct agx_spill_interference;
+struct agx_spill_interference *agx_spill_coalesce_prepare(agx_context *ctx);
+bool agx_spill_coalesce_apply(agx_context *ctx,
+                              struct agx_spill_interference *graph,
+                              unsigned *half_slots);
 void agx_reindex_ssa(agx_context *ctx);
-void agx_ra(agx_context *ctx);
+bool agx_ra(agx_context *ctx);
 void agx_lower_64bit_postra(agx_context *ctx);
 void agx_insert_waits(agx_context *ctx);
 void agx_opt_empty_else(agx_context *ctx);

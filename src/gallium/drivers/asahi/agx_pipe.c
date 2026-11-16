@@ -8,7 +8,9 @@
 #include <errno.h>
 #include <dlfcn.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <xf86drm.h>
+#include "drm-uapi/dma-buf.h"
 #include "asahi/compiler/agx_compile.h"
 #include "asahi/layout/layout.h"
 #include "asahi/lib/decode.h"
@@ -30,8 +32,10 @@
 #include "util/format/u_format.h"
 #include "util/format/u_formats.h"
 #include "util/half_float.h"
+#include "util/libsync.h"
 #include "util/macros.h"
 #include "util/os_misc.h"
+#include "util/os_mman.h"
 #include "util/simple_mtx.h"
 #include "util/timespec.h"
 #include "util/u_drm.h"
@@ -261,6 +265,12 @@ agx_resource_from_handle(struct pipe_screen *pscreen,
    }
 
    ail_make_miptree(&rsc->layout);
+   /* A compressed import must include the complete metadata allocation. */
+   if (rsc->layout.compressed && rsc->layout.size_B > rsc->bo->size) {
+      agx_bo_unreference(dev, rsc->bo);
+      FREE(rsc);
+      return NULL;
+   }
    if (!agx_resource_layout_valid(dev, rsc)) {
       agx_bo_unreference(dev, rsc->bo);
       FREE(rsc);
@@ -396,6 +406,13 @@ agx_linear_allowed(const struct agx_resource *pres)
 
    /* Block compression not allowed with linear */
    if (util_format_is_compressed(pres->base.format))
+      return false;
+
+   /* Apple9 descriptors address a single linear layer, so a linear array
+    * could be neither sampled nor reloaded as a render target. Keep arrays
+    * tiled there unless linear is explicitly required. */
+   if (pres->base.array_size > 1 && !(pres->base.bind & PIPE_BIND_LINEAR) &&
+       agx_apple9_direct_render_enabled(agx_device(pres->base.screen)))
       return false;
 
    switch (pres->base.target) {
@@ -801,6 +818,33 @@ agx_shadow(struct agx_context *ctx, struct agx_resource *rsrc, bool needs_copy)
 }
 
 /*
+ * Wait for the dma-buf fences of a shared BO before the CPU touches it. Batch
+ * tracking only knows this context's work: what other processes or devices
+ * submit against an imported or exported buffer (for example a compositor
+ * rendering the screencast frame that we are about to read back) is ordered
+ * only by these implicit fences. A read waits for writers; a write also waits
+ * for readers.
+ */
+static void
+agx_wait_shared_bo_fences(struct agx_bo *bo, bool write)
+{
+   if (bo->prime_fd < 0)
+      return;
+
+   struct dma_buf_export_sync_file export = {
+      .flags = write ? DMA_BUF_SYNC_RW : DMA_BUF_SYNC_READ,
+      .fd = -1,
+   };
+
+   if (drmIoctl(bo->prime_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &export) ||
+       export.fd < 0)
+      return;
+
+   sync_wait(export.fd, -1);
+   close(export.fd);
+}
+
+/*
  * Perform the required synchronization before a transfer_map operation can
  * complete. This may require syncing batches.
  */
@@ -857,6 +901,10 @@ agx_prepare_for_map(struct agx_context *ctx, struct agx_resource *rsrc,
 
    /* Reading or writing from the CPU requires syncing writers. */
    agx_sync_writer(ctx, rsrc, "Unsynchronized CPU transfer");
+
+   /* Including writers outside this context, and readers before a write */
+   if (rsrc->bo->flags & AGX_BO_SHARED)
+      agx_wait_shared_bo_fences(rsrc->bo, usage & PIPE_MAP_WRITE);
 
    /* Additionally, writing needs readers synced. */
    if (!(usage & PIPE_MAP_WRITE))
@@ -955,7 +1003,20 @@ agx_alloc_staging(struct pipe_screen *screen, struct agx_resource *rsc,
    tmpl.bind =
       PIPE_BIND_LINEAR | PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW;
 
-   struct pipe_resource *pstaging = screen->resource_create(screen, &tmpl);
+   struct pipe_resource *pstaging;
+   if (agx_apple9_direct_render_enabled(agx_device(screen)) &&
+       tmpl.target == PIPE_TEXTURE_2D_ARRAY) {
+      /* Apple9's native descriptors do not support linear array strides.
+       * Use an uncompressed tiled staging image and the ordinary CPU tiling
+       * transfer for these uploads and readbacks. */
+      const uint64_t modifier = DRM_FORMAT_MOD_APPLE_GPU_TILED;
+      tmpl.usage = PIPE_USAGE_DEFAULT;
+      tmpl.bind &= ~PIPE_BIND_LINEAR;
+      pstaging = screen->resource_create_with_modifiers(screen, &tmpl,
+                                                         &modifier, 1);
+   } else {
+      pstaging = screen->resource_create(screen, &tmpl);
+   }
    if (!pstaging)
       return NULL;
 
@@ -1000,6 +1061,36 @@ agx_blit_to_staging(struct pipe_context *pctx, struct agx_transfer *trans)
    blit.filter = PIPE_TEX_FILTER_NEAREST;
 
    agx_blit(pctx, &blit);
+}
+
+/* CPU mappings consume the application's address space even after GL unmaps
+ * a transfer. In a 32-bit process, retaining every texture/buffer mapping
+ * exhausts VA long before GPU memory. Use an independent mapping owned by
+ * the transfer; persistent/coherent transfers keep it until their unmap too.
+ * The normal BO mapping may have escaped to other users and cannot be revoked.
+ */
+static void *
+agx_transfer_map_bo(struct agx_transfer *transfer, struct agx_bo *bo,
+                    bool escapes)
+{
+   if (sizeof(void *) > 4)
+      return agx_bo_map(bo);
+
+   assert(!transfer->bo_map);
+   transfer->bo_map_size = bo->size;
+   /* Tile/detile copies never expose this pointer to GL. Preserve their shim
+    * CPU epoch; only mappings that may escape must revoke epoch tracking.
+    */
+   transfer->bo_map = escapes ? agx_bo_map_range(bo, NULL, bo->size)
+                              : bo->dev->ops.bo_mmap(bo->dev, bo, NULL, bo->size);
+   return transfer->bo_map;
+}
+
+static void
+agx_transfer_unmap_bo(struct agx_transfer *transfer)
+{
+   if (transfer->bo_map)
+      os_munmap(transfer->bo_map, transfer->bo_map_size);
 }
 
 static void *
@@ -1049,6 +1140,9 @@ agx_transfer_map(struct pipe_context *pctx, struct pipe_resource *resource,
    }
 
    struct agx_transfer *transfer = CALLOC_STRUCT(agx_transfer);
+   if (!transfer)
+      return NULL;
+
    transfer->base.level = level;
    transfer->base.usage = usage;
    transfer->base.box = *box;
@@ -1067,7 +1161,8 @@ agx_transfer_map(struct pipe_context *pctx, struct pipe_resource *resource,
       /* Staging resources have one LOD: level 0. Query the strides
        * on this LOD.
        */
-      transfer->base.stride = ail_get_linear_stride_B(&staging->layout, 0);
+      if (staging->layout.tiling == AIL_TILING_LINEAR)
+         transfer->base.stride = ail_get_linear_stride_B(&staging->layout, 0);
       transfer->base.layer_stride = staging->layout.layer_stride_B;
       transfer->staging.rsrc = &staging->base;
 
@@ -1083,7 +1178,20 @@ agx_transfer_map(struct pipe_context *pctx, struct pipe_resource *resource,
          agx_sync_writer(ctx, staging, "GPU read staging blit");
       }
 
-      return agx_bo_map(staging->bo);
+      if (staging->layout.tiling != AIL_TILING_LINEAR) {
+         void *map = pctx->texture_map(pctx, &staging->base, 0, usage,
+                                       &transfer->staging.box,
+                                       &transfer->staging.transfer);
+         if (!map)
+            goto fail;
+         transfer->base.stride = transfer->staging.transfer->stride;
+         transfer->base.layer_stride = transfer->staging.transfer->layer_stride;
+         return map;
+      }
+      void *map = agx_transfer_map_bo(transfer, staging->bo, true);
+      if (!map)
+         goto fail;
+      return map;
    }
 
    if (ail_is_level_twiddled_uncompressed(&rsrc->layout, level)) {
@@ -1097,10 +1205,19 @@ agx_transfer_map(struct pipe_context *pctx, struct pipe_resource *resource,
          rsrc->layout.format, transfer->base.stride, box->height);
 
       transfer->map = calloc(transfer->base.layer_stride, box->depth);
+      if (!transfer->map)
+         goto fail;
+
+      /* Map before returning the staging pointer so allocation failure is
+       * reported by texture_map, rather than during the void unmap callback. */
+      if (sizeof(void *) == 4 &&
+          !agx_transfer_map_bo(transfer, rsrc->bo, false))
+         goto fail;
 
       if ((usage & PIPE_MAP_READ) && agx_resource_valid(rsrc, level)) {
          for (unsigned z = 0; z < box->depth; ++z) {
-            uint8_t *map = agx_map_texture_cpu(rsrc, level, box->z + z);
+            uint8_t *map =
+               agx_map_texture_cpu(rsrc, level, box->z + z, transfer->bo_map);
             uint8_t *dst =
                (uint8_t *)transfer->map + transfer->base.layer_stride * z;
 
@@ -1128,8 +1245,20 @@ agx_transfer_map(struct pipe_context *pctx, struct pipe_resource *resource,
          (uint64_t)ail_get_linear_pixel_B(&rsrc->layout, level, box->x,
                                          box->y, box->z);
 
-      return ((uint8_t *)agx_bo_map(rsrc->bo)) + offset;
+      void *map = agx_transfer_map_bo(transfer, rsrc->bo, true);
+      if (!map)
+         goto fail;
+      return ((uint8_t *)map) + offset;
    }
+
+fail:
+   agx_transfer_unmap_bo(transfer);
+   free(transfer->map);
+   pipe_resource_reference(&transfer->staging.rsrc, NULL);
+   pipe_resource_reference(&transfer->base.resource, NULL);
+   FREE(transfer);
+   *out_transfer = NULL;
+   return NULL;
 }
 
 static void
@@ -1140,6 +1269,9 @@ agx_transfer_unmap(struct pipe_context *pctx, struct pipe_transfer *transfer)
    struct agx_transfer *trans = agx_transfer(transfer);
    struct pipe_resource *prsrc = transfer->resource;
    struct agx_resource *rsrc = (struct agx_resource *)prsrc;
+
+   if (trans->staging.transfer)
+      pctx->texture_unmap(pctx, trans->staging.transfer);
 
    if (trans->staging.rsrc && (transfer->usage & PIPE_MAP_WRITE)) {
       assert(prsrc->target != PIPE_BUFFER);
@@ -1152,7 +1284,8 @@ agx_transfer_unmap(struct pipe_context *pctx, struct pipe_transfer *transfer)
 
       for (unsigned z = 0; z < transfer->box.depth; ++z) {
          uint8_t *map =
-            agx_map_texture_cpu(rsrc, transfer->level, transfer->box.z + z);
+            agx_map_texture_cpu(rsrc, transfer->level, transfer->box.z + z,
+                                trans->bo_map);
          uint8_t *src = (uint8_t *)trans->map + transfer->layer_stride * z;
 
          ail_tile(map, src, &rsrc->layout, transfer->level, transfer->stride,
@@ -1169,6 +1302,7 @@ agx_transfer_unmap(struct pipe_context *pctx, struct pipe_transfer *transfer)
    }
 
    /* Free the transfer */
+   agx_transfer_unmap_bo(trans);
    free(trans->map);
    pipe_resource_reference(&trans->staging.rsrc, NULL);
    pipe_resource_reference(&transfer->resource, NULL);
@@ -1187,6 +1321,9 @@ agx_clear(struct pipe_context *pctx, unsigned buffers,
    struct agx_context *ctx = agx_context(pctx);
    struct agx_batch *batch = agx_get_batch(ctx);
 
+   /* Only the slow clear below may override clip_halfz, and it resets it. */
+   assert(!ctx->force_clip_halfz);
+
    if (unlikely(!agx_render_condition_check(ctx)))
       return;
 
@@ -1199,9 +1336,11 @@ agx_clear(struct pipe_context *pctx, unsigned buffers,
       unsigned color_fast = fastclear & PIPE_CLEAR_COLOR;
       slowclear |= color_fast;
       fastclear &= ~color_fast;
-      /* A depth/stencil-only clear also needs a complete graphics package
-       * when no draw has created one yet. */
-      if (!batch->apple9_render_initialized)
+      /* A fast depth/stencil clear needs a render with a draw in its VDM
+       * stream: it needs the graphics package, and a render whose stream is
+       * empty is never submitted (agx_flush_batch). Without one yet, clear
+       * with a draw. */
+      if (!batch->apple9_render_initialized || !batch->apple9_vdm_draws)
          slowclear |= fastclear;
    }
 
@@ -1231,12 +1370,26 @@ agx_clear(struct pipe_context *pctx, unsigned buffers,
 
    /* Slow clears draw a fullscreen rectangle */
    if (slowclear) {
+      /* u_blitter passes the clear depth as vertex Z with an identity
+       * viewport. Apple9's [-1, 1] clip-Z lowering would round it (0.3
+       * becomes 0.29999995), so draw the clear in [0, W] clip space, where
+       * window Z is the value itself. */
+      bool exact_depth = agx_apple9_direct_render_enabled(agx_device(pctx->screen)) &&
+                         (slowclear & PIPE_CLEAR_DEPTH);
+      if (exact_depth) {
+         ctx->force_clip_halfz = true;
+         ctx->dirty |= AGX_DIRTY_VS_PROG | AGX_DIRTY_RS | AGX_DIRTY_VIEWPORT;
+      }
       agx_blitter_save(ctx, ctx->blitter, ASAHI_CLEAR);
       util_blitter_clear(
          ctx->blitter, ctx->framebuffer.width, ctx->framebuffer.height,
          util_framebuffer_get_num_layers(&ctx->framebuffer), slowclear, color,
          depth, stencil,
          util_framebuffer_get_num_samples(&ctx->framebuffer) > 1);
+      if (exact_depth) {
+         ctx->force_clip_halfz = false;
+         ctx->dirty |= AGX_DIRTY_VS_PROG | AGX_DIRTY_RS | AGX_DIRTY_VIEWPORT;
+      }
    }
 
    if (fastclear)
@@ -1818,8 +1971,27 @@ agx_flush_batch(struct agx_context *ctx, struct agx_batch *batch)
       has_cdm = true;
    }
 
+   /* An Apple9 render with no draw in its VDM stream hangs G16 (piglit
+    * vao-broken-attrib: the only draw was rejected after the tile helpers
+    * were prepared). Never submit one: drop it like any other render that is
+    * not submitted. Clears are drawn or follow a draw (see agx_clear), so a
+    * clear is only lost here if its own draw was rejected. */
+   bool apple9_empty =
+      agx_apple9_direct_render_enabled(agx_device(ctx->base.screen)) &&
+      batch->vdm.bo && batch->initialized && !batch->apple9_vdm_draws;
+   if (apple9_empty && batch->clear) {
+      static bool warned;
+      if (!warned) {
+         mesa_logw("Apple9: dropping a clear whose render has no draw");
+         warned = true;
+      }
+   }
    if (batch->vdm.bo && (batch->clear || batch->initialized)) {
-      has_vdm = agx_flush_render(ctx, batch, &render);
+      has_vdm = !apple9_empty && agx_flush_render(ctx, batch, &render);
+
+      /* The render half is dropped: nothing it recorded reaches the GPU. */
+      if (!has_vdm && batch->initialized)
+         agx_batch_undo_render_writes(batch);
    }
 
    if (!has_cdm && !has_vdm) {
@@ -1916,7 +2088,9 @@ asahi_get_device_reset_status(struct pipe_context *pipe)
 {
    struct agx_context *ctx = agx_context(pipe);
 
-   return ctx->any_faults ? PIPE_GUILTY_CONTEXT_RESET : PIPE_NO_RESET;
+   if (!ctx->any_faults)
+      return PIPE_NO_RESET;
+   return ctx->reset_status;
 }
 
 static void
@@ -1968,6 +2142,10 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
 
    if (!ctx)
       return NULL;
+
+   /* Robust (lose-context-on-reset) contexts poll for failed GPU work; other
+    * contexts only learn about failures from rejected submissions. */
+   ctx->check_fence_errors = flags & PIPE_CONTEXT_LOSE_CONTEXT_ON_RESET;
 
    pctx->screen = screen;
    pctx->priv = priv;
@@ -2177,6 +2355,17 @@ agx_init_shader_caps(struct pipe_screen *pscreen)
          caps->max_shader_buffers = caps->max_shader_images = 0;
          caps->max_texture_samplers = caps->max_sampler_views = 16;
       }
+   }
+
+   /* Apple9 has no native launch path for the tessellation control stage or
+    * the libagx tessellator yet. Report no tessellation stages so
+    * ARB_tessellation_shader stays hidden instead of aborting at draw time.
+    */
+   if (agx_apple9_direct_render_enabled(agx_device(pscreen))) {
+      memset((void *)&pscreen->shader_caps[MESA_SHADER_TESS_CTRL], 0,
+             sizeof(pscreen->shader_caps[MESA_SHADER_TESS_CTRL]));
+      memset((void *)&pscreen->shader_caps[MESA_SHADER_TESS_EVAL], 0,
+             sizeof(pscreen->shader_caps[MESA_SHADER_TESS_EVAL]));
    }
 }
 
@@ -2458,10 +2647,12 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
       /* Point size is carried by the vertex output interface. */
       caps->point_size_fixed = PIPE_POINT_SIZE_LOWER_ALWAYS;
       caps->robust_buffer_access_behavior = false;
-      /* EGL robustness context creation requires a contract we cannot provide. */
-      caps->device_reset_status_query = false;
-      /* The Apple9 texture compiler does not lower external sampler dimensions. */
-      caps->texture_external = false;
+      /* Lost-context reporting (EGL_EXT_create_context_robustness, reset
+       * status queries) works: failed work and rejected submissions mark the
+       * context lost instead of aborting. Robust buffer access stays off. */
+      caps->device_reset_status_query = true;
+      /* External textures are sampled as 2D views. */
+      caps->texture_external = true;
       /* Cull distances still need primitive rejection lowering. */
       caps->cull_distance = false;
       /* One RGBA8 tile-output slot per active color attachment. */
@@ -2471,21 +2662,28 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
       caps->fbfetch = 0;
       caps->blend_equation_advanced = true;
       caps->max_dual_source_render_targets = 1;
-      caps->shader_stencil_export = false;
+      /* The fragment compiler exports stencil with the depth publication,
+       * as Honeykrisp's shaderStencilExport does. */
+      caps->shader_stencil_export = true;
       caps->framebuffer_no_attachment = false;
-      caps->texture_mirror_clamp_to_edge = false;
+      /* Native sampler address mode 5 (agx_apple9_pack_sampler). */
+      caps->texture_mirror_clamp_to_edge = true;
       caps->texture_buffer_objects = true;
       /* RGB32 views consume three physical scalar texels per logical texel. */
       caps->max_texel_buffer_elements = AGX_TEXTURE_BUFFER_MAX_SIZE / 4;
       caps->max_texture_array_layers = 2048;
       caps->max_texture_cube_levels = 15;
       caps->max_texture_3d_levels = 12;
-      caps->cube_map_array = false;
+      /* Cube arrays use the native cube-array descriptor and sample form. */
+      caps->cube_map_array = true;
       caps->seamless_cube_map = true;
-      caps->seamless_cube_map_per_texture = false;
+      /* Seamless filtering is per sampler in the native descriptor and the
+       * compiler key, so it can come from texture state too. */
+      caps->seamless_cube_map_per_texture = true;
       caps->image_load_formatted = false;
       caps->image_store_formatted = false;
-      caps->max_texture_gather_components = 0;
+      /* Gathers use the native gather sample, including constant offsets. */
+      caps->max_texture_gather_components = 4;
       caps->max_varyings = AGX_APPLE9_MAX_VARYING_COMPONENTS / 4;
       caps->doubles = false;
    }
@@ -2529,7 +2727,7 @@ agx_is_format_supported(struct pipe_screen *pscreen, enum pipe_format format,
       if ((usage & PIPE_BIND_RENDER_TARGET) &&
           ((target != PIPE_TEXTURE_1D && target != PIPE_TEXTURE_1D_ARRAY &&
             target != PIPE_TEXTURE_RECT && target != PIPE_TEXTURE_2D &&
-            target != PIPE_TEXTURE_CUBE &&
+            target != PIPE_TEXTURE_CUBE && target != PIPE_TEXTURE_CUBE_ARRAY &&
             target != PIPE_TEXTURE_2D_ARRAY && target != PIPE_TEXTURE_3D) ||
            (!agx_apple9_color_is_wide(format) &&
             !agx_apple9_color_is_packed(format) &&
@@ -2555,6 +2753,7 @@ agx_is_format_supported(struct pipe_screen *pscreen, enum pipe_format format,
           ((target != PIPE_BUFFER && target != PIPE_TEXTURE_2D && target != PIPE_TEXTURE_1D &&
             target != PIPE_TEXTURE_1D_ARRAY && target != PIPE_TEXTURE_RECT &&
             target != PIPE_TEXTURE_3D && target != PIPE_TEXTURE_CUBE &&
+            target != PIPE_TEXTURE_CUBE_ARRAY &&
             target != PIPE_TEXTURE_2D_ARRAY) ||
            !(agx_apple9_texture_format_supported(format) ||
              (target == PIPE_BUFFER && agx_apple9_texture_is_rgb32(format)))))
@@ -2759,6 +2958,9 @@ agx_screen_create(int fd, struct renderonly *ro,
    driParseConfigFiles(config->options, config->options_info,
                        &(driConfigFileParseParams) { .driverName = "asahi" });
 
+   agx_screen->dual_color_blend_by_location =
+      driQueryOptionb(config->options, "dual_color_blend_by_location");
+
    agx_screen->dev.fd = fd;
    agx_screen->dev.ro = ro;
    u_rwlock_init(&agx_screen->destroy_lock);
@@ -2795,6 +2997,15 @@ agx_screen_create(int fd, struct renderonly *ro,
       driQueryOptionf(config->options, "heap_memory_percent");
    if (agx_screen->heap_memory_percent == OS_GPU_HEAP_SIZE_HEURISTIC)
       agx_screen->heap_memory_percent = 1.0f;
+
+   /* Like zink's oom flush, bound the memory one open batch can keep alive,
+    * e.g. a stream of upload-draw-delete textures that never flushes. An
+    * eighth of system memory leaves render passes with large working sets
+    * unsplit. */
+   uint64_t total_memory = 0;
+   if (!os_get_total_physical_memory(&total_memory))
+      total_memory = 8ull << 30;
+   agx_screen->batch_memory_budget = MAX2(total_memory / 8, 512ull << 20);
 
    screen->destroy = agx_destroy_screen;
    screen->get_screen_fd = agx_screen_get_fd;

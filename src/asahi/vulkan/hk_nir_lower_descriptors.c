@@ -10,9 +10,9 @@
 #include "agx_nir_texture.h"
 #include "hk_cmd_buffer.h"
 #include "hk_descriptor_set.h"
+#include "hk_descriptor_buffer.h"
 #include "hk_descriptor_set_layout.h"
 #include "hk_shader.h"
-#include "hk_apple9_root.h"
 
 #include "nir.h"
 #include "nir_builder.h"
@@ -25,8 +25,8 @@
 struct lower_descriptors_ctx {
    const struct hk_descriptor_set_layout *set_layouts[HK_MAX_SETS];
 
+   bool root_uniform;
    bool clamp_desc_array_bounds;
-   bool apple9_buffers_only;
    nir_address_format ubo_addr_format;
    nir_address_format ssbo_addr_format;
 };
@@ -67,21 +67,47 @@ lower_load_constant(nir_builder *b, nir_intrinsic_instr *load,
                     const struct lower_descriptors_ctx *ctx)
 {
    assert(load->intrinsic == nir_intrinsic_load_constant);
-   UNREACHABLE("todo: stick an address in the root descriptor or something");
-
-   uint32_t base = nir_intrinsic_base(load);
-   uint32_t range = nir_intrinsic_range(load);
-
    b->cursor = nir_before_instr(&load->instr);
 
-   nir_def *offset = nir_iadd_imm(b, load->src[0].ssa, base);
-   nir_def *data = nir_load_ubo(
-      b, load->def.num_components, load->def.bit_size, nir_imm_int(b, 0),
-      offset, .align_mul = nir_intrinsic_align_mul(load),
-      .align_offset = nir_intrinsic_align_offset(load), .range_base = base,
-      .range = range);
+   /* Extraction happens before stage emulation/cloning, so every variant
+    * addresses the same immutable data through its API stage's root slot.
+    */
+   unsigned slot = hk_root_descriptor_offset(constant_data) +
+                   b->shader->info.stage * sizeof(uint64_t);
+   /* G16 binds the root table as UBO 0, just as for descriptor-set roots.
+    * Read the pointer directly from that uniform binding instead of fetching
+    * the root address and then loading the pointer from global memory.
+    * The driver always uploads this root word, even when the shader does
+    * not enter the branch using its table, so fetching it can speculate.
+    */
+   nir_def *addr = ctx->root_uniform
+      ? nir_load_ubo(b, 1, 64, nir_imm_int(b, 0), nir_imm_int(b, slot),
+                     .align_mul = 8, .range_base = slot, .range = 8,
+                     .access = ACCESS_CAN_SPECULATE)
+      : load_root(b, 1, 64, nir_imm_int(b, slot), 8);
+   nir_def *offset = nir_iadd_imm(b, load->src[0].ssa,
+                                 nir_intrinsic_base(load));
 
-   nir_def_rewrite_uses(&load->def, data);
+   unsigned bytes = load->def.num_components * load->def.bit_size / 8;
+   assert(bytes <= b->shader->constant_data_size);
+   unsigned align = nir_intrinsic_align_mul(load);
+   unsigned align_offset = (nir_intrinsic_align_offset(load) +
+                            nir_intrinsic_base(load)) % align;
+   unsigned last = b->shader->constant_data_size - bytes;
+   assert(last >= align_offset);
+   last = align_offset + ((last - align_offset) & ~(align - 1));
+
+   /* An out-of-range constant array index is undefined, but must not fault
+    * or read outside the shader allocation. Preserve the load's alignment.
+    */
+   offset = nir_umin(b, offset, nir_imm_int(b, last));
+   nir_def *data = nir_load_global_constant(
+      b, load->def.num_components, load->def.bit_size,
+      nir_iadd(b, addr, nir_u2u64(b, offset)), .align_mul = align,
+      .align_offset = align_offset,
+      .access = ACCESS_CAN_SPECULATE | ACCESS_IN_BOUNDS);
+
+   nir_def_replace(&load->def, data);
 
    return true;
 }
@@ -558,8 +584,6 @@ try_lower_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
 {
    switch (intrin->intrinsic) {
    case nir_intrinsic_load_constant:
-      if (ctx->apple9_buffers_only)
-         return false;
       return lower_load_constant(b, intrin, ctx);
 
    case nir_intrinsic_load_vulkan_descriptor:
@@ -585,11 +609,14 @@ try_lower_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
    case nir_intrinsic_image_deref_size:
    case nir_intrinsic_image_deref_samples:
    case nir_intrinsic_image_deref_store_block_agx:
-      if (ctx->apple9_buffers_only)
-         return false;
       return lower_image_intrin(b, intrin, ctx);
 
    case nir_intrinsic_load_num_workgroups: {
+      /* Task and mesh workgroup counts are lowered with their stages. */
+      if (b->shader->info.stage == MESA_SHADER_TASK ||
+          b->shader->info.stage == MESA_SHADER_MESH)
+         return false;
+
       b->cursor = nir_instr_remove(&intrin->instr);
 
       unsigned offset = hk_root_descriptor_offset(cs.group_count_addr);
@@ -603,6 +630,18 @@ try_lower_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
    default:
       return false;
    }
+}
+
+/* Bytes per plane of a G16 sampled descriptor, see hk_apple9_image_part. */
+static unsigned
+apple9_record_size(VkDescriptorType type)
+{
+   return type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+             ? sizeof(struct hk_apple9_image_part) +
+                  sizeof(struct hk_apple9_sampler_part)
+          : type == VK_DESCRIPTOR_TYPE_SAMPLER
+             ? sizeof(struct hk_apple9_sampler_part)
+             : sizeof(struct hk_apple9_image_part);
 }
 
 static bool
@@ -621,20 +660,74 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
    nir_def *plane_ssa = nir_steal_tex_src(tex, nir_tex_src_plane);
    const uint32_t plane =
       plane_ssa ? nir_src_as_uint(nir_src_for_ssa(plane_ssa)) : 0;
-   const uint64_t plane_offset_B =
-      plane * sizeof(struct hk_sampled_image_descriptor);
+   uint32_t tex_set, tex_binding;
+   nir_def *tex_index;
+   get_resource_deref_binding(b, nir_src_as_deref(nir_src_for_ssa(texture)),
+                              &tex_set, &tex_binding, &tex_index);
+   const struct hk_descriptor_set_layout *tex_layout =
+      ctx->set_layouts[tex_set];
+   const struct hk_device *dev =
+      (const struct hk_device *)tex_layout->vk.base.device;
+   /* Planes are consecutive descriptors. On G16 each plane is a whole
+    * record: an image part, followed by a sampler part in combined image
+    * samplers. A texture and sampler taken from one variable (a combined
+    * image sampler, including one stored in a mutable binding) read the
+    * plane's sampler part. Separate texture and sampler variables read
+    * separate records, even when they alias one mutable binding. */
+   const bool g16 = agx_is_apple9(&dev->dev);
+   if (g16 && tex->sampler_dim != GLSL_SAMPLER_DIM_BUF &&
+       (tex->op == nir_texop_txs || tex->op == nir_texop_query_levels ||
+        tex->op == nir_texop_texture_samples))
+      tex->backend_flags |= AGX_TEXTURE_FLAG_METADATA_QUERY;
+   uint64_t plane_size_B = sizeof(struct hk_sampled_image_descriptor);
+   bool combined = false;
+   uint32_t s_set = 0, s_binding = 0;
+   if (sampler) {
+      nir_def *s_index;
+      get_resource_deref_binding(b, nir_src_as_deref(nir_src_for_ssa(sampler)),
+                                 &s_set, &s_binding, &s_index);
+      /* Resource derefs are variable-rooted (get_resource_deref_binding). */
+      nir_variable *s_var = nir_deref_instr_get_variable(
+         nir_src_as_deref(nir_src_for_ssa(sampler)));
+      nir_variable *t_var = nir_deref_instr_get_variable(
+         nir_src_as_deref(nir_src_for_ssa(texture)));
+      assert(s_var && t_var);
+      combined = s_var == t_var;
+   }
+   if (g16) {
+      plane_size_B = apple9_record_size(
+         combined ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                  : get_binding_layout(tex_set, tex_binding, ctx)->type);
+   }
+   const uint64_t plane_offset_B = plane * plane_size_B;
+   uint64_t sampler_part_B = plane_offset_B;
+   if (g16 && sampler) {
+      /* A sampler variable on a combined image sampler binding still reads
+       * the binding's sampler part, after the image part. */
+      const VkDescriptorType s_type = get_binding_layout(s_set, s_binding, ctx)->type;
+      sampler_part_B =
+         combined ? plane_offset_B + sizeof(struct hk_apple9_image_part)
+                  : plane * apple9_record_size(s_type) +
+                       (s_type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                           ? sizeof(struct hk_apple9_image_part) : 0);
+   }
 
    /* LOD bias is passed in the descriptor set, rather than embedded into
     * the sampler descriptor. There's no spot in the hardware descriptor,
     * plus this saves on precious sampler heap spots.
     */
    if (tex->op == nir_texop_lod_bias) {
+      const bool nudge = tex->backend_flags & HK_TEX_TXL_NUDGE;
       unsigned offs =
-         offsetof(struct hk_sampled_image_descriptor, lod_bias_fp16);
+         g16 ? sampler_part_B +
+                  (nudge ? offsetof(struct hk_apple9_sampler_part, txl_nudge_fp16)
+                         : offsetof(struct hk_apple9_sampler_part, lod_bias_fp16))
+         : plane_offset_B +
+              (nudge ? offsetof(struct hk_sampled_image_descriptor, txl_nudge_fp16)
+                     : offsetof(struct hk_sampled_image_descriptor, lod_bias_fp16));
 
       nir_def *bias = load_resource_deref_desc(
-         b, 1, 16, nir_src_as_deref(nir_src_for_ssa(sampler)),
-         plane_offset_B + offs, ctx);
+         b, 1, 16, nir_src_as_deref(nir_src_for_ssa(sampler)), offs, ctx);
 
       nir_def_replace(&tex->def, bias);
       return true;
@@ -644,10 +737,12 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
       assert(tex->dest_type == nir_type_float16 ||
              tex->dest_type == nir_type_uint16);
 
+      const bool fp16 = tex->dest_type == nir_type_float16;
       unsigned offs =
-         tex->dest_type == nir_type_float16
-            ? offsetof(struct hk_sampled_image_descriptor, min_lod_fp16)
-            : offsetof(struct hk_sampled_image_descriptor, min_lod_uint16);
+         g16 ? (fp16 ? offsetof(struct hk_apple9_image_part, min_lod_fp16)
+                     : offsetof(struct hk_apple9_image_part, min_lod_uint16))
+             : (fp16 ? offsetof(struct hk_sampled_image_descriptor, min_lod_fp16)
+                     : offsetof(struct hk_sampled_image_descriptor, min_lod_uint16));
 
       nir_def *min = load_resource_deref_desc(
          b, 1, 16, nir_src_as_deref(nir_src_for_ssa(texture)),
@@ -657,7 +752,9 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
       return true;
    }
 
+   /* G16 exposes no custom border colors, so these are G13 only. */
    if (tex->op == nir_texop_has_custom_border_color_agx) {
+      assert(!g16);
       unsigned offs = offsetof(struct hk_sampled_image_descriptor,
                                clamp_0_sampler_index_or_negative);
 
@@ -670,6 +767,7 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
    }
 
    if (tex->op == nir_texop_custom_border_color_agx) {
+      assert(!g16);
       unsigned offs = offsetof(struct hk_sampled_image_descriptor, border);
 
       nir_def *border = load_resource_deref_desc(
@@ -684,16 +782,45 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
    }
 
    {
+      /* On G16 the handle is the image part's address. */
       unsigned offset_B =
-         plane_offset_B + offsetof(struct hk_sampled_image_descriptor, tex);
+         g16 ? plane_offset_B
+             : plane_offset_B + offsetof(struct hk_sampled_image_descriptor, tex);
 
       nir_def *handle =
          load_image_handle(b, ctx, nir_src_for_ssa(texture), offset_B);
 
       nir_tex_instr_add_src(tex, nir_tex_src_texture_handle, handle);
+
+      const unsigned set = tex_set, binding = tex_binding;
+      const VkDescriptorBindingFlags late =
+         VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
+         VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT |
+         VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
+         VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
+      if (agx_is_apple9(&dev->dev) &&
+          (get_binding_layout(set, binding, ctx)->flags & late))
+         tex->backend_flags |= HK_APPLE9_TEX_DESCRIPTOR_HANDLE;
    }
 
-   if (sampler != NULL) {
+   if (sampler != NULL && g16) {
+      /* The handle is the sampler part's address; G16 has no sampler heap
+       * index. */
+      uint32_t set, binding;
+      nir_def *idx;
+      get_resource_deref_binding(b, nir_src_as_deref(nir_src_for_ssa(sampler)),
+                                 &set, &binding, &idx);
+      const struct hk_descriptor_set_binding_layout *binding_layout =
+         get_binding_layout(set, binding, ctx);
+      if (ctx->clamp_desc_array_bounds)
+         idx = nir_umin(b, idx, nir_imm_int(b, binding_layout->array_size - 1));
+      nir_def *desc_offs_B = nir_iadd_imm(
+         b, nir_amul_imm(b, idx, binding_layout->stride),
+         binding_layout->offset + sampler_part_B);
+      nir_tex_instr_add_src(tex, nir_tex_src_sampler_handle,
+         nir_bindless_sampler_agx(b, desc_offs_B, nir_imm_intN_t(b, 0, 16),
+                                  .desc_set = set));
+   } else if (sampler != NULL) {
       unsigned offs =
          offsetof(struct hk_sampled_image_descriptor, sampler_index);
       bool clamp_to_0 = tex->backend_flags & AGX_TEXTURE_FLAG_CLAMP_TO_0;
@@ -744,8 +871,6 @@ try_lower_descriptors_instr(nir_builder *b, nir_instr *instr, void *_data)
 
    switch (instr->type) {
    case nir_instr_type_tex:
-      if (ctx->apple9_buffers_only)
-         return false;
       return lower_tex(b, nir_instr_as_tex(instr), ctx);
    case nir_instr_type_intrinsic:
       return try_lower_intrin(b, nir_instr_as_intrinsic(instr), ctx);
@@ -911,15 +1036,15 @@ lower_ssbo_descriptor(nir_builder *b, nir_intrinsic_instr *intr, void *_data)
    }
 }
 
-static bool
-lower_descriptors(nir_shader *nir,
-                  const struct vk_pipeline_robustness_state *rs,
-                  uint32_t set_layout_count,
-                  struct vk_descriptor_set_layout *const *set_layouts,
-                  bool apple9_buffers_only)
+bool
+hk_nir_lower_descriptors(nir_shader *nir,
+                         const struct vk_pipeline_robustness_state *rs,
+                         uint32_t set_layout_count,
+                         struct vk_descriptor_set_layout *const *set_layouts,
+                         bool root_uniform)
 {
    struct lower_descriptors_ctx ctx = {
-      .apple9_buffers_only = apple9_buffers_only,
+      .root_uniform = root_uniform,
       .clamp_desc_array_bounds =
          rs->storage_buffers !=
             VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT ||
@@ -951,22 +1076,4 @@ lower_descriptors(nir_shader *nir,
       nir, lower_ssbo_descriptor, nir_metadata_control_flow, &ctx);
 
    return pass_lower_descriptors || pass_lower_ssbo;
-}
-
-bool
-hk_nir_lower_descriptors(nir_shader *nir,
-                        const struct vk_pipeline_robustness_state *rs,
-                        uint32_t set_layout_count,
-                        struct vk_descriptor_set_layout *const *set_layouts)
-{
-   return lower_descriptors(nir, rs, set_layout_count, set_layouts, false);
-}
-
-bool
-hk_nir_lower_buffer_descriptors(
-   nir_shader *nir, const struct vk_pipeline_robustness_state *rs,
-   uint32_t set_layout_count,
-   struct vk_descriptor_set_layout *const *set_layouts)
-{
-   return lower_descriptors(nir, rs, set_layout_count, set_layouts, true);
 }

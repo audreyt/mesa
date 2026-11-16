@@ -5,16 +5,20 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_device.h"
+#include "hk_apple9_mesh.h"
+#include "pipe/p_defines.h"
+#include "agx_timeline.h"
+#include "vk_util.h"
+#include "wsi_common_entrypoints.h"
 
 #include "agx_bg_eot.h"
-#include "asahi/compiler/agx_apple9_profile.h"
-#include "asahi/lib/agx_apple9_compute.h"
-#include "asahi/lib/agx_apple9_launch.h"
+#include "agx_apple9.h"
 #include "agx_helpers.h"
 #include "agx_scratch.h"
 #include "hk_cmd_buffer.h"
 #include "hk_descriptor_table.h"
 #include "hk_entrypoints.h"
+#include "hk_image.h"
 #include "hk_instance.h"
 #include "hk_physical_device.h"
 #include "hk_shader.h"
@@ -36,10 +40,11 @@
 #include "vk_device.h"
 #include "vk_pipeline_cache.h"
 #include "vk_shader.h"
+#include "hk_queue.h"
+#include "util/u_debug.h"
+#include <xf86drm.h>
 
 #include <fcntl.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <xf86drm.h>
 
 /* clang-format off */
@@ -91,6 +96,8 @@ hk_upload_rodata(struct hk_device *dev)
     */
    offs = align(offs, sizeof(uint64_t));
    dev->rodata.heap = dev->rodata.bo->va->addr + offs;
+   offs += sizeof(struct poly_heap);
+   dev->rodata.mesh_heap = dev->rodata.bo->va->addr + offs;
    offs += sizeof(struct poly_heap);
 
    return VK_SUCCESS;
@@ -147,6 +154,51 @@ hk_destroy_internal_shaders(struct hk_device *dev,
    simple_mtx_destroy(&s->lock);
 }
 
+/* Immutable state shares device-owned USC slabs. Each shader or view owns
+ * its allocation; addresses stay fixed for the lifetime of that object. */
+static bool
+hk_usc_slab_create(void *data, uint64_t size, uint64_t reserve,
+                   struct hk_descriptor_backing *out)
+{
+   struct hk_device *dev = data;
+   assert(!reserve);
+   struct agx_bo *bo = agx_bo_create(
+      &dev->dev, size, 0, AGX_BO_LOW_VA | AGX_BO_READONLY | AGX_BO_WRITEBACK,
+      "Immutable USC state");
+   if (!bo)
+      return false;
+   *out = (struct hk_descriptor_backing){
+      .bo = bo, .addr = bo->va->addr, .map = agx_bo_map(bo), .size = bo->size,
+   };
+   return true;
+}
+
+static void
+hk_usc_slab_destroy(void *data, struct hk_descriptor_backing *backing)
+{
+   struct hk_device *dev = data;
+   agx_bo_unreference(&dev->dev, backing->bo);
+}
+
+static const struct hk_descriptor_memory_ops hk_usc_ops = {
+   .create = hk_usc_slab_create,
+   .destroy = hk_usc_slab_destroy,
+};
+
+void
+hk_device_init_usc_heap(struct hk_device *dev)
+{
+   simple_mtx_init(&dev->usc_heap_lock, mtx_plain);
+   hk_usc_heap_init(&dev->usc_heap, &hk_usc_ops, dev);
+}
+
+void
+hk_device_finish_usc_heap(struct hk_device *dev)
+{
+   hk_usc_heap_finish(&dev->usc_heap);
+   simple_mtx_destroy(&dev->usc_heap_lock);
+}
+
 DERIVE_HASH_TABLE(agx_sampler_packed);
 
 static VkResult
@@ -178,11 +230,18 @@ hk_destroy_sampler_heap(struct hk_device *dev, struct hk_sampler_heap *h)
 
 static VkResult
 hk_sampler_heap_add_locked(struct hk_device *dev, struct hk_sampler_heap *h,
-                           struct agx_sampler_packed desc,
+                           struct agx_sampler_packed desc, uint32_t index,
                            struct hk_rc_sampler **out)
 {
    struct hash_entry *ent = _mesa_hash_table_search(h->ht, &desc);
    if (ent != NULL) {
+      /* Identical samplers share an entry at capture, and so at replay. */
+      if (index != HK_DESCRIPTOR_TABLE_ANY_INDEX &&
+          ((struct hk_rc_sampler *)ent->data)->index != index)
+         return vk_errorf(dev, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
+                          "Sampler replayed at index %u, already at %u",
+                          index, ((struct hk_rc_sampler *)ent->data)->index);
+
       *out = ent->data;
 
       assert((*out)->refcount != 0);
@@ -195,7 +254,6 @@ hk_sampler_heap_add_locked(struct hk_device *dev, struct hk_sampler_heap *h,
    if (!rc)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
-   uint32_t index;
    VkResult result =
       hk_descriptor_table_add(dev, &h->table, &desc, sizeof(desc), &index);
    if (result != VK_SUCCESS) {
@@ -217,12 +275,12 @@ hk_sampler_heap_add_locked(struct hk_device *dev, struct hk_sampler_heap *h,
 
 VkResult
 hk_sampler_heap_add(struct hk_device *dev, struct agx_sampler_packed desc,
-                    struct hk_rc_sampler **out)
+                    uint32_t index, struct hk_rc_sampler **out)
 {
    struct hk_sampler_heap *h = &dev->samplers;
 
    simple_mtx_lock(&h->lock);
-   VkResult result = hk_sampler_heap_add_locked(dev, h, desc, out);
+   VkResult result = hk_sampler_heap_add_locked(dev, h, desc, index, out);
    simple_mtx_unlock(&h->lock);
 
    return result;
@@ -256,6 +314,22 @@ static VkResult
 hk_check_status(struct vk_device *device)
 {
    struct hk_device *dev = container_of(device, struct hk_device, vk);
+
+   /* A GPU fault or timeout completes the affected fences with an error, so
+    * waits succeed. Without this check the application would read garbage
+    * instead of seeing VK_ERROR_DEVICE_LOST. Guest fences under virtio carry
+    * no error; there only failed submissions report device loss.
+    */
+   vk_foreach_queue(vk_queue, &dev->vk) {
+      struct hk_queue *queue = container_of(vk_queue, struct hk_queue, vk);
+      int status = queue->completion_initialized
+                      ? hk_queue_completion_status(&queue->completion) : 1;
+      if (status < 0) {
+         return vk_device_set_lost(&dev->vk, "GPU work failed: %s",
+                                   strerror(-status));
+      }
+   }
+
    return vk_check_printf_status(&dev->vk, &dev->dev.printf);
 }
 
@@ -265,39 +339,6 @@ hk_get_timestamp(struct vk_device *device, uint64_t *timestamp)
    struct hk_device *dev = container_of(device, struct hk_device, vk);
    *timestamp = agx_get_gpu_timestamp(&dev->dev);
    return VK_SUCCESS;
-}
-
-/* AGX_APPLE9_EXPERIMENT_TG_ALLOC=<ceiling>:<encoding>. Absent or malformed
- * values keep the production defaults. The advertised limit never changes. */
-static void
-hk_apple9_threadgroup_experiment_from_env(void)
-{
-   const char *env = getenv("AGX_APPLE9_EXPERIMENT_TG_ALLOC");
-   char *end = NULL;
-   unsigned long ceiling = 0, encoding = 0;
-   bool valid = false;
-   struct agx_apple9_experiments experiments = {
-      .threadgroup_memory_ceiling = AGX_APPLE9_MAX_THREADGROUP_MEMORY_BYTES,
-      .threadgroup_encoding = AGX_APPLE9_TG_ENC_PRODUCTION,
-   };
-
-   if (env && *env >= '0' && *env <= '9') {
-      ceiling = strtoul(env, &end, 10);
-      if (*end == ':' && end[1] >= '0' && end[1] <= '9') {
-         encoding = strtoul(end + 1, &end, 10);
-         valid = !*end && ceiling >= 128 && ceiling <= (1ul << 29) &&
-                 !(ceiling & (ceiling - 1)) &&
-                 encoding <= AGX_APPLE9_TG_ENC_WIDE32;
-      }
-   }
-
-   if (valid) {
-      experiments.threadgroup_memory_ceiling = ceiling;
-      experiments.threadgroup_encoding = encoding;
-   } else if (getenv("AGX_APPLE9_TRACE_REJECT")) {
-      fprintf(stderr, "APPLE9_EXPERIMENT_IGNORED\n");
-   }
-   agx_apple9_experiments_set(&experiments);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -314,6 +355,8 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
                     VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
    if (!dev)
       return vk_error(pdev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   hk_apple9_softfp64_init(&dev->softfp64);
 
    struct vk_device_dispatch_table dispatch_table;
 
@@ -343,8 +386,8 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       goto fail_alloc;
 
    dev->vk.shader_ops = &hk_device_shader_ops;
-   hk_apple9_softfp64_init(&dev->softfp64);
    dev->vk.command_dispatch_table = &dev->cmd_dispatch;
+   hk_cpu_timing_install(&dev->vk.dispatch_table);
 
    drmDevicePtr drm_device = NULL;
    int ret = drmGetDeviceFromDevId(pdev->render_dev, 0, &drm_device);
@@ -363,11 +406,11 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       goto fail_init;
    }
 
-   hk_apple9_threadgroup_experiment_from_env();
-
    dev->perftest = debug_get_flags_option("HK_PERFTEST", hk_perf_options, 0);
 
-   if (instance->drirc.misc.disable_border_emulation) {
+   /* Apple9 does not advertise custom border colours. */
+   if (instance->drirc.misc.disable_border_emulation ||
+       agx_is_apple9(&dev->dev)) {
       dev->perftest |= HK_PERF_NOBORDER;
    }
 
@@ -379,6 +422,14 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       dev->vk.enabled_features.pipelineRobustness = false;
    }
 
+   /* Reserve the capture-replay VA ranges only for devices that capture or
+    * replay; other devices keep their heaps whole. */
+   dev->dev.capture_replay =
+      dev->vk.enabled_features.bufferDeviceAddressCaptureReplay ||
+      dev->vk.enabled_features.bufferDeviceAddressCaptureReplayEXT ||
+      dev->vk.enabled_features.descriptorBufferCaptureReplay;
+
+   dev->dev.native_mesh_classes = hk_apple9_native_index_class_hash();
    bool succ = agx_open_device(NULL, &dev->dev);
    drmFreeDevice(&drm_device);
    if (!succ) {
@@ -387,8 +438,9 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       goto fail_fd;
    }
 
-   if (agx_apple9_compute_enabled(&dev->dev) ||
-       agx_apple9_direct_render_enabled(&dev->dev))
+   hk_device_init_usc_heap(dev);
+
+   if (agx_is_apple9(&dev->dev))
       agx_apple9_initialize_entries(&dev->dev);
 
    vk_device_set_drm_fd(&dev->vk, dev->dev.fd);
@@ -408,15 +460,49 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (result != VK_SUCCESS)
       goto fail_dev;
 
-   result = hk_descriptor_table_init(
-      dev, &dev->occlusion_queries, sizeof(uint64_t), AGX_MAX_OCCLUSION_QUERIES,
-      AGX_MAX_OCCLUSION_QUERIES);
-   if (result != VK_SUCCESS)
-      goto fail_samplers;
+   if (agx_is_apple9(&dev->dev)) {
+      dev->apple9_fetch_sampler =
+         agx_bo_create(&dev->dev, 64 + AGX_APPLE9_SAMPLER_TABLE_STRIDE, 0,
+                       AGX_BO_LOW_VA, "Apple9 immutable samplers");
+      if (!dev->apple9_fetch_sampler) {
+         result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+         goto fail_samplers;
+      }
+      uint8_t *samplers = agx_bo_map(dev->apple9_fetch_sampler);
+      memset(samplers, 0, 64 + AGX_APPLE9_SAMPLER_TABLE_STRIDE);
+      agx_apple9_pack_fetch_sampler(samplers);
+      agx_apple9_pack_sampler(samplers + 64, false, false, 1, 0, 14,
+                              PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+                              PIPE_TEX_WRAP_CLAMP_TO_EDGE, 1);
+      dev->apple9_reload_sampler = dev->apple9_fetch_sampler->va->addr + 64;
+
+      dev->apple9_compute_sysvals =
+         agx_bo_create(&dev->dev, AGX_APPLE9_RUNTIME_SYSVAL_SIZE, 0, 0,
+                       "Apple9 compute sysvals");
+      if (!dev->apple9_compute_sysvals) {
+         result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+         goto fail_samplers;
+      }
+      hk_apple9_compute_sysvals(dev, agx_bo_map(dev->apple9_compute_sysvals));
+
+      dev->apple9_resident =
+         agx_bo_create(&dev->dev, sizeof(struct hk_apple9_residency) + 4, 0, 0,
+                       "Apple9 resident table");
+      if (!dev->apple9_resident) {
+         result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+         goto fail_samplers;
+      }
+      struct hk_apple9_residency *resident = agx_bo_map(dev->apple9_resident);
+      memset(resident, 0, sizeof(*resident) + 4);
+      resident->pages = 1;
+      for (unsigned l = 0; l < AIL_MAX_MIP_LEVELS; ++l)
+         resident->level[l].shift_x = resident->level[l].shift_y = 31;
+      resident->resident[0] = 1;
+   }
 
    result = hk_upload_rodata(dev);
    if (result != VK_SUCCESS)
-      goto fail_queries;
+      goto fail_samplers;
 
    /* XXX: error handling, and should this even go on the device? */
    agx_bg_eot_init(&dev->bg_eot, &dev->dev);
@@ -451,6 +537,12 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       goto fail_queues;
    }
 
+   simple_mtx_init(&dev->heap_lock, mtx_plain);
+   simple_mtx_init(&dev->apple9_variants.lock, mtx_plain);
+   simple_mtx_init(&dev->apple9_bodies.lock, mtx_plain);
+   list_inithead(&dev->apple9_bodies.slabs);
+   dev->dev.apple9_pin_entry = hk_apple9_pin_entry;
+   simple_mtx_init(&dev->apple9_tile_helpers.lock, mtx_plain);
    result = hk_device_init_meta(dev);
    if (result != VK_SUCCESS)
       goto fail_mem_cache;
@@ -459,19 +551,31 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
     * null fragment shaders. We do this at device-time to make binds cheap.
     * Regardless, compiling this shader should be fast.
     */
-   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
-                                                  &agx_nir_options, "empty FS");
-   struct vk_shader_compile_info info = {
-      .nir = b.shader,
-      .robustness = &vk_robustness_disabled,
-      .stage = MESA_SHADER_FRAGMENT,
-   };
-   hk_compile_shader(dev, &info, NULL, NULL, pAllocator, &dev->null_fs,
-                      NULL);
-   if (!dev->null_fs) {
-      result = VK_ERROR_OUT_OF_HOST_MEMORY;
-      goto fail_meta;
+   if (agx_is_apple9(&dev->dev)) {
+      result = hk_apple9_create_null_fs(dev, pAllocator, true, &dev->null_fs);
+      if (result != VK_SUCCESS)
+         goto fail_meta;
+      result = hk_apple9_create_null_fs(dev, pAllocator, false,
+                                        &dev->null_fs_trivial);
+      if (result != VK_SUCCESS)
+         goto fail_null_fs;
+   } else {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+                                                     &agx_nir_options, "empty FS");
+      struct vk_shader_compile_info info = {
+         .nir = b.shader,
+         .robustness = &vk_robustness_disabled,
+         .stage = MESA_SHADER_FRAGMENT,
+      };
+      hk_compile_shader(dev, &info, NULL, NULL, pAllocator, &dev->null_fs);
+      if (!dev->null_fs) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+         goto fail_meta;
+      }
    }
+
+   if (agx_is_apple9(&dev->dev))
+      hk_apple9_precompile_init(dev);
 
    *pDevice = hk_device_to_handle(dev);
 
@@ -480,16 +584,26 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    agx_scratch_init(&dev->dev, &dev->scratch.fs);
    agx_scratch_init(&dev->dev, &dev->scratch.cs);
 
-   u_rwlock_init(&dev->external_bos.lock);
-   dev->external_bos.counts = UTIL_DYNARRAY_INIT;
-   dev->external_bos.list = UTIL_DYNARRAY_INIT;
+
+   simple_mtx_init(&dev->events.lock, mtx_plain);
+   list_inithead(&dev->events.available);
 
    return VK_SUCCESS;
 
+fail_null_fs:
+   hk_api_shader_destroy(&dev->vk, &dev->null_fs->vk, pAllocator);
 fail_meta:
    hk_device_finish_meta(dev);
 fail_mem_cache:
    vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
+   hk_cmd_bo_cache_finish(dev);
+   hk_apple9_variants_finish(dev);
+   hk_apple9_bodies_finish(dev);
+   hk_apple9_tile_helpers_finish(dev);
+   assert(list_is_empty(&dev->apple9_bodies.slabs));
+   simple_mtx_destroy(&dev->apple9_variants.lock);
+   simple_mtx_destroy(&dev->apple9_bodies.lock);
+   simple_mtx_destroy(&dev->apple9_tile_helpers.lock);
 fail_queues:
    vk_foreach_queue_safe(iter, &dev->vk) {
       struct hk_queue *queue = container_of(iter, struct hk_queue, vk);
@@ -502,18 +616,23 @@ fail_bg_eot:
    agx_bg_eot_cleanup(&dev->bg_eot);
 fail_rodata:
    agx_bo_unreference(&dev->dev, dev->rodata.bo);
-fail_queries:
-   hk_descriptor_table_finish(dev, &dev->occlusion_queries);
 fail_samplers:
+   if (dev->apple9_fetch_sampler)
+      agx_bo_unreference(&dev->dev, dev->apple9_fetch_sampler);
+   if (dev->apple9_compute_sysvals)
+      agx_bo_unreference(&dev->dev, dev->apple9_compute_sysvals);
+   if (dev->apple9_resident)
+      agx_bo_unreference(&dev->dev, dev->apple9_resident);
    hk_destroy_sampler_heap(dev, &dev->samplers);
 fail_dev:
+   hk_device_finish_usc_heap(dev);
    agx_close_device(&dev->dev);
 fail_fd:
    close(dev->dev.fd);
 fail_init:
-   hk_apple9_softfp64_finish(&dev->softfp64);
    vk_device_finish(&dev->vk);
 fail_alloc:
+   hk_apple9_softfp64_finish(&dev->softfp64);
    vk_free(&dev->vk.alloc, dev);
    return result;
 }
@@ -526,12 +645,12 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    if (!dev)
       return;
 
+   hk_apple9_precompile_finish(dev);
    hk_apple9_softfp64_finish(&dev->softfp64);
-   util_dynarray_fini(&dev->external_bos.counts);
-   util_dynarray_fini(&dev->external_bos.list);
-   u_rwlock_destroy(&dev->external_bos.lock);
-
    hk_device_finish_meta(dev);
+   hk_apple9_variants_finish(dev);
+   hk_apple9_bodies_finish(dev);
+   hk_apple9_tile_helpers_finish(dev);
    hk_destroy_internal_shaders(dev, &dev->kernels, false);
    hk_destroy_internal_shaders(dev, &dev->prolog_epilog, true);
 
@@ -548,16 +667,85 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    agx_scratch_fini(&dev->scratch.fs);
    agx_scratch_fini(&dev->scratch.cs);
    simple_mtx_destroy(&dev->scratch.lock);
+   assert(list_is_empty(&dev->events.available));
+   simple_mtx_destroy(&dev->events.lock);
 
    if (dev->null_fs) {
       hk_api_shader_destroy(&dev->vk, &dev->null_fs->vk, pAllocator);
    }
+   if (dev->null_fs_trivial)
+      hk_api_shader_destroy(&dev->vk, &dev->null_fs_trivial->vk, pAllocator);
+   simple_mtx_destroy(&dev->apple9_variants.lock);
+   assert(list_is_empty(&dev->apple9_bodies.slabs));
+   simple_mtx_destroy(&dev->apple9_bodies.lock);
+   simple_mtx_destroy(&dev->apple9_tile_helpers.lock);
 
+   if (dev->apple9_fetch_sampler)
+      agx_bo_unreference(&dev->dev, dev->apple9_fetch_sampler);
+   if (dev->apple9_compute_sysvals)
+      agx_bo_unreference(&dev->dev, dev->apple9_compute_sysvals);
+   if (dev->apple9_resident)
+      agx_bo_unreference(&dev->dev, dev->apple9_resident);
+   hk_cmd_bo_cache_finish(dev);
    hk_destroy_sampler_heap(dev, &dev->samplers);
-   hk_descriptor_table_finish(dev, &dev->occlusion_queries);
    agx_bo_unreference(&dev->dev, dev->rodata.bo);
+   if (dev->heap_va) {
+      if (dev->heap_overflows) {
+         mesa_logw("hk: geometry heap overflowed %u times, up to %" PRIu64
+                   " MiB", dev->heap_overflows, dev->heap_reported_B >> 20);
+      }
+      agx_va_free(&dev->dev, dev->heap_va, true);
+   }
    agx_bo_unreference(&dev->dev, dev->heap);
+   simple_mtx_destroy(&dev->heap_lock);
+   agx_bo_unreference(&dev->dev, dev->mesh_heap);
    agx_bg_eot_cleanup(&dev->bg_eot);
+   hk_device_finish_usc_heap(dev);
    agx_close_device(&dev->dev);
    vk_free(&dev->vk.alloc, dev);
+}
+
+/* HK_TIMELINE_FILE: present records (flag 100 is the presentation API scope;
+ * f is the dynamic present mode, or UINT32_MAX when not given). */
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *info)
+{
+   const VkSwapchainPresentModeInfoKHR *mode_info =
+      vk_find_struct_const(info->pNext, SWAPCHAIN_PRESENT_MODE_INFO_KHR);
+   uint64_t mode = UINT32_MAX;
+   if (mode_info && info->swapchainCount == 1 && mode_info->swapchainCount == 1)
+      mode = mode_info->pPresentModes[0];
+   struct agx_timeline_scope trace = agx_timeline_scope_begin(
+      100, (uintptr_t)queue, info->swapchainCount, 0, 0, mode);
+   VkResult result = wsi_QueuePresentKHR(queue, info);
+   agx_timeline_scope_end(&trace, result);
+   if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR)
+      agx_timeline_presented();
+   return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_CreateGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t count,
+                        const VkGraphicsPipelineCreateInfo *infos,
+                        const VkAllocationCallbacks *alloc, VkPipeline *pipelines)
+{
+   struct agx_timeline_scope trace = agx_timeline_scope_begin(
+      101, (uintptr_t)device, count, 0, 0, 0);
+   VkResult result = vk_common_CreateGraphicsPipelines(device, cache, count,
+                                                   infos, alloc, pipelines);
+   agx_timeline_scope_end(&trace, result);
+   return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_CreateComputePipelines(VkDevice device, VkPipelineCache cache, uint32_t count,
+                        const VkComputePipelineCreateInfo *infos,
+                        const VkAllocationCallbacks *alloc, VkPipeline *pipelines)
+{
+   struct agx_timeline_scope trace = agx_timeline_scope_begin(
+      102, (uintptr_t)device, count, 0, 0, 0);
+   VkResult result = vk_common_CreateComputePipelines(device, cache, count,
+                                                   infos, alloc, pipelines);
+   agx_timeline_scope_end(&trace, result);
+   return result;
 }

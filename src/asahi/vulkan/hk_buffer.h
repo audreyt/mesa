@@ -10,17 +10,46 @@
 #include "hk_private.h"
 
 #include "agx_abi.h"
+#include "agx_bo.h"
+#include "layout.h"
 #include "vk_buffer.h"
 
 struct hk_device_memory;
 struct hk_physical_device;
 
+/* Buffers placed at a replayable address of their own. */
+#define HK_BUFFER_CREATE_CAPTURE_REPLAY_BITS                                   \
+   (VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT |                       \
+    VK_BUFFER_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT)
+
 struct hk_buffer {
    struct vk_buffer vk;
 
-   /** Reserved VA for sparse buffers, NULL otherwise. */
+   /** Reserved VA for sparse/capture buffers, or index buffers that cannot
+    * share an allocation alias within its size and device budget limits.
+    */
    struct agx_va *va;
+   bool apple9_index_va;
+
+   /* Apple9 sparse residency: one byte per page, nonzero if bound. */
+   struct agx_bo *apple9_residency;
+
+   /* Virtio resource id of bound implicit-sync (WSI) memory, or 0. */
+   uint32_t implicit_sync_res;
 };
+
+/* Descriptor residency pointer of a sparse residency buffer, biased so the
+ * byte of the page holding address A is at the result + (A >> page shift).
+ */
+static inline uint64_t
+hk_buffer_apple9_residency(const struct hk_buffer *buffer)
+{
+   if (!buffer->apple9_residency)
+      return 0;
+
+   return buffer->apple9_residency->va->addr -
+          (buffer->va->addr / AIL_PAGESIZE);
+}
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_buffer, vk.base, VkBuffer,
                                VK_OBJECT_TYPE_BUFFER)

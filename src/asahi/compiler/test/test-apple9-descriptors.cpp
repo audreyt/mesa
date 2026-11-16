@@ -7,7 +7,6 @@
 #include "agx_compile_apple9.h"
 #include "compiler/nir/nir_builder.h"
 #include "asahi/lib/agx_abi.h"
-#include "asahi/vulkan/hk_apple9.h"
 
 /* These are post-lowering NIR fixtures, not an independent descriptor pass.
  * Nonzero root member offsets are representative literals: the Vulkan pass
@@ -24,7 +23,7 @@ protected:
    {
       b.shader->info.workgroup_size[0] = 32;
       root = nir_load_ubo(
-         &b, 1, 64, nir_imm_int(&b, HK_APPLE9_ROOT_BINDING),
+         &b, 1, 64, nir_imm_int(&b, 0),
          nir_imm_int(&b, 0), .align_mul = 8, .range = 8);
       index = nir_load_subgroup_invocation(&b);
    }
@@ -92,7 +91,7 @@ protected:
       EXPECT_LE(profile.resource_binding_count,
                 AGX_APPLE9_COMPUTE_DIRECT_MAX_RESOURCES);
       ASSERT_EQ(profile.resource_binding_count, 1);
-      EXPECT_EQ(profile.resource_binding[0], HK_APPLE9_ROOT_BINDING);
+      EXPECT_EQ(profile.resource_binding[0], 0u);
       EXPECT_EQ(profile.resource_kind[0], AGX_APPLE9_COMPUTE_RESOURCE_UBO);
       free(compiled.binary);
    }
@@ -153,7 +152,7 @@ TEST(Apple9RootGraphicsCompiler, RootInGraphicsResourceMap)
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_VERTEX, &agx_nir_options, "root_graphics_resource_map");
    nir_def *root = nir_load_ubo(
-      &b, 1, 64, nir_imm_int(&b, HK_APPLE9_ROOT_BINDING),
+      &b, 1, 64, nir_imm_int(&b, 0),
       nir_imm_int(&b, 0), .align_mul = 8, .range = 8);
    nir_def *set = nir_load_global_constant(
       &b, 1, 64, nir_iadd_imm(&b, root, 8), .align_mul = 8);
@@ -173,7 +172,7 @@ TEST(Apple9RootGraphicsCompiler, RootInGraphicsResourceMap)
    EXPECT_NE(compiled.binary, nullptr);
    EXPECT_GT(compiled.info.binary_size, 0u);
    ASSERT_EQ(compiled.info.apple9_resource_count, 1);
-   EXPECT_EQ(compiled.info.apple9_resource_binding[0], HK_APPLE9_ROOT_BINDING);
+   EXPECT_EQ(compiled.info.apple9_resource_binding[0], 0u);
    EXPECT_EQ(compiled.info.apple9_resource_ssbo_mask, 0u);
    free(compiled.binary);
    ralloc_free(b.shader);

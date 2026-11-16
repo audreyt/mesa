@@ -1,3 +1,4 @@
+#include "util/u_debug.h"
 /*
  * Copyright 2024 Valve Corporation
  * Copyright 2024 Alyssa Rosenzweig
@@ -5,7 +6,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_physical_device.h"
-#include "asahi/lib/agx_apple9_compute.h"
+#include "hk_descriptor_buffer.h"
 
 #include "asahi/compiler/agx_nir_texture.h"
 #include "asahi/lib/agx_device.h"
@@ -15,11 +16,14 @@
 #include "util/os_misc.h"
 #include "git_sha1.h"
 #include "hk_buffer.h"
+#include "hk_cmd_buffer.h"
 #include "hk_entrypoints.h"
 #include "hk_image.h"
 #include "hk_instance.h"
 #include "hk_private.h"
+#include "hk_sampler.h"
 #include "hk_shader.h"
+#include "hk_apple9_mesh.h"
 #include "hk_wsi.h"
 
 #include "util/simple_mtx.h"
@@ -115,6 +119,8 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .KHR_shader_draw_parameters = true,
       .KHR_shader_expect_assume = true,
       .KHR_shader_float_controls = true,
+      .KHR_shader_subgroup_extended_types = true,
+      .EXT_shader_viewport_index_layer = false,
       .KHR_shader_float_controls2 = true,
       .KHR_shader_float16_int8 = true,
       .KHR_shader_integer_dot_product = true,
@@ -238,6 +244,28 @@ hk_get_device_features(
    const struct vk_device_extension_table *supported_extensions,
    struct vk_features *features)
 {
+   bool vertex_stores = instance->drirc.misc.enable_vertex_pipeline_stores_atomics;
+
+   if (agx_is_apple9(dev)) {
+      /* Instance options have no device identity. Re-evaluate this feature
+       * with the family tag used by device-scoped defaults, preserving the
+       * usual user configuration and environment override precedence.
+       */
+      driOptionCache options;
+      driParseConfigFiles(&options, &instance->drirc.available_options,
+                         &(driConfigFileParseParams) {
+                            .driverName = "hk",
+                            .deviceName = "G16",
+                            .applicationName = instance->vk.app_info.app_name,
+                            .applicationVersion = instance->vk.app_info.app_version,
+                            .engineName = instance->vk.app_info.engine_name,
+                            .engineVersion = instance->vk.app_info.engine_version,
+                         });
+      vertex_stores = driQueryOptionb(
+         &options, "hk_enable_vertex_pipeline_stores_atomics");
+      driDestroyOptionCache(&options);
+   }
+
    *features = (struct vk_features){
       /* Vulkan 1.0 */
       .robustBufferAccess = true,
@@ -265,7 +293,7 @@ hk_get_device_features(
       .textureCompressionASTC_LDR = true,
       .occlusionQueryPrecise = true,
       .pipelineStatisticsQuery = true,
-      .vertexPipelineStoresAndAtomics = instance->drirc.misc.enable_vertex_pipeline_stores_atomics,
+      .vertexPipelineStoresAndAtomics = vertex_stores,
       .fragmentStoresAndAtomics = true,
       .shaderTessellationAndGeometryPointSize = true,
       .shaderImageGatherExtended = true,
@@ -306,7 +334,8 @@ hk_get_device_features(
       .storageBuffer16BitAccess = true,
       .uniformAndStorageBuffer16BitAccess = true,
       .storagePushConstant16 = true,
-      .storageInputOutput16 = false,
+      /* G16 carries 16-bit stage I/O as 32-bit (hk_lower_io_16bit_to_32bit). */
+      .storageInputOutput16 = agx_is_apple9(dev),
       .multiview = true,
       .multiviewGeometryShader = false,
       .multiviewTessellationShader = false,
@@ -644,6 +673,10 @@ hk_get_device_features(
       /* VK_KHR_shader_relaxed_extended_instruction */
       .shaderRelaxedExtendedInstruction = true,
 
+      /* VK_KHR_unified_image_layouts (Apple9 only) */
+      .unifiedImageLayouts = true,
+      .unifiedImageLayoutsVideo = false,
+
       /* VK_EXT_blend_operation_advanced */
       .advancedBlendCoherentOperations = true,
 
@@ -654,80 +687,6 @@ hk_get_device_features(
       .presentAtAbsoluteTime = true,
 #endif
    };
-
-   if (agx_apple9_compute_enabled(dev)) {
-      /* Native graphics supports vertex/fragment stages, per-pixel shading,
-       * filled polygons and timestamp queries only. */
-      features->geometryShader = false;
-      features->tessellationShader = false;
-      features->shaderTessellationAndGeometryPointSize = false;
-      features->sampleRateShading = false;
-      features->alphaToOne = false;
-      features->fillModeNonSolid = false;
-      features->occlusionQueryPrecise = false;
-      features->pipelineStatisticsQuery = false;
-      /* Native buffer/image transfers do not support block-compressed data. */
-      features->textureCompressionBC = false;
-      features->textureCompressionETC2 = false;
-      features->textureCompressionASTC_LDR = false;
-      /* Native vertex fetch is specialized from the pipeline's static layout. */
-      features->vertexInputDynamicState = false;
-      features->extendedDynamicState = false;
-      /* The native sampler path does not lower custom-border queries. */
-      features->customBorderColors = false;
-      features->customBorderColorWithoutFormat = false;
-      /* The native sampler packet has no non-seamless cube-map mode. */
-      features->nonSeamlessCubeMap = false;
-      /* Native vertex fetch uses the per-binding bounds table. */
-      features->robustBufferAccess = true;
-      features->robustImageAccess = true;
-      features->vertexPipelineStoresAndAtomics = true;
-      features->pipelineRobustness = false;
-      features->robustBufferAccess2 = false;
-      features->robustImageAccess2 = false;
-      /* nullDescriptor: The snapshot model reads descriptors at record
-       * time — null descriptors yield zero addresses. Image lowering
-       * handles null via AGX_ZERO_PAGE_ADDRESS checks (libagx_txs
-       * returns 0). Buffer accesses to address 0 hit the GPU zero page. */
-      // features->nullDescriptor = false;  /* re-enabled for Zink */
-      features->descriptorIndexing = false;
-      features->shaderStorageImageReadWithoutFormat = false;
-      features->shaderStorageImageWriteWithoutFormat = true;
-      /* re-enabled: mature buffer descriptor path handles these */
-      // features->shaderUniformBufferArrayDynamicIndexing = false;
-      features->shaderSampledImageArrayDynamicIndexing = false;
-      // features->shaderStorageBufferArrayDynamicIndexing = false;
-      features->shaderStorageImageArrayDynamicIndexing = false;
-      features->shaderInputAttachmentArrayDynamicIndexing = false;
-      features->shaderUniformTexelBufferArrayDynamicIndexing = false;
-      features->shaderStorageTexelBufferArrayDynamicIndexing = false;
-      // features->shaderUniformBufferArrayNonUniformIndexing = false;
-      features->shaderSampledImageArrayNonUniformIndexing = false;
-      // features->shaderStorageBufferArrayNonUniformIndexing = false;
-      features->shaderStorageImageArrayNonUniformIndexing = false;
-      features->shaderInputAttachmentArrayNonUniformIndexing = false;
-      features->shaderUniformTexelBufferArrayNonUniformIndexing = false;
-      features->shaderStorageTexelBufferArrayNonUniformIndexing = false;
-      // features->descriptorBindingUniformBufferUpdateAfterBind = false;
-      features->descriptorBindingSampledImageUpdateAfterBind = false;
-      features->descriptorBindingStorageImageUpdateAfterBind = false;
-      // features->descriptorBindingStorageBufferUpdateAfterBind = false;
-      features->descriptorBindingUniformTexelBufferUpdateAfterBind = false;
-      features->descriptorBindingStorageTexelBufferUpdateAfterBind = false;
-      features->descriptorBindingInlineUniformBlockUpdateAfterBind = false;
-      // features->descriptorBindingUpdateUnusedWhilePending = false;
-      // features->descriptorBindingPartiallyBound = false;
-      // features->descriptorBindingVariableDescriptorCount = false;
-      // features->runtimeDescriptorArray = false;
-      /* re-enabled: mature buffer descriptor path handles variable pointers.
-       * These are pointer computations in SSBO/BDA space. */
-      // features->variablePointersStorageBuffer = false;
-      // features->variablePointers = false;
-      /* re-enabled: Apple9 compiler handles nir_load_global/nir_store_global
-       * (proven via image lowering). BDA just needs global memory access. */
-      // features->bufferDeviceAddress = false;
-      // features->bufferDeviceAddressCaptureReplay = false;
-   }
 }
 
 static void
@@ -839,7 +798,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .minMemoryMapAlignment = os_page_size,
       .minTexelBufferOffsetAlignment = HK_MIN_TEXEL_BUFFER_ALIGNMENT,
       .minUniformBufferOffsetAlignment = HK_MIN_UBO_ALIGNMENT,
-      .minStorageBufferOffsetAlignment = HK_MIN_SSBO_ALIGNMENT,
+      .minStorageBufferOffsetAlignment = hk_min_ssbo_alignment(dev),
       .minTexelOffset = -8,
       .maxTexelOffset = 7,
       .minTexelGatherOffset = -8,
@@ -976,7 +935,10 @@ hk_get_device_properties(const struct agx_device *dev,
       .minSubgroupSize = 32,
       .maxSubgroupSize = 32,
       .maxComputeWorkgroupSubgroups = 1024 / 32,
-      .requiredSubgroupSizeStages = 0,
+      /* Apple9 executes fixed 32-lane subgroups, including explicitly
+       * required size 32 in compute pipelines. */
+      .requiredSubgroupSizeStages = dev->params.gpu_generation >= 16
+                                      ? VK_SHADER_STAGE_COMPUTE_BIT : 0,
       .maxInlineUniformBlockSize = HK_MAX_INLINE_UNIFORM_BLOCK_SIZE,
       .maxPerStageDescriptorInlineUniformBlocks = 32,
       .maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks = 32,
@@ -998,6 +960,42 @@ hk_get_device_properties(const struct agx_device *dev,
 
       /* VK_KHR_push_descriptor */
       .maxPushDescriptors = HK_MAX_PUSH_DESCRIPTORS,
+
+      /* VK_EXT_descriptor_buffer (G16; HK_APPLE9_DESCRIPTOR_BUFFER=0 hides it) */
+      .combinedImageSamplerDescriptorSingleArray = true,
+      .bufferlessPushDescriptors = true,
+      .allowSamplerImageViewPostSubmitCreation = false,
+      .descriptorBufferOffsetAlignment = HK_APPLE9_DB_ALIGNMENT,
+      .maxDescriptorBufferBindings = HK_MAX_SETS,
+      .maxResourceDescriptorBufferBindings = HK_MAX_SETS,
+      .maxSamplerDescriptorBufferBindings = HK_MAX_SETS,
+      .maxEmbeddedImmutableSamplerBindings = HK_MAX_SETS,
+      .maxEmbeddedImmutableSamplers = 2048,
+      .EDBsamplerDescriptorSize = HK_APPLE9_DB_SAMPLER_SIZE,
+      .combinedImageSamplerDescriptorSize = HK_APPLE9_DB_COMBINED_SIZE,
+      .sampledImageDescriptorSize = HK_APPLE9_DB_SAMPLED_SIZE,
+      .storageImageDescriptorSize = HK_APPLE9_DB_STORAGE_SIZE,
+      .uniformTexelBufferDescriptorSize = HK_APPLE9_DB_TEXEL_SIZE,
+      .robustUniformTexelBufferDescriptorSize = HK_APPLE9_DB_TEXEL_SIZE,
+      .storageTexelBufferDescriptorSize = HK_APPLE9_DB_STORAGE_SIZE,
+      .robustStorageTexelBufferDescriptorSize = HK_APPLE9_DB_STORAGE_SIZE,
+      .uniformBufferDescriptorSize = HK_APPLE9_DB_BUFFER_SIZE,
+      .robustUniformBufferDescriptorSize = HK_APPLE9_DB_BUFFER_SIZE,
+      .storageBufferDescriptorSize = HK_APPLE9_DB_BUFFER_SIZE,
+      .robustStorageBufferDescriptorSize = HK_APPLE9_DB_BUFFER_SIZE,
+      .inputAttachmentDescriptorSize = HK_APPLE9_DB_SAMPLED_SIZE,
+      .maxSamplerDescriptorBufferRange = HK_APPLE9_DB_RANGE,
+      .maxResourceDescriptorBufferRange = HK_APPLE9_DB_RANGE,
+      .samplerDescriptorBufferAddressSpaceSize = HK_APPLE9_DB_ADDRESS_SPACE,
+      .resourceDescriptorBufferAddressSpaceSize = HK_APPLE9_DB_ADDRESS_SPACE,
+      .descriptorBufferAddressSpaceSize = HK_APPLE9_DB_ADDRESS_SPACE,
+      .bufferCaptureReplayDescriptorDataSize = sizeof(uint64_t),
+      .imageCaptureReplayDescriptorDataSize =
+         sizeof(struct hk_image_capture_data),
+      .imageViewCaptureReplayDescriptorDataSize =
+         HK_IMAGE_VIEW_CAPTURE_DATA_SIZE,
+      .samplerCaptureReplayDescriptorDataSize =
+         sizeof(struct hk_sampler_capture_data),
 
       /* VK_EXT_custom_border_color */
       .maxCustomBorderColorSamplers = 4000,
@@ -1087,7 +1085,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .variableSampleLocations = false,
 
       /* VK_EXT_shader_object */
-      .shaderBinaryVersion = 1,
+      .shaderBinaryVersion = 0,
 
       /* VK_EXT_transform_feedback */
       .maxTransformFeedbackStreams = 4,
@@ -1116,25 +1114,6 @@ hk_get_device_properties(const struct agx_device *dev,
       .advancedBlendCorrelatedOverlap = true,
       .advancedBlendAllOperations = true,
    };
-
-   if (agx_apple9_compute_enabled(dev)) {
-      /* The launch word stores (bytes << 2) in 16 bits, so 8 KiB is the
-       * largest supported power-of-two allocation. Advertising the generic
-       * 32 KiB limit makes compute clients select shaders this GPU rejects.
-       */
-      properties->maxComputeSharedMemorySize =
-         AGX_APPLE9_MAX_THREADGROUP_MEMORY_BYTES;
-      /* agx_apple9_compute_grid_supported rejects more than 65535 groups on
-       * any axis, so do not advertise a larger X count.
-       */
-      properties->maxComputeWorkGroupCount[0] = 65535;
-      /* Subgroup reductions do not compile yet. Advertising arithmetic makes
-       * ggml select those shaders instead of the supported scalar matvec.
-       */
-      properties->subgroupSupportedOperations &=
-         ~(VK_SUBGROUP_FEATURE_ARITHMETIC_BIT |
-           VK_SUBGROUP_FEATURE_CLUSTERED_BIT);
-   }
 
    snprintf(properties->deviceName, sizeof(properties->deviceName), "%s",
             (strlen(instance->drirc.debug.force_vk_devicename) > 0) ?
@@ -1178,6 +1157,7 @@ hk_get_device_properties(const struct agx_device *dev,
       VK_IMAGE_LAYOUT_STENCIL_READ_ONLY_OPTIMAL,
       VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL,
       VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
+      VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ,
       // VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT,
       VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT,
    };
@@ -1217,6 +1197,8 @@ hk_physical_device_init_pipeline_cache(struct hk_physical_device *pdev)
 
    const uint64_t compiler_flags = hk_physical_device_compiler_flags(pdev);
    _mesa_blake3_update(&blake3_ctx, &compiler_flags, sizeof(compiler_flags));
+   const uint32_t root_layout = HK_ROOT_LAYOUT_VERSION;
+   _mesa_blake3_update(&blake3_ctx, &root_layout, sizeof(root_layout));
 
    unsigned char blake3[BLAKE3_KEY_LEN];
    _mesa_blake3_final(&blake3_ctx, blake3);
@@ -1286,6 +1268,669 @@ hk_get_sysmem_heap_available(struct hk_physical_device *pdev)
    return pdev->sysmem - total_used;
 }
 
+/* The native Apple9 path implements a subset of Honeykrisp's Apple8 feature
+ * set. Everything Apple9 advertises is listed here explicitly, so enabling a
+ * new Apple8 capability never silently exposes it on Apple9.
+ */
+static void
+hk_apple9_restrict_caps(struct vk_device_extension_table *ext,
+                        struct vk_features *feat, struct vk_properties *props)
+{
+   const struct vk_device_extension_table all = *ext;
+   const struct vk_features all_feat = *feat;
+
+   /* The 3D sampler uses only eleven depth bits, unlike the array layer
+    * count. Copies can address deeper slices, but normalized samples cannot.
+    */
+   props->maxImageDimension3D = AGX_APPLE9_MAX_3D_TEXTURE_DIMENSION;
+
+   *ext = (struct vk_device_extension_table){
+      /* Vulkan 1.1 */
+      .KHR_16bit_storage = true,
+      .KHR_bind_memory2 = true,
+      .KHR_dedicated_allocation = true,
+      .KHR_descriptor_update_template = true,
+      .KHR_device_group = true,
+      .KHR_external_fence = true,
+      .KHR_external_fence_fd = true,
+      .KHR_external_memory = true,
+      .KHR_external_memory_fd = true,
+      .KHR_external_semaphore = true,
+      .KHR_external_semaphore_fd = true,
+      .KHR_get_memory_requirements2 = true,
+      .KHR_maintenance1 = true,
+      .KHR_maintenance2 = true,
+      .KHR_maintenance3 = true,
+      .KHR_multiview = true,
+      .KHR_relaxed_block_layout = true,
+      .KHR_sampler_ycbcr_conversion = true,
+      .KHR_shader_draw_parameters = true,
+      .KHR_storage_buffer_storage_class = true,
+      .KHR_variable_pointers = true,
+
+      /* Vulkan 1.2 */
+      .KHR_8bit_storage = true,
+      .EXT_descriptor_indexing = true,
+      .KHR_draw_indirect_count = true,
+      .KHR_shader_float16_int8 = true,
+      .KHR_buffer_device_address = true,
+      .KHR_create_renderpass2 = true,
+      .KHR_depth_stencil_resolve = true,
+      .KHR_driver_properties = true,
+      .KHR_image_format_list = true,
+      .KHR_imageless_framebuffer = true,
+      .KHR_sampler_mirror_clamp_to_edge = true,
+      .KHR_separate_depth_stencil_layouts = true,
+      .KHR_shader_float_controls = true,
+      .KHR_spirv_1_4 = true,
+      .KHR_timeline_semaphore = true,
+      .KHR_uniform_buffer_standard_layout = true,
+      .KHR_vulkan_memory_model = true,
+      .EXT_host_query_reset = true,
+      .EXT_scalar_block_layout = true,
+      .EXT_separate_stencil_usage = true,
+      .EXT_shader_viewport_index_layer = true,
+
+      /* Vulkan 1.3 */
+      .KHR_copy_commands2 = true,
+      .KHR_dynamic_rendering = true,
+      .KHR_format_feature_flags2 = true,
+      .KHR_maintenance4 = true,
+      .KHR_shader_integer_dot_product = true,
+      .KHR_shader_non_semantic_info = true,
+      .KHR_shader_terminate_invocation = true,
+      .KHR_synchronization2 = true,
+      .KHR_zero_initialize_workgroup_memory = true,
+      .EXT_4444_formats = true,
+      .EXT_extended_dynamic_state = true,
+      .EXT_extended_dynamic_state2 = true,
+      .EXT_image_robustness = true,
+      .EXT_inline_uniform_block = true,
+      .EXT_pipeline_creation_cache_control = true,
+      .EXT_pipeline_creation_feedback = true,
+      .EXT_private_data = true,
+      .EXT_shader_demote_to_helper_invocation = true,
+      .EXT_subgroup_size_control = true,
+      .EXT_texel_buffer_alignment = true,
+      .EXT_tooling_info = true,
+
+      /* Vulkan 1.4 */
+      .KHR_dynamic_rendering_local_read = true,
+      .KHR_global_priority = true,
+      .KHR_index_type_uint8 = true,
+      .KHR_line_rasterization = true,
+      .KHR_maintenance5 = true,
+      .KHR_maintenance6 = true,
+      .KHR_push_descriptor = true,
+      .KHR_shader_float_controls2 = true,
+      .KHR_shader_subgroup_rotate = true,
+      .KHR_vertex_attribute_divisor = true,
+      .EXT_global_priority = true,
+      .EXT_global_priority_query = true,
+      .EXT_index_type_uint8 = true,
+      .EXT_line_rasterization = true,
+      .EXT_pipeline_robustness = true,
+      .EXT_robustness2 = true,
+      .KHR_robustness2 = true,
+      .EXT_transform_feedback = true,
+      .EXT_vertex_attribute_divisor = true,
+
+      /* Other extensions implemented by the common runtime or CPU paths */
+      .KHR_calibrated_timestamps = true,
+      .KHR_maintenance7 = true,
+      .KHR_shader_maximal_reconvergence = true,
+      .KHR_shader_quad_control = true,
+      .KHR_workgroup_memory_explicit_layout = true,
+      .KHR_maintenance8 = true,
+      .KHR_maintenance9 = true,
+      .KHR_pipeline_executable_properties = true,
+      .KHR_shader_subgroup_extended_types = true,
+      .EXT_color_write_enable = true,
+      .EXT_debug_marker = true,
+      .EXT_hdr_metadata = true,
+      .EXT_map_memory_placed = true,
+      /* Process usage of each heap and a budget from available system
+       * memory, as on other unified-memory drivers. */
+      .EXT_memory_budget = true,
+      /* Priority is a residency hint; all memory stays resident. */
+      .EXT_memory_priority = true,
+      .EXT_shader_replicated_composites = true,
+      .EXT_depth_bias_control = true,
+      .EXT_depth_clip_control = true,
+      .EXT_image_2d_view_of_3d = true,
+      /* Storage query bounds are separate from native texture geometry. */
+      .EXT_image_sliced_view_of_3d = true,
+      /* Native custom border colours need the border format: the sampler
+       * record holds the colour in the format's encoding. Without
+       * customBorderColorWithoutFormat, DXVK passes the view format and
+       * vkd3d-proton keeps the standard colours. */
+      .EXT_custom_border_color = true,
+      .EXT_border_color_swizzle = true,
+      .EXT_primitive_topology_list_restart = true,
+      .EXT_provoking_vertex = true,
+      .EXT_mutable_descriptor_type = true,
+      .EXT_shader_subgroup_ballot = true,
+      .EXT_shader_subgroup_vote = true,
+      .VALVE_mutable_descriptor_type = true,
+      .KHR_shader_relaxed_extended_instruction = true,
+      /* GENERAL remains correct and uses the same path as before. Explicit
+       * read-only depth/stencil layouts additionally allow store elision,
+       * render merging and barrier hoisting. GENERAL-layout clients such as
+       * DXVK/vkd3d with unified layouts do not get those read-only shortcuts.
+       * Feedback comes from the feedback loop state (see
+       * hk_attachment_may_be_sampled).
+       */
+      .KHR_unified_image_layouts = true,
+      .KHR_shader_subgroup_uniform_control_flow = true,
+      .EXT_attachment_feedback_loop_layout = true,
+      .EXT_calibrated_timestamps = true,
+      .EXT_dynamic_rendering_unused_attachments = true,
+      .EXT_multi_draw = true,
+      .EXT_non_seamless_cube_map = true,
+      .EXT_shader_module_identifier = true,
+      .EXT_shader_stencil_export = true,
+      .KHR_load_store_op_none = true,
+      .KHR_map_memory2 = true,
+      .KHR_shader_expect_assume = true,
+      .EXT_buffer_device_address = true,
+      .EXT_depth_clip_enable = true,
+      .EXT_external_memory_dma_buf = true,
+      .EXT_image_drm_format_modifier = true,
+      .EXT_load_store_op_none = true,
+      .EXT_physical_device_drm = true,
+      .EXT_queue_family_foreign = true,
+      .GOOGLE_decorate_string = true,
+      .GOOGLE_hlsl_functionality1 = true,
+      .GOOGLE_user_type = true,
+      .EXT_pipeline_protected_access = true,
+      .EXT_image_view_min_lod = true,
+      .KHR_compute_shader_derivatives = true,
+      .EXT_blend_operation_advanced = true,
+      /* Deferred shaders compile vertex fetch for the bound input state. */
+      .EXT_vertex_input_dynamic_state = true,
+      .EXT_extended_dynamic_state3 = true,
+      .EXT_graphics_pipeline_library = true,
+      .KHR_pipeline_library = true,
+      .EXT_shader_object = true,
+      .EXT_sample_locations = true,
+      .EXT_shader_uniform_buffer_unsized_array = true,
+      .KHR_pipeline_binary = true,
+      /* Host copies use the same ail tiling as GPU sampling; host transfer
+       * images are never compressed. */
+      .EXT_host_image_copy = true,
+      .EXT_shader_atomic_float = true,
+      .EXT_attachment_feedback_loop_dynamic_state = true,
+      .EXT_depth_clamp_zero_one = true,
+      .EXT_depth_clamp_control = true,
+      /* Resolves are vk_meta blits, which honor the transfer function
+       * flags. */
+      .KHR_maintenance10 = true,
+
+      /* WSI */
+      .KHR_incremental_present = all.KHR_incremental_present,
+      .KHR_present_id = all.KHR_present_id,
+      .KHR_present_id2 = all.KHR_present_id2,
+      .KHR_present_wait = all.KHR_present_wait,
+      .KHR_present_wait2 = all.KHR_present_wait2,
+      .KHR_swapchain = all.KHR_swapchain,
+      .KHR_swapchain_mutable_format = all.KHR_swapchain_mutable_format,
+      .KHR_swapchain_maintenance1 = all.KHR_swapchain_maintenance1,
+      .EXT_swapchain_maintenance1 = all.EXT_swapchain_maintenance1,
+      .EXT_present_timing = all.EXT_present_timing,
+      .GOOGLE_display_timing = all.GOOGLE_display_timing,
+   };
+
+#define KEEP(x) .x = all_feat.x
+   *feat = (struct vk_features){
+      /* Vulkan 1.0 */
+      KEEP(robustBufferAccess),
+      KEEP(fullDrawIndexUint32),
+      KEEP(independentBlend),
+      KEEP(sampleRateShading),
+      KEEP(logicOp),
+      KEEP(multiDrawIndirect),
+      KEEP(drawIndirectFirstInstance),
+      KEEP(depthClamp),
+      KEEP(depthBiasClamp),
+      KEEP(alphaToOne),
+      KEEP(samplerAnisotropy),
+      KEEP(textureCompressionETC2),
+      KEEP(textureCompressionBC),
+      KEEP(textureCompressionASTC_LDR),
+      KEEP(occlusionQueryPrecise),
+      KEEP(fragmentStoresAndAtomics),
+      KEEP(shaderStorageImageExtendedFormats),
+      KEEP(shaderImageGatherExtended),
+      KEEP(shaderUniformBufferArrayDynamicIndexing),
+      KEEP(shaderSampledImageArrayDynamicIndexing),
+      KEEP(shaderStorageBufferArrayDynamicIndexing),
+      KEEP(shaderStorageImageArrayDynamicIndexing),
+      KEEP(shaderClipDistance),
+      KEEP(inheritedQueries),
+      KEEP(imageCubeArray),
+      KEEP(dualSrcBlend),
+      KEEP(fillModeNonSolid),
+      KEEP(geometryShader),
+      KEEP(pipelineStatisticsQuery),
+      KEEP(tessellationShader),
+      KEEP(multiViewport),
+      KEEP(shaderTessellationAndGeometryPointSize),
+      KEEP(wideLines),
+      KEEP(largePoints),
+      KEEP(vertexPipelineStoresAndAtomics),
+      KEEP(shaderStorageImageReadWithoutFormat),
+      KEEP(shaderStorageImageWriteWithoutFormat),
+      KEEP(shaderCullDistance),
+      KEEP(shaderInt64),
+      KEEP(shaderInt16),
+      KEEP(shaderResourceMinLod),
+
+      /* Vulkan 1.1 */
+      KEEP(multiview),
+      KEEP(storageBuffer16BitAccess),
+      KEEP(uniformAndStorageBuffer16BitAccess),
+      KEEP(storagePushConstant16),
+      KEEP(storageInputOutput16),
+      KEEP(variablePointersStorageBuffer),
+      KEEP(variablePointers),
+      KEEP(shaderDrawParameters),
+
+      /* Vulkan 1.2 */
+      KEEP(samplerMirrorClampToEdge),
+      /* Only the hk_fake_minmax driconf for vkd3d enables it, as upstream */
+      KEEP(samplerFilterMinmax),
+      KEEP(drawIndirectCount),
+      KEEP(storageBuffer8BitAccess),
+      KEEP(uniformAndStorageBuffer8BitAccess),
+      KEEP(storagePushConstant8),
+      KEEP(shaderFloat16),
+      KEEP(shaderInt8),
+      KEEP(uniformBufferStandardLayout),
+      KEEP(scalarBlockLayout),
+      KEEP(imagelessFramebuffer),
+      KEEP(separateDepthStencilLayouts),
+      KEEP(hostQueryReset),
+      KEEP(timelineSemaphore),
+      KEEP(bufferDeviceAddress),
+      KEEP(vulkanMemoryModel),
+      KEEP(vulkanMemoryModelDeviceScope),
+      KEEP(shaderUniformTexelBufferArrayDynamicIndexing),
+      KEEP(shaderStorageTexelBufferArrayDynamicIndexing),
+      /* Sampled images beyond the per-draw tables, dynamically indexed or
+       * late bound are read through descriptor memory; other descriptor
+       * types always are. */
+      KEEP(descriptorIndexing),
+      KEEP(shaderInputAttachmentArrayDynamicIndexing),
+      KEEP(shaderUniformBufferArrayNonUniformIndexing),
+      KEEP(shaderSampledImageArrayNonUniformIndexing),
+      KEEP(shaderStorageBufferArrayNonUniformIndexing),
+      KEEP(shaderStorageImageArrayNonUniformIndexing),
+      KEEP(shaderInputAttachmentArrayNonUniformIndexing),
+      KEEP(shaderUniformTexelBufferArrayNonUniformIndexing),
+      KEEP(shaderStorageTexelBufferArrayNonUniformIndexing),
+      KEEP(descriptorBindingUniformBufferUpdateAfterBind),
+      KEEP(descriptorBindingSampledImageUpdateAfterBind),
+      KEEP(descriptorBindingStorageImageUpdateAfterBind),
+      KEEP(descriptorBindingStorageBufferUpdateAfterBind),
+      KEEP(descriptorBindingUniformTexelBufferUpdateAfterBind),
+      KEEP(descriptorBindingStorageTexelBufferUpdateAfterBind),
+      KEEP(descriptorBindingUpdateUnusedWhilePending),
+      KEEP(descriptorBindingPartiallyBound),
+      KEEP(descriptorBindingVariableDescriptorCount),
+      KEEP(runtimeDescriptorArray),
+      /* Inline uniform data is read from descriptor memory. */
+      KEEP(descriptorBindingInlineUniformBlockUpdateAfterBind),
+      KEEP(shaderOutputLayer),
+      KEEP(shaderOutputViewportIndex),
+      KEEP(subgroupBroadcastDynamicId),
+      /* No 8/16/64-bit shader types are exposed, so this holds trivially. */
+      KEEP(shaderSubgroupExtendedTypes),
+
+      /* Vulkan 1.3 */
+      KEEP(robustImageAccess),
+      KEEP(inlineUniformBlock),
+      KEEP(pipelineCreationCacheControl),
+      KEEP(privateData),
+      KEEP(shaderDemoteToHelperInvocation),
+      KEEP(shaderTerminateInvocation),
+      KEEP(subgroupSizeControl),
+      KEEP(computeFullSubgroups),
+      .computeDerivativeGroupLinear = true,
+      .computeDerivativeGroupQuads = false,
+      KEEP(synchronization2),
+      KEEP(shaderZeroInitializeWorkgroupMemory),
+      KEEP(dynamicRendering),
+      KEEP(shaderIntegerDotProduct),
+      KEEP(maintenance4),
+
+      /* Vulkan 1.4 */
+      KEEP(globalPriorityQuery),
+      KEEP(shaderFloatControls2),
+      KEEP(bresenhamLines),
+      /* Emulated in the fragment shader, see hk_apple9_lower_line_stipple_fs. */
+      .stippledBresenhamLines = true,
+      KEEP(dynamicRenderingLocalRead),
+      KEEP(samplerYcbcrConversion),
+      KEEP(indexTypeUint8),
+      KEEP(maintenance5),
+      KEEP(maintenance6),
+      KEEP(pushDescriptor),
+      KEEP(pipelineRobustness),
+      KEEP(robustBufferAccess2),
+      KEEP(robustImageAccess2),
+      KEEP(nullDescriptor),
+      KEEP(transformFeedback),
+      KEEP(geometryStreams),
+      KEEP(shaderSubgroupRotate),
+      KEEP(shaderSubgroupRotateClustered),
+      KEEP(vertexAttributeInstanceRateDivisor),
+      KEEP(vertexAttributeInstanceRateZeroDivisor),
+      KEEP(extendedDynamicState2LogicOp),
+      /* Tessellation reads the patch size from dynamic state at draw. */
+      KEEP(extendedDynamicState2PatchControlPoints),
+      KEEP(hostImageCopy),
+      /* Device memory has native FP32 atomic addition, which image atomics
+       * also use. Shared memory has exchange but no addition. */
+      .shaderBufferFloat32Atomics = true,
+      .shaderBufferFloat32AtomicAdd = true,
+      .shaderSharedFloat32Atomics = true,
+      .shaderImageFloat32Atomics = true,
+      .shaderImageFloat32AtomicAdd = true,
+
+      /* Extensions */
+      KEEP(mutableDescriptorType),
+      KEEP(pipelineExecutableInfo),
+      KEEP(maintenance8),
+      KEEP(maintenance9),
+      KEEP(shaderReplicatedComposites),
+      KEEP(memoryMapPlaced),
+      KEEP(memoryUnmapReserve),
+      KEEP(colorWriteEnable),
+      /* Lowered in the last pre-rasterization stage. */
+      .depthClipControl = true,
+      KEEP(depthBiasControl),
+      KEEP(leastRepresentableValueForceUnormRepresentation),
+      KEEP(depthBiasExact),
+      KEEP(image2DViewOf3D),
+      KEEP(sampler2DViewOf3D),
+      .imageSlicedViewOf3D = true,
+      KEEP(customBorderColors),
+      KEEP(borderColorSwizzle),
+      KEEP(primitiveTopologyListRestart),
+      KEEP(provokingVertexLast),
+      KEEP(transformFeedbackPreservesProvokingVertex),
+      KEEP(maintenance7),
+      KEEP(shaderMaximalReconvergence),
+      KEEP(shaderQuadControl),
+      KEEP(workgroupMemoryExplicitLayout),
+      KEEP(workgroupMemoryExplicitLayoutScalarBlockLayout),
+      KEEP(workgroupMemoryExplicitLayout8BitAccess),
+      KEEP(workgroupMemoryExplicitLayout16BitAccess),
+      KEEP(attachmentFeedbackLoopLayout),
+      KEEP(unifiedImageLayouts),
+      KEEP(dynamicRenderingUnusedAttachments),
+      KEEP(multiDraw),
+      KEEP(nonSeamlessCubeMap),
+      KEEP(shaderModuleIdentifier),
+      KEEP(shaderRelaxedExtendedInstruction),
+      KEEP(shaderSubgroupUniformControlFlow),
+      KEEP(formatA4R4G4B4),
+      KEEP(formatA4B4G4R4),
+      KEEP(depthClipEnable),
+      KEEP(extendedDynamicState),
+      KEEP(extendedDynamicState2),
+      KEEP(texelBufferAlignment),
+      KEEP(swapchainMaintenance1),
+      KEEP(presentId),
+      KEEP(presentId2),
+      KEEP(presentWait),
+      KEEP(presentWait2),
+      KEEP(shaderExpectAssume),
+      KEEP(pipelineProtectedAccess),
+      /* Advanced blending reads the tile in the shader. */
+      KEEP(advancedBlendCoherentOperations),
+      KEEP(vertexInputDynamicState),
+      KEEP(graphicsPipelineLibrary),
+      KEEP(shaderObject),
+      /* Blend, sample and vertex state specialise deferred shaders at draw
+       * time; rasterizer state is emitted per draw. */
+      KEEP(extendedDynamicState3TessellationDomainOrigin),
+      KEEP(extendedDynamicState3DepthClampEnable),
+      KEEP(extendedDynamicState3PolygonMode),
+      KEEP(extendedDynamicState3RasterizationSamples),
+      KEEP(extendedDynamicState3SampleMask),
+      KEEP(extendedDynamicState3AlphaToCoverageEnable),
+      KEEP(extendedDynamicState3AlphaToOneEnable),
+      KEEP(extendedDynamicState3LogicOpEnable),
+      KEEP(extendedDynamicState3ColorBlendEnable),
+      KEEP(extendedDynamicState3ColorBlendEquation),
+      KEEP(extendedDynamicState3ColorWriteMask),
+      KEEP(extendedDynamicState3RasterizationStream),
+      KEEP(extendedDynamicState3DepthClipEnable),
+      KEEP(extendedDynamicState3SampleLocationsEnable),
+      KEEP(extendedDynamicState3ProvokingVertexMode),
+      KEEP(extendedDynamicState3LineRasterizationMode),
+      .extendedDynamicState3LineStippleEnable = true,
+      .extendedDynamicState3DepthClipNegativeOneToOne = true,
+      /* 2D views clamp gradient samples in hardware; other implicit samples
+       * select the clamped LOD explicitly, without anisotropy. */
+      .minLod = true,
+      KEEP(shaderUniformBufferUnsizedArray),
+      KEEP(pipelineBinaries),
+      KEEP(presentTiming),
+      KEEP(presentAtAbsoluteTime),
+      KEEP(presentAtRelativeTime),
+      /* Capture replay and sparse binding rebind memory into reserved
+       * addresses. Shaders look up image residency in a table per image. */
+      KEEP(bufferDeviceAddressCaptureReplay),
+      KEEP(bufferDeviceAddressCaptureReplayEXT),
+      KEEP(sparseBinding),
+      KEEP(sparseResidencyBuffer),
+      KEEP(sparseResidencyAliased),
+      KEEP(sparseResidencyImage2D),
+      KEEP(shaderResourceResidency),
+      .attachmentFeedbackLoopDynamicState = true,
+      .memoryPriority = true,
+      /* Storage images address samples through the same layout as sampled
+       * multisample images. */
+      .shaderStorageImageMultisample = true,
+      .depthClampZeroOne = true,
+      .depthClampControl = true,
+      .maintenance10 = true,
+   };
+#undef KEEP
+
+   /* EXT_mesh_shader runs on the compute path: task and mesh workgroups run
+    * as compute kernels, then a draw of their output records. Multiview
+    * repeats both per view with the view index in the root table, and the
+    * rasterization shader writes the view's layer. Query counters are updated
+    * by task/mesh kernels before the deferred availability write, using the
+    * same query-pool machinery as other graphics stages.
+    * HK_APPLE9_MESH_SHADER=0 hides it.
+    */
+   if (debug_get_bool_option("HK_APPLE9_MESH_SHADER", true)) {
+      ext->EXT_mesh_shader = true;
+      feat->meshShader = true;
+      feat->taskShader = true;
+      feat->multiviewMeshShader = true;
+      feat->meshShaderQueries = true;
+   }
+
+   /* Fragment shader interlock: the compiler acquires the pixel in raster
+    * order at shader entry, holds it through the end of the shader and fences
+    * the critical section's memory accesses before the release; such shaders
+    * request ordered tile access. That orders fragments per covered sample,
+    * which is sample interlock. For pixel interlock under MSAA the draw also
+    * sets the fragment control "Pixel order" bit, which orders fragments of a
+    * pixel whatever samples they cover (at 1x the two are the same). That
+    * bit orders whole microtiles, so pixel interlock is reported only where
+    * the driconf hk_enable_pixel_interlock asks for it.
+    */
+   ext->EXT_fragment_shader_interlock = true;
+   feat->fragmentShaderSampleInterlock = true;
+   feat->fragmentShaderPixelInterlock = false;
+
+   /* Per-vertex inputs and barycentrics of vertex and mesh pipelines are
+    * written by the stage feeding the rasterizer, exact for primitives clipped
+    * at the 1.5w guard band.
+    */
+   ext->KHR_fragment_shader_barycentric = true;
+   feat->fragmentShaderBarycentric = true;
+
+   /* Predicated draws, dispatches and attachment clears read zeroed indirect
+    * arguments when the predicate fails. Secondary command buffers are
+    * replayed into the primary, so they inherit its predicate.
+    */
+   ext->EXT_conditional_rendering = true;
+   feat->conditionalRendering = true;
+   feat->inheritedConditionalRendering = true;
+
+   /* Primitives generated queries count in the passthrough geometry shader,
+    * which runs before rasterizer discard and sees every vertex stream.
+    */
+   ext->EXT_primitives_generated_query = true;
+   feat->primitivesGeneratedQuery = true;
+   feat->primitivesGeneratedQueryWithRasterizerDiscard = true;
+   feat->primitivesGeneratedQueryWithNonZeroStreams = feat->geometryStreams;
+
+   props->apiVersion = VK_MAKE_API_VERSION(0, 1, 4, VK_HEADER_VERSION);
+   props->conformanceVersion = (VkConformanceVersion){0};
+
+   /* Subgroup operations are lowered to native ballot and simd_shuffle. Task
+    * and mesh shaders run as compute kernels on the mesh path, with the same
+    * 32-lane subgroups.
+    */
+   props->subgroupSupportedStages = VK_SHADER_STAGE_COMPUTE_BIT |
+                                    VK_SHADER_STAGE_ALL_GRAPHICS;
+   if (feat->meshShader)
+      props->subgroupSupportedStages |= VK_SHADER_STAGE_TASK_BIT_EXT |
+                                        VK_SHADER_STAGE_MESH_BIT_EXT;
+   props->subgroupSupportedOperations =
+      VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT |
+      VK_SUBGROUP_FEATURE_BALLOT_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT |
+      VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT |
+      VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | VK_SUBGROUP_FEATURE_CLUSTERED_BIT |
+      VK_SUBGROUP_FEATURE_QUAD_BIT | VK_SUBGROUP_FEATURE_ROTATE_BIT |
+      VK_SUBGROUP_FEATURE_ROTATE_CLUSTERED_BIT;
+   props->subgroupQuadOperationsInAllStages = true;
+   props->requiredSubgroupSizeStages = VK_SHADER_STAGE_COMPUTE_BIT;
+
+   props->maxComputeSharedMemorySize = AGX_APPLE9_MAX_SHARED_BYTES;
+
+   /* VK_KHR_maintenance10: the opaque black border of RGBA4 formats is
+    * not established. */
+   props->rgba4OpaqueBlackSwizzled = false;
+   props->resolveSrgbFormatAppliesTransferFunction = true;
+   props->resolveSrgbFormatSupportsTransferFunctionControl = true;
+
+   /* VK_EXT_mesh_shader */
+   props->maxTaskWorkGroupTotalCount = 1 << 22;
+   for (unsigned i = 0; i < 3; ++i) {
+      props->maxTaskWorkGroupCount[i] = 65535;
+      props->maxTaskWorkGroupSize[i] = 128;
+      props->maxMeshWorkGroupCount[i] = 65535;
+      props->maxMeshWorkGroupSize[i] = 128;
+   }
+   props->maxTaskWorkGroupInvocations = 128;
+   props->maxTaskPayloadSize = 16384;
+   props->maxTaskSharedMemorySize = AGX_APPLE9_MAX_SHARED_BYTES;
+   props->maxTaskPayloadAndSharedMemorySize = AGX_APPLE9_MAX_SHARED_BYTES;
+   props->maxMeshWorkGroupTotalCount = 1 << 22;
+   props->maxMeshWorkGroupInvocations = 128;
+   props->maxMeshSharedMemorySize = AGX_APPLE9_MAX_SHARED_BYTES;
+   props->maxMeshPayloadAndSharedMemorySize = AGX_APPLE9_MAX_SHARED_BYTES;
+   props->maxMeshOutputMemorySize = 32768;
+   props->maxMeshPayloadAndOutputMemorySize = 48128;
+   props->maxMeshOutputComponents = 128;
+   props->maxMeshOutputVertices = 256;
+   props->maxMeshOutputPrimitives = 256;
+   props->maxMeshOutputLayers = 8;
+   /* Mesh multiview repeats the task and mesh work per view. 16 views cover
+    * D3D12 view instancing (4) with margin; a 32-view limit also trips the
+    * CTS's 32-bit view-mask shift (cts-mesh-max-view-index-20261009).
+    */
+   props->maxMeshMultiviewViewCount = MIN2(props->maxMultiviewViewCount, 16);
+   props->meshOutputPerVertexGranularity = 1;
+   props->meshOutputPerPrimitiveGranularity = 1;
+   props->maxPreferredTaskWorkGroupInvocations = 32;
+   props->maxPreferredMeshWorkGroupInvocations = 32;
+   props->prefersLocalInvocationVertexOutput = false;
+   props->prefersLocalInvocationPrimitiveOutput = false;
+   props->prefersCompactVertexOutput = true;
+
+   /* Native is an optional per-draw realization. Emulation backs the full
+    * advertised mesh/task limits, including grids and outputs larger than
+    * the current native class. */
+
+   /* VK_KHR_compute_shader_derivatives: task and mesh workgroups run as
+    * compute kernels with the API's linear invocation order, so linear
+    * derivative groups lower as in compute shaders.
+    */
+   props->meshAndTaskShaderDerivatives = true;
+   props->prefersCompactPrimitiveOutput = true;
+   /* Unbound sparse ranges map scratch pages, which reads observe, unless
+    * hk_sparse_unbound_unmapped leaves them unmapped (set by the caller).
+    */
+   props->sparseResidencyNonResidentStrict = false;
+   /* With early fragment tests, the depth/stencil test, and with it occlusion
+    * counting, runs at shader entry (agx_nir_lower_sample_mask). A sample the
+    * entry test counted cannot be discarded afterwards, so a gl_SampleMask
+    * write only masks color. Counting after the mask would mean deferring the
+    * test past the mask's computation, which early-test semantics forbid once
+    * side effects or attachment reads come first. The early_fragment
+    * sample_count QualityWarning reflects this spec-permitted order. */
+   props->earlyFragmentSampleMaskTestBeforeSampleCounting = false;
+   /* FP32 arithmetic flushes natively. The Apple9 compiler canonicalizes
+    * raw-result operations for explicit FTZ, including min/max, sign-bit
+    * operations, subgroup reductions and floating atomic return values.
+    * DenormPreserve shaders take guarded software paths around the
+    * flushing arithmetic (agx_nir_lower_apple9_denorm_preserve). */
+   props->shaderDenormFlushToZeroFloat32 = true;
+   props->shaderDenormPreserveFloat32 = true;
+   /* Position uses four entries of the 128-entry publication bank. Keep two
+    * more for point size and the layer/viewport word, including when inserted
+    * by lowering. Clip distances are already ordinary varying components
+    * and count against the API output limit, so do not reserve them twice.
+    * Their rasterizer copies share the ordinary varying exports.
+    */
+   const unsigned outputs = HK_APPLE9_OUTPUT_COMPONENTS;
+   props->maxVertexOutputComponents = outputs;
+   props->maxTessellationEvaluationOutputComponents = outputs;
+   props->maxGeometryOutputComponents = outputs;
+   /* Geometry inputs are the previous stage's outputs: advertise no more than
+    * a vertex or evaluation shader can export (the minimum is 64), so a
+    * geometry shader using the full input limit has a producer that links.
+    */
+   props->maxGeometryInputComponents = outputs;
+   /* Input declarations need not all have produced values. The fragment
+    * compiler removes unused and unwritten inputs before assigning compact
+    * coefficients from the producer's tighter export-bank layout. Expose
+    * all 32 API input locations without increasing the producer budget.
+    */
+   props->maxFragmentInputComponents = 128;
+   /* Polygon points are drawn as real points by the software polygon stage,
+    * which forwards the last pre-rasterization stage's PointSize. Draws it
+    * cannot take keep the hardware polygon mode with size 1: transform
+    * feedback, interfaces without room for the point size and polygon slot,
+    * and geometry or mesh shaders outside its limits.
+    */
+   props->polygonModePointSize = true;
+   /* Byte-count draws use a GPU conversion to the ordinary indirect path.
+    * Qualified on G16; retain the existing exposure on older generations.
+    */
+   props->transformFeedbackDraw = true;
+   props->maxComputeWorkGroupCount[0] = 65535;
+
+   /* The native 4x tile layout supports 64 bytes per pixel. Four RGBA32
+    * targets fill it; eight targets require tile spilling or a smaller tile
+    * layout that this path does not yet implement.
+    */
+   props->maxColorAttachments = 8;
+   props->maxFragmentOutputAttachments = 8;
+}
+
+uint64_t hk_process_heap_used[VK_MAX_MEMORY_HEAPS];
+
 VkResult
 hk_create_drm_physical_device(struct vk_instance *_instance,
                               drmDevicePtr drm_device,
@@ -1345,12 +1990,29 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    pdev->master_fd = -1;
    pdev->render_dev = render_dev;
    pdev->dev.fd = fd;
+   pdev->dev.native_mesh_classes = hk_apple9_native_index_class_hash();
+   /* Logical devices open their own agx_device, see hk_CreateDevice. */
+   pdev->dev.probe_only = true;
 
    if (!agx_open_device(NULL, &pdev->dev)) {
       /* Fail silently, for virtgpu */
       result = VK_ERROR_INCOMPATIBLE_DRIVER;
       goto fail_pdev_alloc;
    }
+
+   /* HK_EXPERIMENTAL_APPLE9=0 hides the device, e.g. to fall back to
+    * another Vulkan implementation. */
+   if (agx_is_apple9(&pdev->dev) &&
+       !debug_get_bool_option("HK_EXPERIMENTAL_APPLE9", true)) {
+      result = VK_ERROR_INCOMPATIBLE_DRIVER;
+      goto fail_agx_device;
+   }
+
+   /* A private install prefix or a DRIRC_CONFIGDIR override loses the
+    * application options silently otherwise. */
+   if (agx_is_apple9(&pdev->dev) && !instance->drirc.misc.defaults_loaded)
+      mesa_logw("hk: 00-hk-defaults.conf was not loaded; application "
+                "workarounds such as the D3D options are off");
 
    struct vk_physical_device_dispatch_table dispatch_table;
    vk_physical_device_dispatch_table_from_entrypoints(
@@ -1360,8 +2022,6 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
 
    struct vk_device_extension_table supported_extensions;
    hk_get_device_extensions(instance, &supported_extensions);
-   if (agx_apple9_compute_enabled(&pdev->dev))
-      supported_extensions.EXT_non_seamless_cube_map = false;
 
    struct vk_features supported_features;
    hk_get_device_features(&pdev->dev, instance, &supported_extensions,
@@ -1369,6 +2029,38 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
 
    struct vk_properties properties;
    hk_get_device_properties(&pdev->dev, instance, &properties);
+
+   if (agx_is_apple9(&pdev->dev)) {
+      hk_apple9_restrict_caps(&supported_extensions, &supported_features,
+                              &properties);
+      /* Sample positions are per render and a change splits the render, so
+       * they can vary within a subpass, but DXVK would centre samples for
+       * every MultisampleEnable=FALSE draw: report it only where the
+       * driconf asks (Zink, which needs it to disable GL_MULTISAMPLE). */
+      properties.variableSampleLocations =
+         instance->drirc.misc.variable_sample_locations;
+      /* Opt-in: under MSAA pixel interlock orders whole microtiles, several
+       * times slower with small primitives (README.apple9.md). */
+      supported_features.fragmentShaderPixelInterlock =
+         instance->drirc.misc.enable_pixel_interlock;
+      /* Unmapped with soft faults: unbound reads are zero, writes dropped. */
+      properties.sparseResidencyNonResidentStrict =
+         hk_sparse_unbound_unmapped(&pdev->dev);
+   }
+
+   /* VK_EXT_descriptor_buffer, with its memory type; HK_APPLE9_DESCRIPTOR_BUFFER=0
+    * hides both. With 128 B image and sampler parts vkd3d-proton finds its
+    * host copy templates; in-world ELDEN RING runs 13% faster with it (x86
+    * driver) and 5% (FEX thunk), with descriptor CPU near zero (2026-10-11). */
+   if (agx_is_apple9(&pdev->dev) &&
+       debug_get_bool_option("HK_APPLE9_DESCRIPTOR_BUFFER", true)) {
+      supported_extensions.EXT_descriptor_buffer = true;
+      supported_features.descriptorBuffer = true;
+      supported_features.descriptorBufferPushDescriptors = true;
+      supported_features.descriptorBufferCaptureReplay = true;
+      supported_features.descriptorBufferImageLayoutIgnored = false;
+   }
+
 
    properties.drmHasRender = true;
    properties.drmRenderMajor = major(render_dev);
@@ -1379,6 +2071,15 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
                                     &properties, &dispatch_table);
    if (result != VK_SUCCESS)
       goto fail_agx_device;
+
+   /* Set by driconf for vkd3d-proton, see hk_apple9_arrayed_2d_views. */
+   pdev->apple9_layered_2d = agx_is_apple9(&pdev->dev) &&
+      instance->drirc.misc.apple9_arrayed_2d_views;
+   pdev->apple9_d3d_mip_rounding = agx_is_apple9(&pdev->dev) &&
+      instance->drirc.misc.apple9_d3d_mip_rounding;
+   pdev->disable_native_index = instance->drirc.misc.disable_native_index;
+   pdev->disable_native_blocks = instance->drirc.misc.disable_native_blocks;
+   pdev->disable_native_stages = instance->drirc.misc.disable_native_stages;
 
    hk_physical_device_init_pipeline_cache(pdev);
 
@@ -1418,15 +2119,39 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       .heapIndex = sysmem_heap_idx,
    };
 
+   pdev->apple9_descriptor_mem_type = UINT8_MAX;
+   if (agx_is_apple9(&pdev->dev) &&
+       debug_get_bool_option("HK_APPLE9_DESCRIPTOR_BUFFER", true)) {
+      pdev->apple9_descriptor_mem_type = pdev->mem_type_count;
+      pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
+         .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                          VK_MEMORY_PROPERTY_HOST_CACHED_BIT |
+                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+         .heapIndex = sysmem_heap_idx,
+      };
+   }
+
    assert(pdev->mem_heap_count <= ARRAY_SIZE(pdev->mem_heaps));
    assert(pdev->mem_type_count <= ARRAY_SIZE(pdev->mem_types));
 
    pdev->queue_families[pdev->queue_family_count++] = (struct hk_queue_family){
-      .queue_flags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT |
+      .queue_flags = agx_is_apple9(&pdev->dev)
+                        ? VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT |
+                             VK_QUEUE_TRANSFER_BIT | VK_QUEUE_SPARSE_BINDING_BIT :
+                     VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT |
                      VK_QUEUE_TRANSFER_BIT | VK_QUEUE_SPARSE_BINDING_BIT,
 
       .queue_count = 1,
    };
+   /* Vulkan 1.4 requires a second transfer-capable family without host image
+    * copies. Its queues submit through their own kernel command queues. */
+   if (agx_is_apple9(&pdev->dev)) {
+      pdev->queue_families[pdev->queue_family_count++] = (struct hk_queue_family){
+         .queue_flags = VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT,
+         .queue_count = 1,
+      };
+   }
    assert(pdev->queue_family_count <= ARRAY_SIZE(pdev->queue_families));
 
    unsigned st_idx = 0;
@@ -1509,7 +2234,7 @@ hk_GetPhysicalDeviceMemoryProperties2(
 
          for (unsigned i = 0; i < pdev->mem_heap_count; i++) {
             const struct hk_memory_heap *heap = &pdev->mem_heaps[i];
-            uint64_t used = p_atomic_read(&heap->used);
+            uint64_t used = p_atomic_read(&hk_process_heap_used[i]);
 
             /* From the Vulkan 1.3.278 spec:
              *

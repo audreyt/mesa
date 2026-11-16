@@ -2059,6 +2059,40 @@ TEST_F(nir_load_store_vectorize_test, ubo_overlapping_vec4_vec4_unused_component
    EXPECT_INSTR_SWIZZLES(movs[0x2], load, "y");
 }
 
+TEST_F(nir_load_store_vectorize_test, global_split_address_alignment)
+{
+   nir_def *base = nir_load_ubo(b, 1, 64, nir_imm_int(b, 0),
+                               nir_imm_int(b, 0));
+   nir_intrinsic_set_align(nir_def_as_intrinsic(base), 8, 0);
+   nir_intrinsic_set_range(nir_def_as_intrinsic(base), 8);
+   nir_def *offset = nir_imm_int(b, 64);
+   nir_def *bound = nir_imm_int(b, 256);
+   nir_def *values[] = {
+      nir_load_global_constant_offset(b, 1, 32, base, offset),
+      nir_load_global_bounded(b, 1, 32, base, offset, bound),
+      nir_load_global_constant_bounded(b, 1, 32, base, offset, bound),
+   };
+   const nir_intrinsic_op ops[] = {
+      nir_intrinsic_load_global_constant_offset,
+      nir_intrinsic_load_global_bounded,
+      nir_intrinsic_load_global_constant_bounded,
+   };
+   for (auto *value : values) {
+      nir_intrinsic_set_align(nir_def_as_intrinsic(value), 16, 0);
+      nir_mov(b, value);
+   }
+
+   run_vectorizer(nir_var_mem_global);
+
+   for (auto op : ops) {
+      SCOPED_TRACE(op);
+      auto *load = get_intrinsic(op, 0);
+      ASSERT_NE(load, nullptr);
+      EXPECT_EQ(nir_intrinsic_align_mul(load), 16u);
+      EXPECT_EQ(nir_intrinsic_align_offset(load), 0u);
+   }
+}
+
 TEST_F(nir_load_store_vectorize_test, ubo_alignment_16_4)
 {
    nir_def *offset = nir_load_local_invocation_index(b);

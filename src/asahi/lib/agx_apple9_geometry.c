@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "agx_apple9_compute.h"
+#include "agx_apple9.h"
 
 #include <limits.h>
 #include <string.h>
@@ -48,8 +48,6 @@ agx_apple9_build_compute_geometry_fields(
           * numerator when rounding up on the CPU. */
          groups[d] = geometry->threads[d] / geometry->local[d] +
                      (geometry->threads[d] % geometry->local[d] != 0);
-         if (groups[d] > 65535)
-            return false;
       }
       pointer = record_address + offset;
       break;

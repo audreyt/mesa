@@ -13,7 +13,6 @@
 #include "hk_device.h"
 #include "hk_entrypoints.h"
 #include "hk_shader.h"
-#include "asahi/lib/agx_apple9_compute.h"
 
 #include "libagx_dgc.h"
 #include "libagx_shaders.h"
@@ -40,12 +39,6 @@ hk_has_available(const struct hk_query_pool *pool)
    return pool->vk.query_type != VK_QUERY_TYPE_TIMESTAMP;
 }
 
-static uint16_t *
-hk_pool_oq_index_ptr(const struct hk_query_pool *pool)
-{
-   return agx_bo_map(pool->bo) + pool->query_start;
-}
-
 static uint32_t
 hk_reports_per_query(struct hk_query_pool *pool)
 {
@@ -53,6 +46,7 @@ hk_reports_per_query(struct hk_query_pool *pool)
    case VK_QUERY_TYPE_OCCLUSION:
    case VK_QUERY_TYPE_TIMESTAMP:
    case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
+   case VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT:
       return 1;
    case VK_QUERY_TYPE_PIPELINE_STATISTICS:
       return util_bitcount(pool->vk.pipeline_statistics);
@@ -73,7 +67,9 @@ hk_flush_if_timestamp(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool)
     */
    if (pool->vk.query_type == VK_QUERY_TYPE_TIMESTAMP) {
       perf_debug(cmd, "Flushing for timestamp copy");
+      hk_cs_end_hint(cmd, HK_CS_END_QUERY);
       hk_cmd_buffer_end_graphics(cmd);
+      hk_cs_end_hint(cmd, HK_CS_END_QUERY);
       hk_cmd_buffer_end_compute(cmd);
    }
 }
@@ -98,35 +94,22 @@ static uint64_t
 hk_query_offset(struct hk_query_pool *pool, uint32_t query)
 {
    assert(query < pool->vk.query_count);
-   return pool->query_start + query * pool->query_stride;
+   return pool->query_start + (uint64_t)query * pool->query_stride;
 }
 
 static uint64_t
-hk_query_report_addr(struct hk_device *dev, struct hk_query_pool *pool,
+hk_query_report_addr(struct hk_query_pool *pool,
                      uint32_t query)
 {
-   if (pool->oq_queries) {
-      uint16_t *oq_index = hk_pool_oq_index_ptr(pool);
-      return dev->occlusion_queries.bo->va->addr +
-             (oq_index[query] * sizeof(uint64_t));
-   } else {
-      return pool->bo->va->addr + hk_query_offset(pool, query);
-   }
+   return pool->bo->va->addr + hk_query_offset(pool, query);
 }
 
 static struct hk_query_report *
-hk_query_report_map(struct hk_device *dev, struct hk_query_pool *pool,
+hk_query_report_map(struct hk_query_pool *pool,
                     uint32_t query)
 {
-   if (pool->oq_queries) {
-      uint64_t *queries = (uint64_t *)agx_bo_map(dev->occlusion_queries.bo);
-      uint16_t *oq_index = hk_pool_oq_index_ptr(pool);
-
-      return (struct hk_query_report *)&queries[oq_index[query]];
-   } else {
-      return (void *)((char *)agx_bo_map(pool->bo) +
-                      hk_query_offset(pool, query));
-   }
+   return (void *)((char *)agx_bo_map(pool->bo) +
+                   hk_query_offset(pool, query));
 }
 
 void
@@ -159,7 +142,7 @@ hk_queue_write(struct hk_cmd_buffer *cmd, uint64_t address, uint32_t value,
                bool after_gfx)
 {
    struct hk_cs *cs = hk_cmd_buffer_get_cs_general(
-      cmd, after_gfx ? &cmd->current_cs.post_gfx : &cmd->current_cs.cs, true);
+      cmd, after_gfx ? &cmd->current_cs.post_gfx : &cmd->current_cs.cs, true, HK_SYNC_ALL);
    if (!cs)
       return;
 
@@ -189,19 +172,131 @@ hk_queue_write(struct hk_cmd_buffer *cmd, uint64_t address, uint32_t value,
    libagx_write_u32(cmd, agx_1d(1), AGX_BARRIER_ALL, address, value);
 }
 
+/* Apply queued query counter increments, then mark their queries available.
+ * Called outside rendering wherever queries can next be observed: resets,
+ * copies and the end of the command buffer.
+ */
+void
+hk_flush_query_writes(struct hk_cmd_buffer *cmd)
+{
+   unsigned accums = util_dynarray_num_elements(&cmd->occlusion_accum,
+                                                struct libagx_occlusion_accum);
+   if (accums) {
+      struct hk_cs *cs =
+         hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.cs, true, HK_SYNC_ALL);
+      if (cs) {
+         /* The segments were written by rendering that has to complete. */
+         hk_cdm_cache_flush(hk_cmd_buffer_device(cmd), cs);
+         uint64_t params = hk_pool_upload(cmd, cmd->occlusion_accum.data,
+                                          cmd->occlusion_accum.size, 16);
+         libagx_accumulate_occlusion(cmd, agx_1d(1), AGX_BARRIER_ALL, params,
+                                     accums);
+      }
+   }
+
+   unsigned adds =
+      util_dynarray_num_elements(&cmd->query_adds, struct libagx_imm_write);
+   unsigned writes =
+      util_dynarray_num_elements(&cmd->query_writes, struct libagx_imm_write);
+
+   if (adds) {
+      uint64_t params = hk_pool_upload(cmd, cmd->query_adds.data,
+                                       cmd->query_adds.size, 16);
+      libagx_add_u32s(cmd, agx_1d(1), AGX_BARRIER_ALL, params, adds);
+   }
+
+   if (writes) {
+      struct hk_cs *cs =
+         hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.cs, true, HK_SYNC_ALL);
+      if (cs) {
+         /* Results must be visible system-wide once marked available, as in
+          * hk_dispatch_imm_writes. */
+         hk_cdm_cache_flush(hk_cmd_buffer_device(cmd), cs);
+         uint64_t params = hk_pool_upload(cmd, cmd->query_writes.data,
+                                          cmd->query_writes.size, 16);
+         libagx_write_u32s(cmd, agx_1d(writes), AGX_BARRIER_ALL, params);
+      }
+   }
+
+   util_dynarray_clear(&cmd->occlusion_accum);
+   util_dynarray_clear(&cmd->query_adds);
+   util_dynarray_clear(&cmd->query_writes);
+}
+
+/* Select the visibility slot for the next draw. Each control stream counts
+ * into its own segment slots; a segment is added into every occlusion query
+ * that was active while it counted when the queries are next observed. A
+ * counting segment also serves non-precise queries, which only need a nonzero
+ * result. Returns the control stream, which changes if this one ran out of
+ * segment slots.
+ */
+struct hk_cs *
+hk_occlusion_prepare_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+
+   if (gfx->occlusion.segment_dirty) {
+      gfx->occlusion.segment_dirty = false;
+      gfx->occlusion.segment_mode = AGX_VISIBILITY_MODE_NONE;
+
+      if (gfx->occlusion.active_count) {
+         if (cs->occlusion_segments == HK_OCCLUSION_SEGMENTS) {
+            perf_debug(cmd, "Splitting control stream for occlusion segments");
+            hk_cs_end_hint(cmd, HK_CS_END_QUERY);
+            hk_cmd_buffer_end_graphics(cmd);
+            cs = hk_cmd_buffer_get_cs(cmd, false /* compute */);
+            if (!cs)
+               return NULL;
+            gfx->occlusion.segment_dirty = false;
+         }
+
+         if (!cs->occlusion_base) {
+            size_t size = HK_OCCLUSION_SEGMENTS * sizeof(uint64_t);
+            struct agx_ptr slots = hk_pool_alloc(cmd, size, 64);
+            if (!slots.cpu)
+               return cs;
+            memset(slots.cpu, 0, size);
+            cs->occlusion_base = slots.gpu;
+         }
+
+         unsigned segment = cs->occlusion_segments++;
+         bool precise = false;
+         for (unsigned i = 0; i < gfx->occlusion.active_count; ++i) {
+            struct libagx_occlusion_accum accum = {
+               .src = cs->occlusion_base + segment * sizeof(uint64_t),
+               .dst = gfx->occlusion.active[i].report,
+            };
+            util_dynarray_append(&cmd->occlusion_accum, accum);
+            precise |= gfx->occlusion.active[i].precise;
+         }
+
+         gfx->occlusion.index = segment;
+         gfx->occlusion.segment_mode = precise ? AGX_VISIBILITY_MODE_COUNTING
+                                               : AGX_VISIBILITY_MODE_BOOLEAN;
+         gfx->dirty |= HK_DIRTY_OCCLUSION;
+      }
+   }
+
+   enum agx_visibility_mode mode =
+      gfx->occlusion.paused ? AGX_VISIBILITY_MODE_NONE
+                            : gfx->occlusion.segment_mode;
+   if (mode != gfx->occlusion.mode) {
+      gfx->occlusion.mode = mode;
+      gfx->dirty |= HK_DIRTY_OCCLUSION;
+   }
+   return cs;
+}
+
 static void
 emit_zero_queries(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
                   uint32_t first_index, uint32_t num_queries,
                   bool set_available)
 {
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
    perf_debug(cmd, "Query pool zero");
 
    struct libagx_reset_query_args info = {
       .availability = hk_has_available(pool) ? pool->bo->va->addr : 0,
-      .results = pool->oq_queries ? dev->occlusion_queries.bo->va->addr
-                                  : pool->bo->va->addr + pool->query_start,
-      .oq_index = pool->oq_queries ? pool->bo->va->addr + pool->query_start : 0,
+      .results = pool->bo->va->addr + pool->query_start,
 
       .first_query = first_index,
       .reports_per_query = hk_reports_per_query(pool),
@@ -218,7 +313,7 @@ host_zero_queries(struct hk_device *dev, struct hk_query_pool *pool,
 {
    for (uint32_t i = 0; i < num_queries; i++) {
       struct hk_query_report *reports =
-         hk_query_report_map(dev, pool, first_index + i);
+         hk_query_report_map(pool, first_index + i);
 
       uint64_t value = 0;
       if (hk_has_available(pool)) {
@@ -242,17 +337,8 @@ hk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
    VK_FROM_HANDLE(hk_device, dev, device);
    struct hk_query_pool *pool;
 
-   if (agx_apple9_compute_enabled(&dev->dev) &&
-       pCreateInfo->queryType != VK_QUERY_TYPE_TIMESTAMP) {
-      if (getenv("AGX_APPLE9_TRACE_REJECT"))
-         fprintf(stderr, "APPLE9_RENDER_REJECT reason=queries type=%d count=%u\n",
-                 pCreateInfo->queryType, pCreateInfo->queryCount);
-      return vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
-   }
-
    bool occlusion = pCreateInfo->queryType == VK_QUERY_TYPE_OCCLUSION;
    bool timestamp = pCreateInfo->queryType == VK_QUERY_TYPE_TIMESTAMP;
-   unsigned occlusion_queries = occlusion ? pCreateInfo->queryCount : 0;
 
    pool =
       vk_query_pool_create(&dev->vk, pCreateInfo, pAllocator, sizeof(*pool));
@@ -262,26 +348,34 @@ hk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
    /* We place the availability first and then data */
    pool->query_start = 0;
    if (hk_has_available(pool)) {
-      pool->query_start = align(pool->vk.query_count * sizeof(uint32_t),
-                                sizeof(struct hk_query_report));
+      /* Keep visibility results page aligned, as with the former standalone
+       * hardware table. CPU report alignment alone is insufficient.
+       */
+      unsigned alignment =
+         occlusion ? AIL_PAGESIZE : sizeof(struct hk_query_report);
+      pool->query_start =
+         align64((uint64_t)pool->vk.query_count * sizeof(uint32_t), alignment);
    }
 
    uint32_t reports_per_query = hk_reports_per_query(pool);
    pool->query_stride = reports_per_query * sizeof(struct hk_query_report);
 
    if (pool->vk.query_count > 0) {
-      uint32_t bo_size = pool->query_start;
+      uint64_t bo_size = pool->query_start +
+                         (uint64_t)pool->query_stride * pool->vk.query_count;
 
-      /* For occlusion queries, we stick the query index remapping here */
-      if (occlusion_queries)
-         bo_size += sizeof(uint16_t) * pool->vk.query_count;
-      else
-         bo_size += pool->query_stride * pool->vk.query_count;
-
-      /* The kernel requires that timestamp buffers are SHARED */
-      enum agx_bo_flags flags = AGX_BO_WRITEBACK;
+      /* Preserve the uncached CPU mapping of native visibility results. */
+      enum agx_bo_flags flags = occlusion ? 0 : AGX_BO_WRITEBACK;
+      /* The kernel requires that timestamp buffers are SHARED. */
       if (timestamp)
          flags |= AGX_BO_SHARED;
+
+      /* G16 firmware writes timestamps through an uncached mapping, which
+       * does not snoop CPU caches. Keep the CPU view uncached too, so reset
+       * values cannot linger in a cache line over the firmware's write.
+       */
+      if (timestamp && agx_is_apple9(&dev->dev))
+         flags &= ~AGX_BO_WRITEBACK;
 
       pool->bo = agx_bo_create(&dev->dev, bo_size, 0, flags, "Query pool");
       if (!pool->bo) {
@@ -304,25 +398,6 @@ hk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
       }
    }
 
-   uint16_t *oq_index = hk_pool_oq_index_ptr(pool);
-
-   for (unsigned i = 0; i < occlusion_queries; ++i) {
-      uint64_t zero = 0;
-      unsigned index;
-
-      VkResult result = hk_descriptor_table_add(
-         dev, &dev->occlusion_queries, &zero, sizeof(uint64_t), &index);
-
-      if (result != VK_SUCCESS) {
-         hk_DestroyQueryPool(device, hk_query_pool_to_handle(pool), pAllocator);
-         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-      }
-
-      /* We increment as we go so we can clean up properly if we run out */
-      assert(pool->oq_queries < occlusion_queries);
-      oq_index[pool->oq_queries++] = index;
-   }
-
    if (pCreateInfo->flags & VK_QUERY_POOL_CREATE_RESET_BIT_KHR)
       host_zero_queries(dev, pool, 0, pool->vk.query_count, false);
 
@@ -340,12 +415,6 @@ hk_DestroyQueryPool(VkDevice device, VkQueryPool queryPool,
 
    if (!pool)
       return;
-
-   uint16_t *oq_index = hk_pool_oq_index_ptr(pool);
-
-   for (unsigned i = 0; i < pool->oq_queries; ++i) {
-      hk_descriptor_table_remove(dev, &dev->occlusion_queries, oq_index[i]);
-   }
 
    if (pool->handle)
       dev->dev.ops.bo_unbind_object(&dev->dev, pool->handle);
@@ -369,9 +438,11 @@ hk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
                      uint32_t firstQuery, uint32_t queryCount)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   hk_cmd_render_merge_flush(cmd);
    VK_FROM_HANDLE(hk_query_pool, pool, queryPool);
 
    hk_flush_if_timestamp(cmd, pool);
+   hk_flush_query_writes(cmd);
 
    perf_debug(cmd, "Reset query pool");
    emit_zero_queries(cmd, pool, firstQuery, queryCount, false);
@@ -383,10 +454,11 @@ hk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
                       uint32_t query)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   hk_cmd_render_merge_flush(cmd);
+   hk_apple9_end_native_batch(cmd);
    VK_FROM_HANDLE(hk_query_pool, pool, queryPool);
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
-   uint64_t report_addr = hk_query_report_addr(dev, pool, query);
+   uint64_t report_addr = hk_query_report_addr(pool, query);
    bool after_gfx = cmd->current_cs.gfx != NULL;
 
    /* When writing timestamps for compute, we split the control stream at each
@@ -402,11 +474,12 @@ hk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
        cmd->current_cs.cs->timestamp.end.addr) {
 
       perf_debug(cmd, "Splitting for compute timestamp");
+      hk_cs_end_hint(cmd, HK_CS_END_QUERY);
       hk_cmd_buffer_end_compute(cmd);
    }
 
    struct hk_cs *cs = hk_cmd_buffer_get_cs_general(
-      cmd, after_gfx ? &cmd->current_cs.gfx : &cmd->current_cs.cs, true);
+      cmd, after_gfx ? &cmd->current_cs.gfx : &cmd->current_cs.cs, true, HK_SYNC_ALL);
    if (!cs)
       return;
 
@@ -452,40 +525,69 @@ hk_cmd_begin_end_query(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
                        uint32_t query, uint32_t index,
                        VkQueryControlFlags flags, bool end)
 {
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
    bool graphics = false;
 
    switch (pool->vk.query_type) {
    case VK_QUERY_TYPE_OCCLUSION: {
-      assert(query < pool->oq_queries);
+      assert(query < pool->vk.query_count);
+      struct hk_graphics_state *gfx = &cmd->state.gfx;
+      uint64_t report = hk_query_report_addr(pool, query);
 
       if (end) {
-         cmd->state.gfx.occlusion.mode = AGX_VISIBILITY_MODE_NONE;
+         for (unsigned i = 0; i < gfx->occlusion.active_count; ++i) {
+            if (gfx->occlusion.active[i].report == report) {
+               gfx->occlusion.active[i] =
+                  gfx->occlusion.active[--gfx->occlusion.active_count];
+               break;
+            }
+         }
       } else {
-         cmd->state.gfx.occlusion.mode = flags & VK_QUERY_CONTROL_PRECISE_BIT
-                                            ? AGX_VISIBILITY_MODE_COUNTING
-                                            : AGX_VISIBILITY_MODE_BOOLEAN;
+         assert(gfx->occlusion.active_count < HK_MAX_ACTIVE_OCCLUSION_QUERIES);
+         if (gfx->occlusion.active_count < HK_MAX_ACTIVE_OCCLUSION_QUERIES) {
+            unsigned i = gfx->occlusion.active_count++;
+            gfx->occlusion.active[i].report = report;
+            gfx->occlusion.active[i].precise =
+               flags & VK_QUERY_CONTROL_PRECISE_BIT;
+         }
       }
 
-      uint16_t *oq_index = hk_pool_oq_index_ptr(pool);
-      cmd->state.gfx.occlusion.index = oq_index[query];
-      cmd->state.gfx.dirty |= HK_DIRTY_OCCLUSION;
+      /* Draws after this count into a new segment of the active set. */
+      gfx->occlusion.segment_dirty = true;
       graphics = true;
       break;
    }
 
    case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT: {
-      uint64_t addr = hk_query_report_addr(dev, pool, query);
+      uint64_t addr = hk_query_report_addr(pool, query);
       cmd->state.gfx.xfb_query[index] = end ? 0 : addr;
       break;
    }
 
+   case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT: {
+      uint64_t addr = hk_query_report_addr(pool, query);
+      cmd->state.gfx.pg_query[index] = end ? 0 : addr;
+      /* Counting needs a geometry stage; reconsider the passthrough. */
+      cmd->state.gfx.shaders_dirty |= BITFIELD_BIT(MESA_SHADER_VERTEX);
+      graphics = true;
+      break;
+   }
+
+   case VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT:
+      cmd->state.gfx.mesh_pg_query = end ? 0 : hk_query_report_addr(pool, query);
+      graphics = true;
+      break;
+
    case VK_QUERY_TYPE_PIPELINE_STATISTICS: {
+      /* Direct draws' input assembly counts belong to the ending query. */
+      hk_flush_ia_stats(cmd);
       struct hk_root_descriptor_table *root = &cmd->state.gfx.descriptors.root;
       cmd->state.gfx.descriptors.root_dirty = true;
 
-      root->draw.pipeline_stats = hk_query_report_addr(dev, pool, query);
-      root->draw.pipeline_stats_flags = pool->vk.pipeline_statistics;
+      /* Later draws must neither change the ended query nor pay for its
+       * counters: every enabled statistic costs work per draw or fragment. */
+      root->draw.pipeline_stats =
+         end ? AGX_SCRATCH_PAGE_ADDRESS : hk_query_report_addr(pool, query);
+      root->draw.pipeline_stats_flags = end ? 0 : pool->vk.pipeline_statistics;
 
       /* XXX: I don't think is correct... when does the query become available
        * exactly?
@@ -499,10 +601,18 @@ hk_cmd_begin_end_query(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
       UNREACHABLE("Unsupported query type");
    }
 
-   /* We need to set available=1 after the graphics work finishes. */
+   /* We need to set available=1 after the graphics work finishes. Defer that
+    * until the query can be observed, so that a query ending in each render
+    * pass does not add a compute dispatch between render passes. */
    if (end) {
       perf_debug(cmd, "Query ending, type %u", pool->vk.query_type);
-      hk_queue_write(cmd, hk_query_available_addr(pool, query), 1, graphics);
+      uint64_t available = hk_query_available_addr(pool, query);
+      if (graphics) {
+         struct libagx_imm_write write = {.address = available, .value = 1};
+         util_dynarray_append(&cmd->query_writes, write);
+      } else {
+         hk_queue_write(cmd, available, 1, false);
+      }
    }
 }
 
@@ -512,6 +622,7 @@ hk_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
                            uint32_t index)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   hk_cmd_render_merge_flush(cmd);
    VK_FROM_HANDLE(hk_query_pool, pool, queryPool);
 
    hk_cmd_begin_end_query(cmd, pool, query, index, flags, false);
@@ -522,6 +633,7 @@ hk_CmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
                          uint32_t query, uint32_t index)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   hk_cmd_render_merge_flush(cmd);
    VK_FROM_HANDLE(hk_query_pool, pool, queryPool);
 
    hk_cmd_begin_end_query(cmd, pool, query, index, 0, true);
@@ -557,7 +669,7 @@ hk_query_is_available(struct hk_device *dev, struct hk_query_pool *pool,
       return p_atomic_read(available) != 0;
    } else {
       const struct hk_query_report *report =
-         hk_query_report_map(dev, pool, query);
+         hk_query_report_map(pool, query);
 
       return report->value != LIBAGX_QUERY_UNAVAILABLE;
    }
@@ -624,7 +736,7 @@ hk_GetQueryPoolResults(VkDevice device, VkQueryPool queryPool,
 
       bool write_results = available || (flags & VK_QUERY_RESULT_PARTIAL_BIT);
 
-      const struct hk_query_report *src = hk_query_report_map(dev, pool, query);
+      const struct hk_query_report *src = hk_query_report_map(pool, query);
       assert(i * stride < dataSize);
       void *dst = (char *)pData + i * stride;
 
@@ -652,19 +764,18 @@ hk_CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
                            VkDeviceSize stride, VkQueryResultFlags flags)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   hk_cmd_render_merge_flush(cmd);
    VK_FROM_HANDLE(hk_query_pool, pool, queryPool);
    VK_FROM_HANDLE(hk_buffer, dst_buffer, dstBuffer);
 
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
    hk_flush_if_timestamp(cmd, pool);
+   hk_flush_query_writes(cmd);
 
    perf_debug(cmd, "Query pool copy");
 
    struct libagx_copy_query_args info = {
       .availability = hk_has_available(pool) ? pool->bo->va->addr : 0,
-      .results = pool->oq_queries ? dev->occlusion_queries.bo->va->addr
-                                  : pool->bo->va->addr + pool->query_start,
-      .oq_index = pool->oq_queries ? pool->bo->va->addr + pool->query_start : 0,
+      .results = pool->bo->va->addr + pool->query_start,
 
       .first_query = firstQuery,
       .dst_addr = hk_buffer_address_rw(dst_buffer, dstOffset),

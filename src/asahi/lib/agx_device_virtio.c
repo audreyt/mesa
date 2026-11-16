@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "util/u_wait_watchdog.h"
 #include "agx_device_virtio.h"
 
 #include <inttypes.h>
@@ -47,12 +48,14 @@ agx_virtio_simple_ioctl(struct agx_device *dev, unsigned cmd, void *_req)
    if (cmd & IOC_OUT)
       memcpy(_req, rsp->payload, _IOC_SIZE(cmd));
 
+   u_watchdog_ioctl("asahi virtio host IOCTL_SIMPLE", dev->fd, rsp->ret, 0);
    return rsp->ret;
 }
 
 static struct agx_bo *
 agx_virtio_bo_alloc(struct agx_device *dev, size_t size, size_t align,
-                    enum agx_bo_flags flags)
+                    enum agx_bo_flags flags,
+                    enum agx_va_flags extra_va_flags, uint64_t fixed_va)
 {
    struct agx_bo *bo;
    unsigned handle = 0;
@@ -81,7 +84,8 @@ agx_virtio_bo_alloc(struct agx_device *dev, size_t size, size_t align,
    enum agx_va_flags va_flags = flags & AGX_BO_CONTEXT  ? AGX_VA_CONTEXT
                                 : flags & AGX_BO_LOW_VA ? AGX_VA_USC
                                                         : 0;
-   struct agx_va *va = agx_va_alloc(dev, size, align, va_flags, 0);
+   struct agx_va *va =
+      agx_va_alloc(dev, size, align, va_flags | extra_va_flags, fixed_va);
    if (!va) {
       fprintf(stderr, "Failed to allocate BO VMA\n");
       return NULL;
@@ -192,15 +196,19 @@ agx_virtio_bo_unbind_object(struct agx_device *dev, uint32_t object_handle)
    return 0;
 }
 
-static void
-agx_virtio_bo_mmap(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr)
+static void *
+agx_virtio_bo_mmap(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr,
+                   size_t size)
 {
-   bo->_map = vdrm_bo_map(dev->vdrm, bo->handle, bo->size, fixed_addr);
-   if (bo->_map == MAP_FAILED) {
-      bo->_map = NULL;
-      fprintf(stderr, "mmap failed: result=%p size=0x%llx fd=%i\n", bo->_map,
-              (long long)bo->size, dev->fd);
+   void *map = vdrm_bo_map(dev->vdrm, bo->handle, size, fixed_addr);
+   if (map == MAP_FAILED) {
+      fprintf(stderr, "mmap failed: size=0x%llx fd=%i\n", (long long)size,
+              dev->fd);
+      return NULL;
    }
+
+   agx_bo_mapping_dontfork(map, size);
+   return map;
 }
 
 static ssize_t

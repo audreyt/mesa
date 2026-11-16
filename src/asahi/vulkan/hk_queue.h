@@ -8,12 +8,25 @@
 #pragma once
 
 #include "hk_private.h"
+#include "hk_sync.h"
+#include "hk_queue_completion.h"
 #include "vk_queue.h"
 
 struct hk_device;
 
 struct hk_queue {
    struct vk_queue vk;
+#ifdef HK_GPU_BUSY_COUNTERS
+   struct hk_gpu_busy_queue *gpu_busy;
+#endif
+   struct hk_sync_state sync;
+   struct hk_queue_completion completion;
+   bool completion_initialized;
+
+   /* A render that writes memory other than its attachments (stores,
+    * atomics, transform feedback) was submitted, and no later render's
+    * tiling has waited for its completion since (hk_queue.c). */
+   bool render_writer_pending;
 
    struct {
       /* Asahi kernel queue ID */

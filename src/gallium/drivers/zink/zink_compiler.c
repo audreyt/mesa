@@ -87,8 +87,8 @@ is_clipcull_dist(int location)
 
 #define SIZEOF_FIELD(type, field) sizeof(((type *)0)->field)
 
-static void
-create_gfx_pushconst(nir_shader *nir)
+static const struct glsl_type *
+gfx_pushconst_type(nir_shader *nir, bool poly_stipple)
 {
 #define PUSHCONST_MEMBER(member_idx, field)                                                                     \
 fields[member_idx].type =                                                                                       \
@@ -96,7 +96,6 @@ fields[member_idx].type =                                                       
 fields[member_idx].name = ralloc_asprintf(nir, #field);                                                         \
 fields[member_idx].offset = offsetof(struct zink_gfx_push_constant, field);
 
-   nir_variable *pushconst;
    /* create compatible layout for the ntv push constant loader */
    struct glsl_struct_field *fields = rzalloc_array(nir, struct glsl_struct_field, ZINK_GFX_PUSHCONST_MAX);
    PUSHCONST_MEMBER(ZINK_GFX_PUSHCONST_DRAW_MODE_IS_INDEXED, draw_mode_is_indexed);
@@ -107,13 +106,25 @@ fields[member_idx].offset = offsetof(struct zink_gfx_push_constant, field);
    PUSHCONST_MEMBER(ZINK_GFX_PUSHCONST_LINE_STIPPLE_PATTERN, line_stipple_pattern);
    PUSHCONST_MEMBER(ZINK_GFX_PUSHCONST_VIEWPORT_SCALE, viewport_scale);
    PUSHCONST_MEMBER(ZINK_GFX_PUSHCONST_LINE_WIDTH, line_width);
+   PUSHCONST_MEMBER(ZINK_GFX_PUSHCONST_POLY_STIPPLE, poly_stipple);
 
-   pushconst = nir_variable_create(nir, nir_var_mem_push_const,
-                                   glsl_struct_type(fields, ZINK_GFX_PUSHCONST_MAX, "struct", false),
-                                   "gfx_pushconst");
-   pushconst->data.location = INT_MAX; //doesn't really matter
+   /* the stipple pattern is only declared by shaders that read it, since
+    * it is outside the push constant range on some devices
+    */
+   unsigned num_fields = poly_stipple ? ZINK_GFX_PUSHCONST_MAX : ZINK_GFX_PUSHCONST_POLY_STIPPLE;
+   return glsl_struct_type(fields, num_fields, "struct", false);
 
 #undef PUSHCONST_MEMBER
+}
+
+static void
+create_gfx_pushconst(nir_shader *nir)
+{
+   nir_variable *pushconst;
+   pushconst = nir_variable_create(nir, nir_var_mem_push_const,
+                                   gfx_pushconst_type(nir, false),
+                                   "gfx_pushconst");
+   pushconst->data.location = INT_MAX; //doesn't really matter
 }
 
 static bool
@@ -560,6 +571,30 @@ struct lower_line_stipple_state {
    bool line_rectangular;
 };
 
+/* Varyings added by draw-time lowering are created separately in the
+ * generated GS and in the FS, after IO assignment, so neither side can count
+ * the other's variables. They take fixed driver locations at the top of the
+ * range instead: GL varyings are capped at half of the Vulkan output
+ * locations (see max_varyings in zink_screen.c), which keeps these clear of
+ * every assigned slot. The only internal varyings that take assigned slots
+ * are the up to two relocated clip distance vectors (lower_clip_fs).
+ */
+enum zink_emulated_varying {
+   ZINK_EMULATED_VARYING_STIPPLE = 1,
+   ZINK_EMULATED_VARYING_LINE_COORD = 2,
+};
+
+static unsigned
+emulated_varying_location(const struct zink_screen *screen,
+                          enum zink_emulated_varying varying)
+{
+   const VkPhysicalDeviceLimits *limits = &screen->info.props.limits;
+   unsigned top = MIN3(limits->maxGeometryOutputComponents / 4,
+                       limits->maxFragmentInputComponents / 4, MAX_VARYING);
+   assert(top >= ZINK_EMULATED_VARYING_LINE_COORD + 2 + screen->base.caps.max_varyings);
+   return top - varying;
+}
+
 static nir_def *
 viewport_map(nir_builder *b, nir_def *vert,
              nir_def *scale)
@@ -620,7 +655,8 @@ lower_line_stipple_gs_instr(nir_builder *b, nir_instr *instr, void *data)
 }
 
 static bool
-lower_line_stipple_gs(nir_shader *shader, bool line_rectangular)
+lower_line_stipple_gs(nir_shader *shader, bool line_rectangular,
+                      unsigned driver_location)
 {
    nir_builder b;
    struct lower_line_stipple_state state;
@@ -637,7 +673,8 @@ lower_line_stipple_gs(nir_shader *shader, bool line_rectangular)
                                            glsl_float_type(),
                                            "__stipple");
    state.stipple_out->data.interpolation = INTERP_MODE_NOPERSPECTIVE;
-   state.stipple_out->data.driver_location = shader->num_outputs++;
+   state.stipple_out->data.driver_location = driver_location;
+   shader->num_outputs++;
    state.stipple_out->data.location = MAX2(util_last_bit64(shader->info.outputs_written), VARYING_SLOT_VAR0);
    shader->info.outputs_written |= BITFIELD64_BIT(state.stipple_out->data.location);
 
@@ -664,7 +701,7 @@ lower_line_stipple_gs(nir_shader *shader, bool line_rectangular)
 }
 
 static bool
-lower_line_stipple_fs(nir_shader *shader)
+lower_line_stipple_fs(nir_shader *shader, unsigned driver_location)
 {
    nir_builder b;
    nir_function_impl *entry = nir_shader_get_entrypoint(shader);
@@ -675,7 +712,8 @@ lower_line_stipple_fs(nir_shader *shader)
                                                glsl_float_type(),
                                                "__stipple");
    stipple->data.interpolation = INTERP_MODE_NOPERSPECTIVE;
-   stipple->data.driver_location = shader->num_inputs++;
+   stipple->data.driver_location = driver_location;
+   shader->num_inputs++;
    stipple->data.location = MAX2(util_last_bit64(shader->info.inputs_read), VARYING_SLOT_VAR0);
    shader->info.inputs_read |= BITFIELD64_BIT(stipple->data.location);
 
@@ -916,7 +954,7 @@ lower_line_smooth_gs_instr(nir_builder *b, nir_instr *instr, void *data)
 }
 
 static bool
-lower_line_smooth_gs(nir_shader *shader)
+lower_line_smooth_gs(nir_shader *shader, unsigned driver_location)
 {
    nir_builder b;
    struct lower_line_smooth_state state;
@@ -949,17 +987,11 @@ lower_line_smooth_gs(nir_shader *shader)
    if (!state.pos_out)
       return false;
 
-   unsigned location = 0;
-   nir_foreach_shader_in_variable(var, shader) {
-     if (var->data.driver_location >= location)
-         location = var->data.driver_location + 1;
-   }
-
    state.line_coord_out =
       nir_variable_create(shader, nir_var_shader_out, glsl_vec4_type(),
                           "__line_coord");
    state.line_coord_out->data.interpolation = INTERP_MODE_NOPERSPECTIVE;
-   state.line_coord_out->data.driver_location = location;
+   state.line_coord_out->data.driver_location = driver_location;
    state.line_coord_out->data.location = MAX2(util_last_bit64(shader->info.outputs_written), VARYING_SLOT_VAR0);
    shader->info.outputs_written |= BITFIELD64_BIT(state.line_coord_out->data.location);
    shader->num_outputs++;
@@ -984,8 +1016,52 @@ lower_line_smooth_gs(nir_shader *shader)
                                        nir_metadata_control_flow, &state);
 }
 
+/* GL polygon stipple: kill fragments whose bit in the 32x32 pattern is clear.
+ * The pattern rows are in framebuffer order (row 0 at y = 0), with the most
+ * significant bit of each row at x % 32 == 0.
+ */
 static bool
-lower_line_smooth_fs(nir_shader *shader, bool lower_stipple)
+lower_poly_stipple_fs(nir_shader *shader)
+{
+   nir_function_impl *entry = nir_shader_get_entrypoint(shader);
+   nir_builder b = nir_builder_at(nir_before_impl(entry));
+
+   nir_foreach_variable_with_modes(var, shader, nir_var_mem_push_const)
+      var->type = gfx_pushconst_type(shader, true);
+
+   nir_variable *pos = nir_get_variable_with_location(shader, nir_var_shader_in,
+                                                      VARYING_SLOT_POS, glsl_vec4_type());
+   shader->info.inputs_read |= VARYING_BIT_POS;
+   nir_def *coord = nir_f2u32(&b, nir_trim_vector(&b, nir_load_var(&b, pos), 2));
+   nir_def *x = nir_iand_imm(&b, nir_channel(&b, coord, 0), 31);
+   nir_def *y = nir_iand_imm(&b, nir_channel(&b, coord, 1), 31);
+
+   /* push constant loads take constant offsets, so select the row with a
+    * bcsel tree on the bits of y
+    */
+   nir_def *rows[32];
+   for (unsigned i = 0; i < 32; i += 4) {
+      nir_def *vec = nir_load_push_constant_zink(&b, 4, 32,
+                                                 nir_imm_int(&b, ZINK_GFX_PUSHCONST_POLY_STIPPLE),
+                                                 .component = i);
+      for (unsigned c = 0; c < 4; c++)
+         rows[i + c] = nir_channel(&b, vec, c);
+   }
+   for (unsigned n = 32, bit = 0; n > 1; n /= 2, bit++) {
+      nir_def *odd = nir_test_mask(&b, y, 1u << bit);
+      for (unsigned i = 0; i < n / 2; i++)
+         rows[i] = nir_bcsel(&b, odd, rows[2 * i + 1], rows[2 * i]);
+   }
+
+   nir_def *mask = nir_ushr(&b, nir_imm_int(&b, 0x80000000), x);
+   nir_discard_if(&b, nir_ieq_imm(&b, nir_iand(&b, rows[0], mask), 0));
+   shader->info.fs.uses_discard = true;
+   return nir_progress(true, entry, nir_metadata_none);
+}
+
+static bool
+lower_line_smooth_fs(nir_shader *shader, bool lower_stipple,
+                     unsigned stipple_location, unsigned line_coord_location)
 {
    int dummy;
    nir_builder b;
@@ -996,7 +1072,8 @@ lower_line_smooth_fs(nir_shader *shader, bool lower_stipple)
                                             glsl_float_type(),
                                             "__stipple");
       stipple_counter->data.interpolation = INTERP_MODE_NOPERSPECTIVE;
-      stipple_counter->data.driver_location = shader->num_inputs++;
+      stipple_counter->data.driver_location = stipple_location;
+      shader->num_inputs++;
       stipple_counter->data.location =
          MAX2(util_last_bit64(shader->info.inputs_read), VARYING_SLOT_VAR0);
       shader->info.inputs_read |= BITFIELD64_BIT(stipple_counter->data.location);
@@ -1013,7 +1090,9 @@ lower_line_smooth_fs(nir_shader *shader, bool lower_stipple)
       nir_store_var(&b, stipple_pattern, pattern, 1);
    }
 
-   nir_lower_aaline_fs(shader, &dummy, stipple_counter, stipple_pattern);
+   nir_variable *line_coord =
+      nir_lower_aaline_fs(shader, &dummy, stipple_counter, stipple_pattern);
+   line_coord->data.driver_location = line_coord_location;
    return true;
 }
 
@@ -1367,6 +1446,8 @@ zink_screen_init_compiler(struct zink_screen *screen)
    screen->ntv_info.have_shader_viewport_index_layer = screen->info.have_EXT_shader_viewport_index_layer;
    screen->ntv_info.have_shader_output_layer = screen->info.feats12.shaderOutputLayer;
    screen->ntv_info.spirv_version = screen->spirv_version;
+   screen->ntv_info.strip_names =
+      !(zink_debug & (ZINK_DEBUG_NIR | ZINK_DEBUG_SPIRV | ZINK_DEBUG_TGSI));
    if (screen->info.have_KHR_shader_float_controls) {
       if (screen->info.props12.shaderDenormFlushToZeroFloat16)
          screen->ntv_info.float_controls.flush_denorms |= 0x1;
@@ -2833,8 +2914,30 @@ delete_psiz_store_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 }
 
 static bool
+psiz_store_not_one(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_store_output:
+   case nir_intrinsic_store_per_primitive_output:
+   case nir_intrinsic_store_per_vertex_output:
+      break;
+   default:
+      return false;
+   }
+   return nir_intrinsic_io_semantics(intr).location == VARYING_SLOT_PSIZ &&
+          !(nir_src_is_const(intr->src[0]) && fabs(nir_src_as_float(intr->src[0]) - 1.0) < FLT_EPSILON);
+}
+
+static bool
 delete_psiz_store(nir_shader *nir, bool one)
 {
+   /* Deleting the stores of 1.0 relies on the default size of an unwritten
+    * PointSize: when any other store remains, the vertices whose store was
+    * deleted would get an undefined size instead (e.g. a geometry shader
+    * emitting points of size 1.0 and 13.0).
+    */
+   if (one && nir_shader_intrinsics_pass(nir, psiz_store_not_one, nir_metadata_all, NULL))
+      return false;
    bool progress = nir_shader_intrinsics_pass(nir, delete_psiz_store_instr,
                                               nir_metadata_control_flow, one ? nir : NULL);
    if (progress)
@@ -3569,7 +3672,7 @@ zink_shader_spirv_compile(struct zink_screen *screen, struct zink_shader *zs, st
    VkPushConstantRange pcr;
    pcr.stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
    pcr.offset = 0;
-   pcr.size = sizeof(struct zink_gfx_push_constant);
+   pcr.size = zink_gfx_push_constant_size(screen);
    sci.pushConstantRangeCount = 1;
    sci.pPushConstantRanges = &pcr;
 
@@ -4180,13 +4283,15 @@ zink_shader_compile(struct zink_screen *screen, bool can_shobj, struct zink_shad
 
          case MESA_SHADER_GEOMETRY:
             if (zink_gs_key(key)->lower_line_stipple) {
-               NIR_PASS(_, nir, lower_line_stipple_gs, zink_gs_key(key)->line_rectangular);
+               NIR_PASS(_, nir, lower_line_stipple_gs, zink_gs_key(key)->line_rectangular,
+                        emulated_varying_location(screen, ZINK_EMULATED_VARYING_STIPPLE));
                NIR_PASS(_, nir, nir_lower_var_copies);
                need_optimize = true;
             }
 
             if (zink_gs_key(key)->lower_line_smooth) {
-               NIR_PASS(_, nir, lower_line_smooth_gs);
+               NIR_PASS(_, nir, lower_line_smooth_gs,
+                        emulated_varying_location(screen, ZINK_EMULATED_VARYING_LINE_COORD));
                NIR_PASS(_, nir, nir_lower_var_copies);
                need_optimize = true;
             }
@@ -4227,10 +4332,19 @@ zink_shader_compile(struct zink_screen *screen, bool can_shobj, struct zink_shad
       case MESA_SHADER_FRAGMENT:
          if (zink_fs_key(key)->lower_line_smooth) {
             NIR_PASS(_, nir, lower_line_smooth_fs,
-                       zink_fs_key(key)->lower_line_stipple);
+                       zink_fs_key(key)->lower_line_stipple,
+                       emulated_varying_location(screen, ZINK_EMULATED_VARYING_STIPPLE),
+                       emulated_varying_location(screen, ZINK_EMULATED_VARYING_LINE_COORD));
             need_optimize = true;
          } else if (zink_fs_key(key)->lower_line_stipple)
-               NIR_PASS(_, nir, lower_line_stipple_fs);
+               NIR_PASS(_, nir, lower_line_stipple_fs,
+                        emulated_varying_location(screen, ZINK_EMULATED_VARYING_STIPPLE));
+
+         if (zink_fs_key_base(key)->poly_stipple) {
+            NIR_PASS(_, nir, lower_poly_stipple_fs);
+            NIR_PASS(_, nir, nir_lower_discard_if, nir_lower_demote_if_to_cf | nir_lower_terminate_if_to_cf);
+            need_optimize = true;
+         }
 
          if (zink_fs_key(key)->lower_point_smooth) {
             NIR_PASS(_, nir, nir_lower_point_smooth, false);

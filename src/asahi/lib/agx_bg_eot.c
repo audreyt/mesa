@@ -4,6 +4,7 @@
  */
 
 #include "agx_bg_eot.h"
+#include "agx_apple9_libagx.h"
 #include "util/simple_mtx.h"
 #include "util/u_debug.h"
 #include "agx_compile.h"
@@ -233,50 +234,13 @@ agx_bg_eot_cleanup(struct agx_bg_eot_cache *cache)
    cache->dev = NULL;
 }
 
+/* Returns false when the program's USC allocation fails (the aperture is
+ * full); nothing is cached then, so a later call can retry. */
 static bool
-agx_apple9_lower_kernel_input(nir_builder *b, nir_intrinsic_instr *intr,
-                            UNUSED void *data)
-{
-   if (intr->intrinsic != nir_intrinsic_load_preamble)
-      return false;
-   b->cursor = nir_before_instr(&intr->instr);
-   unsigned offset = nir_intrinsic_base(intr) * 2;
-   nir_def_replace(&intr->def,
-      nir_load_ubo(b, intr->def.num_components, intr->def.bit_size,
-                   nir_imm_int(b, 0), nir_imm_int(b, offset),
-                   .align_mul = 2, .range_base = offset,
-                   .range = intr->def.num_components * intr->def.bit_size / 8));
-   return true;
-}
-
-/* libagx marks the timestamp source volatile only to bypass caches; Apple9
- * rejects volatile, so keep that intent as coherent.
- */
-static bool
-agx_apple9_volatile_to_coherent(nir_builder *b, nir_intrinsic_instr *intr,
-                                UNUSED void *data)
-{
-   if (!nir_intrinsic_has_access(intr) ||
-       !(nir_intrinsic_access(intr) & ACCESS_VOLATILE))
-      return false;
-
-   nir_intrinsic_set_access(intr, (nir_intrinsic_access(intr) &
-                                   ~ACCESS_VOLATILE) | ACCESS_COHERENT);
-   return true;
-}
-
-static void
 agx_compile_apple9_precompiled(struct agx_bg_eot_cache *cache,
                              struct agx_precompiled_shader *p, unsigned program)
 {
-   const uint32_t *serialized = libagx_nir[program];
-   struct blob_reader reader;
-   blob_reader_init(&reader, serialized + 1, serialized[0]);
-   nir_shader *nir = nir_deserialize(NULL, &agx_nir_options, &reader);
-   nir_shader_intrinsics_pass(nir, agx_apple9_lower_kernel_input,
-                             nir_metadata_control_flow, NULL);
-   nir_shader_intrinsics_pass(nir, agx_apple9_volatile_to_coherent,
-                             nir_metadata_all, NULL);
+   nir_shader *nir = agx_apple9_libagx_nir(program, NULL);
 
    struct agx_shader_part part = {0};
    const char *reason = NULL;
@@ -294,12 +258,15 @@ agx_compile_apple9_precompiled(struct agx_bg_eot_cache *cache,
    p->bo = agx_bo_create(cache->dev, part.info.binary_size, 0,
                          AGX_BO_EXEC | AGX_BO_LOW_VA | AGX_BO_WRITEBACK,
                          "Apple9 internal shader");
-   if (!p->bo)
-      abort();
+   if (!p->bo) {
+      free(part.binary);
+      return false;
+   }
    memcpy(agx_bo_map(p->bo), part.binary, part.info.binary_size);
    agx_bo_note_cpu_write(p->bo, 0, part.info.binary_size);
    p->ptr = p->bo->va->addr;
    free(part.binary);
+   return true;
 }
 
 static struct agx_precompiled_shader *
@@ -317,8 +284,11 @@ agx_get_precompiled_locked(struct agx_bg_eot_cache *cache, unsigned program)
    struct agx_precompiled_shader *p =
       rzalloc(cache->ht, struct agx_precompiled_shader);
 
-   if (cache->dev->chip == AGX_CHIP_G16G) {
-      agx_compile_apple9_precompiled(cache, p, program);
+   if (agx_is_apple9(cache->dev)) {
+      if (!agx_compile_apple9_precompiled(cache, p, program)) {
+         ralloc_free(p);
+         return NULL;
+      }
       p_atomic_set(&cache->precomp[program], p);
       return p;
    }
